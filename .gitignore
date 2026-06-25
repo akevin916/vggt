@@ -147,3 +147,12 @@ skyseg.onnx
 # pixi environments
 .pixi
 *.egg-info
+
+*.pth
+*.pt
+
+# Dyn-VGGT: training artifacts, data symlink, third-party reference clones
+/logs/
+training/logs/
+/data
+/reference/

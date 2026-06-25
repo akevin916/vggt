@@ -718,13 +718,15 @@ class Trainer:
             batch = self._apply_batch_repetition(batch)
         
         # Normalize camera extrinsics and points. The function returns new tensors.
-        normalized_extrinsics, normalized_cam_points, normalized_world_points, normalized_depths = \
+        # MODIFIED (B6): also normalises scene_flow_gt in lock-step when present (Dyn-VGGT).
+        normalized_extrinsics, normalized_cam_points, normalized_world_points, normalized_depths, normalized_scene_flow = \
             normalize_camera_extrinsics_and_points_batch(
                 extrinsics=batch["extrinsics"],
                 cam_points=batch["cam_points"],
                 world_points=batch["world_points"],
                 depths=batch["depths"],
                 point_masks=batch["point_masks"],
+                scene_flow=batch.get("scene_flow_gt", None),
             )
 
         # Replace the original values in the batch with the normalized ones.
@@ -732,6 +734,8 @@ class Trainer:
         batch["cam_points"] = normalized_cam_points
         batch["world_points"] = normalized_world_points
         batch["depths"] = normalized_depths
+        if normalized_scene_flow is not None:
+            batch["scene_flow_gt"] = normalized_scene_flow
 
         return batch
 

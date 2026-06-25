@@ -15,16 +15,29 @@ from vggt.heads.track_head import TrackHead
 
 
 class VGGT(nn.Module, PyTorchModelHubMixin):
+    # MODIFIED: Dyn-VGGT extensions are all opt-in (default flags off) so plain VGGT() and pretrained
+    #           checkpoint loading are byte-for-byte unchanged. Set enable_temporal/motion/flow to True
+    #           to activate the spatio-temporal aggregator and the motion-decoupled dual-field heads.
     def __init__(self, img_size=518, patch_size=14, embed_dim=1024,
-                 enable_camera=True, enable_point=True, enable_depth=True, enable_track=True):
+                 enable_camera=True, enable_point=True, enable_depth=True, enable_track=True,
+                 enable_temporal=False, enable_motion=False, enable_flow=False):
         super().__init__()
 
-        self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim)
+        # NEW: enable_temporal injects temporal attention into the aggregator (aa_order gains "temporal").
+        aa_order = ["frame", "temporal", "global"] if enable_temporal else ["frame", "global"]
+        self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim, aa_order=aa_order)
 
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None
         self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1") if enable_point else None
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1") if enable_depth else None
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size) if enable_track else None
+
+        # NEW: motion-segmentation head — per-pixel dynamic probability m∈[0,1] (Dyn-VGGT contribution ③).
+        #      output_dim=2 → DPTHead splits last channel as confidence, leaving 1 channel for m (docs §5).
+        self.motion_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="sigmoid", conf_activation="sigmoid") if enable_motion else None
+        # NEW: scene-flow head — per-pixel 3D residual displacement Δ (Dyn-VGGT contribution ③).
+        #      output_dim=4 → 3 displacement channels + 1 confidence channel.
+        self.flow_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="linear", conf_activation="expp1") if enable_flow else None
 
     def forward(self, images: torch.Tensor, query_points: torch.Tensor = None):
         """
@@ -81,6 +94,27 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 )
                 predictions["world_points"] = pts3d
                 predictions["world_points_conf"] = pts3d_conf
+
+            # NEW: motion-decoupled dual-field branch (Dyn-VGGT contributions ②③).
+            #      motion head → dynamic probability m; flow head → residual scene flow Δ;
+            #      assembled point X_{t,p} = X^can_{t,p} + m·Δ (docs §4.1). Heads are opt-in.
+            if self.motion_head is not None:
+                motion, motion_conf = self.motion_head(
+                    aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
+                )
+                predictions["motion_prob"] = motion          # [B, S, H, W, 1] in [0, 1]
+                predictions["motion_conf"] = motion_conf
+            if self.flow_head is not None:
+                scene_flow, scene_flow_conf = self.flow_head(
+                    aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
+                )
+                predictions["scene_flow"] = scene_flow       # [B, S, H, W, 3] residual displacement Δ
+                predictions["scene_flow_conf"] = scene_flow_conf
+            # Assemble the motion-decoupled point only when all ingredients are present.
+            if self.point_head is not None and self.motion_head is not None and self.flow_head is not None:
+                predictions["world_points_dyn"] = (
+                    predictions["world_points"] + predictions["motion_prob"] * predictions["scene_flow"]
+                )
 
         if self.track_head is not None and query_points is not None:
             track_list, vis, conf = self.track_head(

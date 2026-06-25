@@ -24,13 +24,20 @@ class MultitaskLoss(torch.nn.Module):
     - Point loss
     - Tracking loss (not cleaned yet, dirty code is at the bottom of this file)
     """
-    def __init__(self, camera=None, depth=None, point=None, track=None, **kwargs):
+    # MODIFIED: Dyn-VGGT adds four task configs (motion/flow/reproj/tsmooth). All optional — if a config
+    #           dict is None the corresponding branch is skipped, so the original VGGT loss is unchanged.
+    def __init__(self, camera=None, depth=None, point=None, track=None,
+                 motion=None, flow=None, reproj=None, tsmooth=None, **kwargs):
         super().__init__()
         # Loss configuration dictionaries for each task
         self.camera = camera
         self.depth = depth
         self.point = point
         self.track = track
+        self.motion = motion      # NEW: dynamic-segmentation BCE (docs §6.2-1)
+        self.flow = flow          # NEW: 3D scene-flow supervision (docs §6.2-2)
+        self.reproj = reproj      # NEW: cross-time reprojection consistency (docs §6.2-3)
+        self.tsmooth = tsmooth    # NEW: temporal smoothness of flow & motion (docs §6.2-4)
 
     def forward(self, predictions, batch) -> torch.Tensor:
         """
@@ -46,33 +53,61 @@ class MultitaskLoss(torch.nn.Module):
         total_loss = 0
         loss_dict = {}
         
-        # Camera pose loss - if pose encodings are predicted
-        if "pose_enc_list" in predictions:
-            camera_loss_dict = compute_camera_loss(predictions, batch, **self.camera)   
+        # Camera pose loss - if pose encodings are predicted AND a camera loss config is provided
+        # (MODIFIED: guard on self.camera so stages that predict pose but don't supervise it — e.g. S0 — work)
+        if self.camera is not None and "pose_enc_list" in predictions:
+            camera_loss_dict = compute_camera_loss(predictions, batch, **self.camera)
             camera_loss = camera_loss_dict["loss_camera"] * self.camera["weight"]   
             total_loss = total_loss + camera_loss
             loss_dict.update(camera_loss_dict)
         
-        # Depth estimation loss - if depth maps are predicted
-        if "depth" in predictions:
+        # Depth estimation loss - if depth maps are predicted AND a depth loss config is provided
+        if self.depth is not None and "depth" in predictions:
             depth_loss_dict = compute_depth_loss(predictions, batch, **self.depth)
             depth_loss = depth_loss_dict["loss_conf_depth"] + depth_loss_dict["loss_reg_depth"] + depth_loss_dict["loss_grad_depth"]
             depth_loss = depth_loss * self.depth["weight"]
             total_loss = total_loss + depth_loss
             loss_dict.update(depth_loss_dict)
 
-        # 3D point reconstruction loss - if world points are predicted
-        if "world_points" in predictions:
+        # 3D point reconstruction loss - if world points are predicted AND a point loss config is provided
+        if self.point is not None and "world_points" in predictions:
             point_loss_dict = compute_point_loss(predictions, batch, **self.point)
             point_loss = point_loss_dict["loss_conf_point"] + point_loss_dict["loss_reg_point"] + point_loss_dict["loss_grad_point"]
             point_loss = point_loss * self.point["weight"]
             total_loss = total_loss + point_loss
             loss_dict.update(point_loss_dict)
 
+        # NEW: dynamic-segmentation loss — supervise motion head against GT mask (or pseudo-label).
+        if self.motion is not None and "motion_prob" in predictions and "motion_mask" in batch:
+            motion_loss_dict = compute_motion_loss(predictions, batch, **self.motion)
+            total_loss = total_loss + motion_loss_dict["loss_motion"] * self.motion["weight"]
+            loss_dict.update(motion_loss_dict)
+
+        # NEW: scene-flow supervision — dense "assembled point vs GT world_points" (primary, needs only
+        #      depth+camera) plus optional sparse 3D scene-flow GT. Trains the flow head Δ (docs §6.2-2).
+        if self.flow is not None and "world_points_dyn" in predictions and "world_points" in batch:
+            flow_loss_dict = compute_flow_loss(predictions, batch, **self.flow)
+            flow_loss = (flow_loss_dict["loss_conf_flow"] + flow_loss_dict["loss_reg_flow"]
+                         + flow_loss_dict["loss_sparse_flow"])
+            total_loss = total_loss + flow_loss * self.flow["weight"]
+            loss_dict.update(flow_loss_dict)
+
+        # NEW: cross-time reprojection consistency — ties point/flow/motion to camera geometry.
+        if self.reproj is not None and "world_points" in predictions:
+            reproj_loss_dict = compute_reproj_loss(predictions, batch, **self.reproj)
+            total_loss = total_loss + reproj_loss_dict["loss_reproj"] * self.reproj["weight"]
+            loss_dict.update(reproj_loss_dict)
+
+        # NEW: temporal smoothness of scene flow and motion mask (suppress video flicker).
+        if self.tsmooth is not None and ("scene_flow" in predictions or "motion_prob" in predictions):
+            tsmooth_loss_dict = compute_tsmooth_loss(predictions, batch, **self.tsmooth)
+            total_loss = total_loss + tsmooth_loss_dict["loss_tsmooth"] * self.tsmooth["weight"]
+            loss_dict.update(tsmooth_loss_dict)
+
         # Tracking loss - not cleaned yet, dirty code is at the bottom of this file
         if "track" in predictions:
             raise NotImplementedError("Track loss is not cleaned up yet")
-        
+
         loss_dict["objective"] = total_loss
 
         return loss_dict
@@ -196,10 +231,11 @@ def camera_loss_single(pred_pose_enc, gt_pose_enc, loss_type="l1"):
     return loss_T, loss_R, loss_FL
 
 
-def compute_point_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_fn = None, valid_range=-1, **kwargs):
+def compute_point_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_fn = None, valid_range=-1,
+                       mask_dynamic=False, dyn_thresh=0.5, **kwargs):
     """
     Compute point loss.
-    
+
     Args:
         predictions: Dict containing 'world_points' and 'world_points_conf'
         batch: Dict containing ground truth 'world_points' and 'point_masks'
@@ -207,12 +243,21 @@ def compute_point_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
         alpha: Weight for confidence regularization
         gradient_loss_fn: Type of gradient loss to apply
         valid_range: Quantile range for outlier filtering
+        mask_dynamic: NEW (Dyn-VGGT, docs §6.1/§5.2) — if True and a motion prediction exists, exclude
+                      dynamic pixels (m >= dyn_thresh) from supervising the canonical point X^can, since
+                      GT world_points record the MOVED position of dynamic objects. Enabled from stage S1.
+        dyn_thresh: Threshold on the (detached) dynamic probability for the hard exclusion above.
     """
     pred_points = predictions['world_points']
     pred_points_conf = predictions['world_points_conf']
     gt_points = batch['world_points']
     gt_points_mask = batch['point_masks']
-    
+
+    # NEW: keep only static pixels for X^can supervision (hard-threshold form of the (1-m) weighting).
+    if mask_dynamic and "motion_prob" in predictions:
+        static = (predictions["motion_prob"][..., 0].detach() < dyn_thresh)
+        gt_points_mask = gt_points_mask & static
+
     gt_points = check_and_fix_inf_nan(gt_points, "gt_points")
     
     if gt_points_mask.sum() < 100:
@@ -276,6 +321,142 @@ def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
     }
 
     return loss_dict
+
+
+# ----------------------------------------------------------------------------------------------------
+# NEW: Dyn-VGGT loss terms (motion / flow / reproj / tsmooth). See docs/dyn_vggt_method.md §6.2.
+# ----------------------------------------------------------------------------------------------------
+
+def compute_motion_loss(predictions, batch, supervise_valid_only=False, **kwargs):
+    # NEW: dynamic-segmentation BCE. Supervises motion head m∈[0,1] against the GT dynamic mask
+    #      (docs §6.2-1). When no GT mask is available a pseudo-label path would be used instead
+    #      (handled by the caller's gating); here GT supervision is assumed present.
+    pred_m = predictions["motion_prob"][..., 0]          # (B, S, H, W), post-sigmoid in [0,1]
+    gt_m = batch["motion_mask"].to(pred_m.dtype)         # (B, S, H, W)
+    pred_m = pred_m.clamp(1e-6, 1 - 1e-6)
+
+    # Manual BCE (autocast-safe; F.binary_cross_entropy is disallowed under AMP autocast).
+    bce = -(gt_m * torch.log(pred_m) + (1 - gt_m) * torch.log(1 - pred_m))
+
+    if supervise_valid_only and "point_masks" in batch:
+        m = batch["point_masks"]
+        loss = bce[m].mean() if m.sum() >= 1 else (0.0 * pred_m).mean()
+    else:
+        loss = bce.mean()
+    loss = check_and_fix_inf_nan(loss, "loss_motion")
+    return {"loss_motion": loss}
+
+
+def compute_flow_loss(predictions, batch, gamma=1.0, alpha=0.2, valid_range=-1,
+                      sparse_huber_delta=1.0, **kwargs):
+    """
+    Scene-flow (Δ) supervision (docs §6.2-2). Trains the flow head through TWO signals:
+
+    1. Dense "assembled point" supervision (primary, no optical flow needed):
+       GT `world_points` at frame t IS the true world position of every pixel's surface at that
+       instant (dynamic objects included), so the assembled point X = X^can + m·Δ has a dense GT
+       target. Combined with the (1-m)-masked L_point (which pins X^can on static pixels only),
+       this forces Δ to explain the dynamic-region discrepancy. Works on any depth+camera dataset.
+
+    2. Optional sparse 3D scene-flow GT (e.g. PointOdyssey trajs_3d): a direct L1 on Δ where a
+       per-pixel `scene_flow_gt` (+ `scene_flow_mask`) is provided.
+    """
+    pred_dyn = predictions["world_points_dyn"]           # (B, S, H, W, 3) assembled point
+    flow_conf = predictions.get("scene_flow_conf", predictions["world_points_conf"])
+    gt_points = batch["world_points"]
+    gt_mask = batch["point_masks"]
+
+    gt_points = check_and_fix_inf_nan(gt_points, "gt_points_flow")
+
+    if gt_mask.sum() < 100:
+        dummy = (0.0 * pred_dyn).mean()
+        return {"loss_conf_flow": dummy, "loss_reg_flow": dummy, "loss_sparse_flow": dummy}
+
+    # Dense confidence-weighted regression of the assembled point against GT world points.
+    loss_conf, _, loss_reg = regression_loss(
+        pred_dyn, gt_points, gt_mask, conf=flow_conf,
+        gradient_loss_fn="", gamma=gamma, alpha=alpha, valid_range=valid_range,
+    )
+
+    loss_dict = {"loss_conf_flow": loss_conf, "loss_reg_flow": loss_reg}
+
+    # Optional sparse 3D scene-flow GT path.
+    if "scene_flow_gt" in batch:
+        pred_flow = predictions["scene_flow"]
+        gt_flow = batch["scene_flow_gt"]
+        valid = batch.get("scene_flow_mask", gt_mask)
+        if valid.sum() > 0:
+            diff = (pred_flow[valid] - gt_flow[valid]).abs().sum(dim=-1)
+            loss_sparse = F.huber_loss(diff, torch.zeros_like(diff), delta=sparse_huber_delta)
+            loss_dict["loss_sparse_flow"] = check_and_fix_inf_nan(loss_sparse, "loss_sparse_flow")
+        else:
+            loss_dict["loss_sparse_flow"] = (0.0 * pred_dyn).mean()
+    else:
+        loss_dict["loss_sparse_flow"] = (0.0 * pred_dyn).mean()
+
+    return loss_dict
+
+
+def compute_reproj_loss(predictions, batch, huber_delta=0.01, use_dyn=True, normalize=True, **kwargs):
+    # NEW: cross-time reprojection consistency (docs §6.2-3). Projects the assembled point
+    #      X_{t,p} = X^can + m·Δ through the (GT) camera and matches it to the pixel grid u_{t,p}.
+    #      Ties the point/flow/motion heads together via a single geometric constraint.
+    if use_dyn and "world_points_dyn" in predictions:
+        X = predictions["world_points_dyn"]              # (B, S, H, W, 3)
+    else:
+        X = predictions["world_points"]
+    extr = batch["extrinsics"]                           # (B, S, 3, 4) world-to-cam (OpenCV)
+    intr = batch["intrinsics"]                           # (B, S, 3, 3)
+    mask = batch["point_masks"]                          # (B, S, H, W)
+    B, S, H, W, _ = X.shape
+
+    R = extr[..., :3, :3]                                # (B, S, 3, 3)
+    t = extr[..., :3, 3]                                 # (B, S, 3)
+    x_cam = torch.einsum("bsij,bshwj->bshwi", R, X) + t[:, :, None, None, :]
+    z = x_cam[..., 2:3].clamp(min=1e-3)
+    xy = x_cam[..., :2] / z
+    fx = intr[..., 0, 0][:, :, None, None]; cx = intr[..., 0, 2][:, :, None, None]
+    fy = intr[..., 1, 1][:, :, None, None]; cy = intr[..., 1, 2][:, :, None, None]
+    u = fx * xy[..., 0] + cx
+    v = fy * xy[..., 1] + cy
+    proj = torch.stack([u, v], dim=-1)                   # (B, S, H, W, 2)
+
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=X.device), torch.arange(W, device=X.device), indexing="ij"
+    )
+    grid = torch.stack([xx, yy], dim=-1).to(X.dtype)     # (H, W, 2) pixel coords (x, y)
+    grid = grid[None, None].expand(B, S, H, W, 2)
+
+    if mask.sum() < 1:
+        return {"loss_reproj": (0.0 * X).mean()}
+    err = (proj - grid)[mask]                            # (Nvalid, 2) pixel error
+    # NEW: normalise by the image diagonal so the term is fractional (~O(1)) and resolution-independent,
+    #      otherwise raw pixel error dominates the objective (observed in P0). huber_delta is then in
+    #      fraction-of-diagonal units (default 0.01 ≈ 1% of the diagonal).
+    if normalize:
+        diag = (H ** 2 + W ** 2) ** 0.5
+        err = err / diag
+    err = check_and_fix_inf_nan(err, "reproj_err")
+    loss = F.huber_loss(err, torch.zeros_like(err), delta=huber_delta)
+    return {"loss_reproj": loss}
+
+
+def compute_tsmooth_loss(predictions, batch, tv_weight=0.1, **kwargs):
+    # NEW: temporal smoothness (docs §6.2-4). 2nd-order difference on scene flow (penalise jerky
+    #      motion) + temporal TV on the dynamic mask. Requires sequences ordered in time.
+    total = 0.0
+    if "scene_flow" in predictions and predictions["scene_flow"].shape[1] >= 3:
+        d = predictions["scene_flow"]                    # (B, S, H, W, 3)
+        acc = d[:, 2:] - 2 * d[:, 1:-1] + d[:, :-2]      # 2nd-order temporal difference
+        total = total + acc.abs().mean()
+    if "motion_prob" in predictions and predictions["motion_prob"].shape[1] >= 2:
+        m = predictions["motion_prob"][..., 0]           # (B, S, H, W)
+        total = total + tv_weight * (m[:, 1:] - m[:, :-1]).abs().mean()
+    if not torch.is_tensor(total):
+        # nothing to smooth (e.g. S<2); return a differentiable zero anchored to a prediction
+        anchor = predictions.get("scene_flow", predictions.get("motion_prob"))
+        total = (0.0 * anchor).mean()
+    return {"loss_tsmooth": total}
 
 
 def regression_loss(pred, gt, mask, conf=None, gradient_loss_fn=None, gamma=1.0, alpha=0.2, valid_range=-1):

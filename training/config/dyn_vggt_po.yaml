@@ -1,0 +1,184 @@
+# Dyn-VGGT training config — PointOdyssey, full 7-term loss (docs/dyn_vggt_method.md).
+# NEW: enables the spatio-temporal aggregator + motion/flow dual-field heads and the new loss terms.
+# This corresponds to stage P3b/S1 (motion decoupling on; point uses (1-m) masking).
+defaults:
+  - default_dataset.yaml
+
+exp_name: dyn_vggt_po
+img_size: 518
+num_workers: 8
+seed_value: 42
+accum_steps: 2
+patch_size: 14
+val_epoch_freq: 5
+max_img_per_gpu: 32      # temporal attention + 2 extra heads use more memory than vanilla VGGT
+
+limit_train_batches: 800
+limit_val_batches: 200
+
+
+data:
+  train:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    max_img_per_gpu: ${max_img_per_gpu}
+    common_config:
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+      debug: False
+      repeat_batch: False
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.pointodyssey.PointOdysseyDataset
+          split: train
+          PO_DIR: /media/cvml-75/ssd2t1/data/point_odyssey
+  val:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    max_img_per_gpu: ${max_img_per_gpu}
+    common_config:
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+      debug: False
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.pointodyssey.PointOdysseyDataset
+          split: test
+          PO_DIR: /media/cvml-75/ssd2t1/data/point_odyssey
+
+
+logging:
+  log_dir: logs
+  log_visuals: False
+  log_freq: 1
+  log_level_primary: DEBUG
+  log_level_secondary: WARNING
+  all_ranks: False
+  tensorboard_writer:
+    _target_: train_utils.tb_writer.TensorBoardLogger
+    path: ${logging.log_dir}/tensorboard
+  scalar_keys_to_log:
+    train:
+      keys_to_log:
+        - loss_objective
+        - loss_camera
+        - loss_reg_depth
+        - loss_reg_point
+        - loss_motion
+        - loss_reg_flow
+        - loss_reproj
+        - loss_tsmooth
+    val:
+      keys_to_log:
+        - loss_objective
+        - loss_reg_depth
+        - loss_motion
+        - loss_reg_flow
+
+
+checkpoint:
+  save_dir: logs/${exp_name}/ckpts
+  save_freq: 5
+  resume_checkpoint_path: /YOUR/PATH/TO/VGGT_PRETRAINED_CKPT   # warm-start from pretrained VGGT (strict: False)
+  strict: False
+
+
+loss:
+  _target_: loss.MultitaskLoss
+  camera:
+    weight: 5.0
+    loss_type: "l1"
+  depth:
+    weight: 1.0
+    gradient_loss_fn: "grad"
+    valid_range: 0.98
+  point:
+    weight: 1.0
+    gradient_loss_fn: "normal"
+    valid_range: 0.98
+    mask_dynamic: True        # (1-m) static masking of X^can (stage S1+, docs §6.1)
+    dyn_thresh: 0.5
+  motion:
+    weight: 1.0               # BCE vs GT dynamic mask (docs §6.2-1)
+  flow:
+    weight: 0.5               # dense assembled-point supervision of Δ (docs §6.2-2)
+    gamma: 1.0
+    alpha: 0.2
+    valid_range: 0.98
+  reproj:
+    weight: 1.0               # cross-time reprojection consistency (docs §6.2-3)
+    huber_delta: 0.01         # error normalised by image diagonal (fraction units)
+  tsmooth:
+    weight: 0.1               # temporal smoothness of Δ and m (docs §6.2-4)
+    tv_weight: 0.1
+  track: null
+
+
+optim:
+  param_group_modifiers: False
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 5e-5
+    weight_decay: 0.05
+  # Stage S1/P3b: freeze the DINOv2 patch embed; train temporal blocks + heads.
+  frozen_module_names:
+      - "*patch_embed*"
+  amp:
+    enabled: True
+    amp_dtype: bfloat16
+  gradient_clip:
+    _target_: train_utils.gradient_clip.GradientClipper
+    configs:
+      - module_name: ["aggregator"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["depth", "point", "camera", "motion_head", "flow_head"]
+        max_norm: 1.0
+        norm_type: 2
+  options:
+    lr:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.CompositeParamScheduler
+          schedulers:
+            - _target_: fvcore.common.param_scheduler.LinearParamScheduler
+              start_value: 1e-8
+              end_value: 5e-5
+            - _target_: fvcore.common.param_scheduler.CosineParamScheduler
+              start_value: 5e-5
+              end_value: 1e-8
+          lengths: [0.05, 0.95]
+          interval_scaling: ['rescaled', 'rescaled']
+    weight_decay:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+          value: 0.05
+
+
+max_epochs: 20
+
+model:
+  _target_: vggt.models.vggt.VGGT
+  enable_camera: True
+  enable_depth: True
+  enable_point: True          # required: X^can is the rigid branch of the dual field
+  enable_track: False
+  enable_temporal: True       # NEW: spatio-temporal aggregator (contribution ①)
+  enable_motion: True         # NEW: motion-seg head (contribution ③)
+  enable_flow: True           # NEW: scene-flow head (contribution ③)
+
+
+distributed:
+  backend: nccl
+  comms_dtype: None
+  find_unused_parameters: True   # temporal blocks / new heads may be unused in some configs
+  timeout_mins: 30
+  gradient_as_bucket_view: True
+  bucket_cap_mb: 25
+  broadcast_buffers: True
+
+cuda:
+    cudnn_deterministic: False
+    cudnn_benchmark: False
+    allow_tf32: True

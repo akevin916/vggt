@@ -13,7 +13,7 @@ from typing import Optional, Tuple, Union, List, Dict, Any
 
 from vggt.layers import PatchEmbed
 from vggt.layers.block import Block
-from vggt.layers.rope import RotaryPositionEmbedding2D, PositionGetter
+from vggt.layers.rope import RotaryPositionEmbedding2D, RotaryPositionEmbedding1D, PositionGetter  # MODIFIED: import 1D temporal RoPE for Dyn-VGGT
 from vggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
 
 logger = logging.getLogger(__name__)
@@ -68,6 +68,7 @@ class Aggregator(nn.Module):
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
+        temporal_every=3,   # NEW: insert one temporal block every `temporal_every` aa-blocks (decision A3)
     ):
         super().__init__()
 
@@ -76,6 +77,10 @@ class Aggregator(nn.Module):
         # Initialize rotary position embedding if frequency > 0
         self.rope = RotaryPositionEmbedding2D(frequency=rope_freq) if rope_freq > 0 else None
         self.position_getter = PositionGetter() if self.rope is not None else None
+
+        # NEW: temporal RoPE — independent 1D rotary embedding applied only inside temporal attention,
+        #      keeping the spatial 2D RoPE untouched so pretrained weights warm-start cleanly (docs §3.1).
+        self.temporal_rope = RotaryPositionEmbedding1D(frequency=rope_freq) if rope_freq > 0 else None
 
         self.frame_blocks = nn.ModuleList(
             [
@@ -115,12 +120,46 @@ class Aggregator(nn.Module):
         self.aa_order = aa_order
         self.patch_size = patch_size
         self.aa_block_size = aa_block_size
+        self.temporal_every = temporal_every  # NEW
 
         # Validate that depth is divisible by aa_block_size
         if self.depth % self.aa_block_size != 0:
             raise ValueError(f"depth ({depth}) must be divisible by aa_block_size ({aa_block_size})")
 
         self.aa_block_num = self.depth // self.aa_block_size
+
+        # NEW: temporal attention blocks (Dyn-VGGT contribution ①). Only built when "temporal" is in aa_order,
+        #      so default VGGT (aa_order=["frame","global"]) is byte-for-byte unchanged & pretrained-loadable.
+        #      Inserted once every `temporal_every` aa-blocks → n_temporal = aa_block_num // temporal_every.
+        #      Each block warm-starts as identity via LayerScale gamma=0 (docs §3.2).
+        if "temporal" in self.aa_order:
+            self.n_temporal = self.aa_block_num // self.temporal_every
+            self.temporal_blocks = nn.ModuleList(
+                [
+                    block_fn(
+                        dim=embed_dim,
+                        num_heads=num_heads,
+                        mlp_ratio=mlp_ratio,
+                        qkv_bias=qkv_bias,
+                        proj_bias=proj_bias,
+                        ffn_bias=ffn_bias,
+                        init_values=init_values,
+                        qk_norm=qk_norm,
+                        rope=self.temporal_rope,
+                    )
+                    for _ in range(self.n_temporal)
+                ]
+            )
+            # γ=0 warm-start: zero both LayerScale gammas so each temporal block is an identity map at init.
+            # (Block uses nn.Identity() when init_values is falsy, so we must zero an *existing* LayerScale.)
+            for blk in self.temporal_blocks:
+                if hasattr(blk.ls1, "gamma"):
+                    nn.init.zeros_(blk.ls1.gamma)
+                if hasattr(blk.ls2, "gamma"):
+                    nn.init.zeros_(blk.ls2.gamma)
+        else:
+            self.n_temporal = 0
+            self.temporal_blocks = None
 
         # Note: We have two camera tokens, one for the first frame and one for the rest
         # The same applies for register tokens
@@ -230,11 +269,23 @@ class Aggregator(nn.Module):
         # update P because we added special tokens
         _, P, C = tokens.shape
 
+        # NEW: temporal positions for the 1D time RoPE, shape (B*P, S) integer frame indices (decision B4).
+        #      camera token (idx 0) and patch tokens (idx >= patch_start_idx) get the real frame index t;
+        #      register tokens (idx 1..patch_start_idx-1) get 0 → identity rotation (no temporal RoPE).
+        temporal_pos = None
+        if self.temporal_blocks is not None and self.temporal_rope is not None:
+            frame_index = torch.arange(S, device=images.device)
+            temporal_pos = frame_index.view(1, 1, S).expand(B, P, S).clone()  # (B, P, S)
+            if self.patch_start_idx > 1:
+                temporal_pos[:, 1:self.patch_start_idx, :] = 0  # register tokens → no temporal RoPE
+            temporal_pos = temporal_pos.reshape(B * P, S)
+
         frame_idx = 0
         global_idx = 0
+        temporal_idx = 0
         output_list = []
 
-        for _ in range(self.aa_block_num):
+        for block_iter in range(self.aa_block_num):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
                     tokens, frame_idx, frame_intermediates = self._process_frame_attention(
@@ -244,6 +295,14 @@ class Aggregator(nn.Module):
                     tokens, global_idx, global_intermediates = self._process_global_attention(
                         tokens, B, S, P, C, global_idx, pos=pos
                     )
+                elif attn_type == "temporal":
+                    # NEW: run a temporal block once every `temporal_every` aa-blocks.
+                    #      It only updates the streaming `tokens`; it does NOT emit an intermediate
+                    #      into output_list, so the head input stays [B,S,P,2C] (decision A2).
+                    if self.temporal_blocks is not None and (block_iter % self.temporal_every == self.temporal_every - 1):
+                        tokens, temporal_idx = self._process_temporal_attention(
+                            tokens, B, S, P, C, temporal_idx, pos=temporal_pos
+                        )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
 
@@ -303,6 +362,28 @@ class Aggregator(nn.Module):
             intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, global_idx, intermediates
+
+    def _process_temporal_attention(self, tokens, B, S, P, C, temporal_idx, pos=None):
+        # NEW: temporal attention (Dyn-VGGT contribution ①). Reshape so the *time* axis S is the
+        #      sequence dim — each spatial position attends across its own S frames (motion/trajectory).
+        #      Updates the streaming tokens only; emits NO intermediate (head input stays 2C, decision A2).
+        """
+        Process one temporal attention block. Tokens are reshaped to (B*P, S, C) so attention runs
+        purely along the time axis, then reshaped back to (B*S, P, C) for the next attention type.
+        """
+        # (B*S, P, C) or (B, S*P, C) -> (B, S, P, C) -> (B*P, S, C)
+        tokens = tokens.view(B, S, P, C).permute(0, 2, 1, 3).reshape(B * P, S, C)
+
+        if self.training:
+            tokens = checkpoint(self.temporal_blocks[temporal_idx], tokens, pos, use_reentrant=self.use_reentrant)
+        else:
+            tokens = self.temporal_blocks[temporal_idx](tokens, pos=pos)
+        temporal_idx += 1
+
+        # (B*P, S, C) -> (B, P, S, C) -> (B*S, P, C)
+        tokens = tokens.view(B, P, S, C).permute(0, 2, 1, 3).reshape(B * S, P, C)
+
+        return tokens, temporal_idx
 
 
 def slice_expand_and_flatten(token_tensor, B, S):

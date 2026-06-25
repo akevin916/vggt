@@ -186,3 +186,30 @@ class RotaryPositionEmbedding2D(nn.Module):
 
         # Combine processed features
         return torch.cat((vertical_features, horizontal_features), dim=-1)
+
+
+class RotaryPositionEmbedding1D(RotaryPositionEmbedding2D):
+    # NEW: Dyn-VGGT 時間軸 RoPE。與 2D 版同構但只編「時間」一個軸（整個 head_dim 都用幀索引旋轉），
+    #      只在 temporal attention 內作用，空間 RoPE 一個字不動，保留預訓練 warm-start（見 docs §3.1）。
+    """1D Rotary Position Embedding for the temporal axis.
+
+    Reuses the frequency / rotate-half machinery of the 2D version, but rotates the
+    full feature dimension by a single (time) coordinate instead of splitting it into
+    a vertical/horizontal pair.
+
+    Args:
+        tokens: Input tensor of shape (batch, n_heads, n_tokens, head_dim).
+        positions: Integer position tensor of shape (batch, n_tokens) — frame indices.
+                   Tokens given position 0 receive an identity rotation (no temporal RoPE),
+                   which is how register tokens are excluded (decision B4).
+    """
+
+    def forward(self, tokens: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        assert tokens.size(-1) % 2 == 0, "Feature dimension must be even"
+        assert positions.ndim == 2, "Positions must have shape (batch, n_tokens)"
+
+        feature_dim = tokens.size(-1)
+        max_position = int(positions.max()) + 1
+        cos_comp, sin_comp = self._compute_frequency_components(feature_dim, max_position, tokens.device, tokens.dtype)
+
+        return self._apply_1d_rope(tokens, positions, cos_comp, sin_comp)
