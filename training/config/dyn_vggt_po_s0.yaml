@@ -7,12 +7,13 @@ defaults:
 
 exp_name: dyn_vggt_po_s0
 img_size: 518
-num_workers: 8
+num_workers: 0
 seed_value: 42
-accum_steps: 2
+accum_steps: 1         # MUST be 1: accum>1 chunks the batch on B, and batch_size can be 1 (large img_num)
+                       # -> an empty B=0 chunk -> empty RoPE positions -> crash. No accumulation needed (S0 light).
 patch_size: 14
 val_epoch_freq: 1
-max_img_per_gpu: 32
+max_img_per_gpu: 10    # OOM at 16 (4 DPT heads @518² peaked ~29GB); 10 → ~18-20GB, safe overnight margin
 
 limit_train_batches: 800
 limit_val_batches: 200
@@ -28,6 +29,7 @@ data:
       patch_size: ${patch_size}
       debug: False
       repeat_batch: False
+      img_nums: [2, 10]   # cap clip length so peak memory ~max_img_per_gpu images
     dataset:
       _target_: data.composed_dataset.ComposedDataset
       dataset_configs:
@@ -42,6 +44,7 @@ data:
       img_size: ${img_size}
       patch_size: ${patch_size}
       debug: False
+      img_nums: [2, 10]
     dataset:
       _target_: data.composed_dataset.ComposedDataset
       dataset_configs:
@@ -77,7 +80,7 @@ logging:
 checkpoint:
   save_dir: logs/${exp_name}/ckpts
   save_freq: 1
-  resume_checkpoint_path: /home/cvml-75/Desktop/vggt/training/checkpoints/VGGT-1B.pt   # warm-start; new modules load as missing keys
+  resume_checkpoint_path: /home/cvml-75/Desktop/vggt/training/checkpoints/VGGT-1B.pt   # warm-start (raw state_dict, no optimizer key → clean load). NOTE: resuming from our own mid-run checkpoint hits an upstream trainer bug (trainer.py:216 self.optims.optimizer on a list), so crash-recovery resume needs that fixed first.
   strict: False
 
 
@@ -139,7 +142,7 @@ optim:
           value: 0.05
 
 
-max_epochs: 5
+max_epochs: 12   # generous for overnight; every epoch is checkpointed (save_freq=1) so we can pick any
 
 model:
   _target_: vggt.models.vggt.VGGT
