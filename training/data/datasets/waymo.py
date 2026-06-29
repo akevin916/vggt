@@ -118,6 +118,9 @@ class WaymoDataset(BaseDataset):
                 except ValueError:
                     continue
                 if cam_id in self.cameras:
+                    npz = osp.join(seg_dir, f"{frame_idx:05d}_{cam_id}.npz")
+                    if not osp.isfile(npz):
+                        continue
                     cam_frames[cam_id].append(frame_idx)
 
             for cam_id, frame_ids in cam_frames.items():

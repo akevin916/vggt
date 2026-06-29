@@ -31,7 +31,7 @@ SINTEL_EVAL_SEQUENCES = [
     "temple_3",
 ]
 
-DEFAULT_SINTEL_ROOT = "/home/cvml-75/Desktop/3D-repo/data/sintel/training"
+DEFAULT_SINTEL_ROOT = "/home/cvml-75/Desktop/vggt/training/data"
 
 
 @dataclass

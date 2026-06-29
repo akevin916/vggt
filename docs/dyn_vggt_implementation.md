@@ -15,7 +15,7 @@
 | 數據（PointOdyssey） | [pointodyssey.py](../training/data/datasets/pointodyssey.py) | 返回 `motion_mask`（RNG-replay 對齊） | ✅ 已實作 |
 | 數據（TartanAir） | [tartanair.py](../training/data/datasets/tartanair.py) | 靜態場景；不提供 `motion_mask`；S1 防遺忘混入 | ✅ 已實作 |
 | 數據 collation | [composed_dataset.py](../training/data/composed_dataset.py) | 轉發 `motion_mask`/`scene_flow_gt` | ✅ 已實作 |
-| 訓練 config | [dyn_vggt_po_s0.yaml](../training/config/dyn_vggt_po_s0.yaml)、[dyn_vggt_s1.yaml](../training/config/dyn_vggt_s1.yaml)、[dyn_vggt_s2a.yaml](../training/config/dyn_vggt_s2a.yaml) + smoke | S0 → S1a/S1b 平行 ablation | ✅ 已實作 |
+| 訓練 config | [dyn_vggt_po_s0.yaml](../training/config/dyn_vggt_po_s0.yaml)、[dyn_vggt_s1.yaml](../training/config/dyn_vggt_s1.yaml)、[dyn_vggt_s2a.yaml](../training/config/dyn_vggt_s2a.yaml)、[dyn_vggt_s2.yaml](../training/config/dyn_vggt_s2.yaml) + smoke | S0 → S1a/S1b/S2 | ✅ 已實作 |
 | warm-start 驗證 | [verify_warmstart.py](../training/verify_warmstart.py) | 載入 VGGT-1B 檢查 missing/unexpected + γ=0 | ✅ PASS |
 | 全局對齊（④） | 新建 `dyn_alignment.py` | 前饋初始化的 test-time 優化 | ⏳ 未做（P4） |
 | 評測 pipeline | 新建 eval 腳本 | §5 的 ATE/AbsRel/IoU/Chamfer | ⏳ 未做（P5） |
@@ -143,7 +143,7 @@ VGGT-1B.pt ──S0──▶ s0.pt │  (5 頭 + 7 loss)          ├─ S2 ─�
 | **S0** | aggregator + 原三頭 | 2 新頭（~65M） | `L_motion` `L_flow` | PO | 1e-4 | 8–12 | IoU ≳ 0.5；凍結幾何 bit-identical |
 | **S1a** | aggregator | 5 頭（~150–200M） | 全 7 項；`mask_dynamic` 開 | PO 70% + TA 30% | 5e-5 | 20 | motion IoU 維持；val AbsRel/ATE 改善 |
 | **S1b** | embed + frame + global | temporal + 5 頭（~448M） | 5 項（無 reproj/tsmooth） | PO 70% + TA 30% | 5e-5 | 20 | 時序一致 ↑；pose 無退化 |
-| **S2** | TBD | 合併 S1a + S1b 成果 | TBD | TBD | — | — | — |
+| **S2** | embed + frame | temporal + global + 5 頭（~750M） | 5 項（cam/depth/point/motion/flow；去 reproj/tsmooth） | PO 70% + TA 30% | 5e-5 | 20 | depth/pose 不退化；motion IoU 維持 |
 
 S1a 與 S1b 皆從 S0 出發，是**平行 ablation**：
 - **S1a**：固定 backbone，看「解凍全部頭 + 豐富 loss」的效果
@@ -151,13 +151,13 @@ S1a 與 S1b 皆從 S0 出發，是**平行 ablation**：
 
 **Loss 分類**：
 
-| 項 | S0 | S1a | S1b |
-|---|---|---|---|
-| `L_motion` `L_flow` | ✔ | ✔ | ✔ |
-| `L_cam` `L_depth` `L_point` | — | ✔ | ✔ |
-| `L_reproj` `L_tsmooth` | — | ✔ | — |
+| 項 | S0 | S1a | S1b | S2 |
+|---|---|---|---|---|
+| `L_motion` `L_flow` | ✔ | ✔ | ✔ | ✔ |
+| `L_cam` `L_depth` `L_point` | — | ✔ | ✔ | ✔ |
+| `L_reproj` `L_tsmooth` | — | ✔ | — | — |
 
-**記憶體參考（RTX 5090 ~31 GB）**：S0 `img_nums=[2,10]`；S1a `[2,6]`（peak ~25 GB）；S1b `[2,6]`（peak ~25 GB）。
+**記憶體參考（RTX 5090 ~31 GB）**：S0 `img_nums=[2,10]`；S1a `[2,6]`（peak ~25 GB）；S1b `[2,6]`（peak ~25 GB）；S2 `[2,4]`（temporal+global 同開，需壓幀數）。
 
 #### 各 stage 說明
 
@@ -176,40 +176,13 @@ S1a 與 S1b 皆從 S0 出發，是**平行 ablation**：
 只解凍 temporal blocks（global 凍住），看時序注意力對幾何的貢獻。不含 reproj/tsmooth（S2 觀察到這兩項梯度貢獻極小）。
 - S2 同時解凍 temporal + global 導致 pose catastrophic forgetting → S1b 隔離 temporal、保護 global。
 
-**S2 — 合併（規劃中）**
-根據 S1a/S1b 結果決定合併策略。
-
-### 4.3 跨 stage 權重傳遞
-
-```bash
-# 每 stage 結束：抽純權重
-python extract_weights.py --src logs/<exp>/ckpts/checkpoint_N.pt --dst checkpoints/dyn_vggt_sN.pt
-
-# 下一 stage config 指定
-checkpoint.resume_checkpoint_path: checkpoints/dyn_vggt_s<N-1>.pt
-```
-
-不可直接 resume 含 `optimizer` key 的 trainer checkpoint（upstream bug，見 execution §6）。
-
-### 4.4 Config 與啟動
-
-| config | stage | 狀態 | 說明 |
-|---|---|---|---|
-| `dyn_vggt_po_s0.yaml` | S0 | ✅ 已跑完 | 2 loss；`val_metrics: false` |
-| `dyn_vggt_s1.yaml` | S1a | ✅ 已跑完 | 5 頭 + 7 loss；PO+TA；backbone 凍 |
-| `dyn_vggt_s2a.yaml` | S1b | ✅ 就緒 | temporal + 5 loss；global/frame/embed 凍 |
-| `dyn_vggt_s1_smoke.yaml` | S1a smoke | ✅ | 20 batch 管線確認 |
-| `dyn_vggt_s2_smoke.yaml` | S1b smoke | ✅ | 記憶體 gate |
-| `dyn_vggt_po.yaml` | — | ⚠️ legacy | 舊版一次解凍 750M；不再使用 |
-
-啟動指令（必須用 `torchrun`）：
-```bash
-cd /home/cvml-75/Desktop/vggt/training
-torchrun --nproc_per_node=1 launch.py --config dyn_vggt_s1              # S1a
-torchrun --nproc_per_node=1 launch.py --config dyn_vggt_s2a             # S1b
-torchrun --nproc_per_node=1 launch.py --config dyn_vggt_s1_smoke        # S1a smoke
-torchrun --nproc_per_node=1 launch.py --config dyn_vggt_s2_smoke        # S1b smoke
-```
+**S2 — temporal + global 聯合訓練（ablation，✅ 進行中）**
+凍 `patch_embed` + `frame_blocks`，解凍 temporal + global + 5 頭（~750M）。**直接從 S0 warm-start**，跳過 S1 head-only 微調，驗證「temporal+global 一起解凍是否可行」。
+- **Loss 5 項**：`L_cam`(w=5) + `L_depth`(w=1) + `L_point`(w=1, `mask_dynamic`) + `L_motion`(w=1) + `L_flow`(w=0.5)。去掉 `reproj`（梯度趨近零）與 `tsmooth`（< 1% 梯度貢獻）。
+- **數據**：PO (`len_train=100000`) + TartanAir (`len_train=43000`)；`img_nums=[2,4]`、`max_img_per_gpu=4`。
+- **lr**：5e-5 cosine（5% linear warmup → 1e-8）；weight_decay=0.05；grad clip 1.0（aggregator / heads 分組）。
+- **AMP**：bfloat16。
+- **resume**：`logs/dyn_vggt_s2/ckpts/checkpoint_4.pt`（epoch 4 續訓）。
 
 ---
 
@@ -236,42 +209,17 @@ torchrun --nproc_per_node=1 launch.py --config dyn_vggt_s2_smoke        # S1b sm
 
 ## 6. 目前實作狀態與驗證
 
-### 6.1 已驗證（smoke / P0）
-- **架構 smoke**：RoPE1D pos=0=identity；temporal γ=0=identity；加 temporal 後 `output_list` 仍 `[B,S,P,2C]` 且輸出與原版逐位元相同（warm-start 嚴格等價）；雙場組裝廣播正確。
-- **loss smoke**：7 項 forward+backward、objective 有限、梯度流向 motion/flow/world/depth。
-- **warm-start 驗證**（`verify_warmstart.py`）：載入 `VGGT-1B.pt` → missing = `temporal_blocks+motion_head+flow_head`、unexpected = `track_head`（track 關閉）、temporal γ 全 0 → **PASS**。
-- **P0 真資料 overfit**：full model（1.35B）在真實 PointOdyssey batch 上 objective 下降、無 NaN。
-- **S0 launch smoke**（完整 `launch.py`→DDP→trainer）：warm-start 載入、PointOdyssey dataloader、trainable 65.3M（只 motion/flow）、訓練步 loss 計算、checkpoint 存檔、validation 跑通 → **exit 0**。
-- **S1a launch smoke**（`dyn_vggt_s1_smoke`）：凍 aggregator、5 頭 + 7 loss、`img_nums=[6,6]` peak ~25GB/31GB → **通過**（`[8,8]` OOM）。
-- **S1b mem smoke**（`dyn_vggt_s2_smoke`）：temporal + 5 頭、`img_nums=[4,4]` peak ~27GB/31GB → **通過**。
+### 6.1 sintel 評估
+| Metric / Model | Depth AbsRel | Depth $\delta < 1.25$ | Depth RMSE | Pose ATE   | Pose RPE-trans | **Pose RPE-rot** |
+| -------------- | ------------ | --------------------- | ---------- | ---------- | -------------- | ---------------- |
+| base           | 0.2747       | 0.6832                | 5.8274     | 0.1714     | 0.0617         | 0.4706           |
+| **S1a**        | 0.2552       | 0.6859                | **5.3843** | 0.1710     | 0.0691         | 0.4792           |
+| **S1b**        | 0.2790       | 0.6919                | 5.7328     | **0.1692** | 0.0770         | 0.5502           |
+| **s2**         | 0.2840       | 0.7039                | 4.9737     | 0.2035     | 0.0896         | 1.9737           |
+| **S1a-full**   | 0.2421       | 0.6869                | 5.2720     | 0.1816     | 0.0675         | 0.5409           |
+| **MonST3R**    | 0.3450       | 0.5620                | —          | 0.1080     | 0.0420         | 0.7320           |
 
-### 6.2 S1a 訓練結果與 Sintel 評測
-
-**S1a 訓練**：20 epoch（7h27m），凍 aggregator、解凍 5 頭、PO+TA 混合數據。最佳 checkpoint = **epoch 17**（綜合 RMSE/flow/RPE_rot 最優）。權重已抽取至 `checkpoints/dyn_vggt_s1.pt`（5.1GB）。
-
-**Sintel 評測（epoch-17, `eval_sintel.py`）**：
-
-| 指標 | Dyn-VGGT S1a | MonST3R | 比較 |
-|---|---|---|---|
-| **Depth AbsRel** | **0.2552** | 0.3450 | ✅ ↓26% |
-| **Depth δ<1.25** | **0.6859** | 0.5620 | ✅ ↑22% |
-| Depth RMSE | 5.3843 | — | — |
-| Pose ATE | 0.1710 | **0.1080** | ❌ +58%（S1b 解凍 temporal 後預期改善） |
-| Pose RPE-trans | 0.0691 | **0.0420** | ❌ +64% |
-| **Pose RPE-rot** | **0.4792** | 0.7320 | ✅ ↓35% |
-
-**判定**：Depth 已全面超越 MonST3R；旋轉估計優；平移精度差距預期在 S1b 解凍 temporal 後縮小。
-
-### 6.3 待完成
+### 6.2 待完成
 - `dyn_alignment.py`（P4 全局對齊）。
-- Spring/Waymo/Bonn loader（多數據集泛化）。
-- SEA-RAFT 光流快取（僅 mask-less 集的 `m*` 需要；PointOdyssey 有 GT mask 不需）。
 - PointOdyssey `trajs_3d` → 稀疏 `scene_flow_gt`（可選加強）。
 - 完整 benchmark（TUM/Bonn/DAVIS/KITTI 等）。
-
-### 6.4 環境與資料
-
-- **主 repo** = `/home/cvml-75/Desktop/vggt`；env `vggt-dyn`（editable install）。
-- warm-start 權重：`training/checkpoints/VGGT-1B.pt`（另有 `raft-things.pth` 供未來光流）。
-- 數據：PointOdyssey `/media/cvml-75/ssd2t1/data/point_odyssey`；TartanAir `/media/cvml-75/ssd2t1/data/tartanair`。
-- Config 與啟動指令見 §4.4。

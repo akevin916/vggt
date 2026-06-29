@@ -156,3 +156,4 @@ skyseg.onnx
 training/logs/
 /data
 /reference/
+training/config
