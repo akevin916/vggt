@@ -41,6 +41,7 @@ from train_utils.general import *
 from train_utils.logging import setup_logging
 from train_utils.normalization import normalize_camera_extrinsics_and_points_batch
 from train_utils.optimizer import construct_optimizers
+from eval.val_metrics import ValMetricsAccumulator
 
 
 class Trainer:
@@ -75,6 +76,7 @@ class Trainer:
         limit_val_batches: Optional[int] = None,
         optim: Optional[Dict[str, Any]] = None,
         loss: Optional[Dict[str, Any]] = None,
+        val_metrics: Optional[Dict[str, Any]] = None,
         env_variables: Optional[Dict[str, Any]] = None,
         accum_steps: int = 1,
         **kwargs,
@@ -111,6 +113,7 @@ class Trainer:
         self.logging_conf = logging
         self.checkpoint_conf = checkpoint
         self.optim_conf = optim
+        self.val_metrics_conf = val_metrics or {}
 
         # Store hyperparameters
         self.accum_steps = accum_steps
@@ -213,10 +216,17 @@ class Trainer:
         # Load optimizer state if available and in training mode
         if "optimizer" in checkpoint:
             logging.info(f"Loading optimizer state dict (rank {self.rank})")
-            self.optims.optimizer.load_state_dict(checkpoint["optimizer"])
+            opt_states = checkpoint["optimizer"]
+            if isinstance(opt_states, list):
+                for optim, state in zip(self.optims, opt_states):
+                    optim.optimizer.load_state_dict(state)
+            else:
+                self.optims[0].optimizer.load_state_dict(opt_states)
 
         # Load training progress
-        if "epoch" in checkpoint:
+        if "prev_epoch" in checkpoint:
+            self.epoch = checkpoint["prev_epoch"] + 1
+        elif "epoch" in checkpoint:
             self.epoch = checkpoint["epoch"]
         self.steps = checkpoint["steps"] if "steps" in checkpoint else {"train": 0, "val": 0}
         self.ckpt_time_elapsed = checkpoint.get("time_elapsed", 0)
@@ -247,7 +257,7 @@ class Trainer:
         self.model = instantiate(self.model_conf, _recursive_=False)
         self.loss = instantiate(self.loss_conf, _recursive_=False)
         self.gradient_clipper = instantiate(self.optim_conf.gradient_clip)
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.optim_conf.amp.enabled)
+        self.scaler = torch.amp.GradScaler('cuda', enabled=self.optim_conf.amp.enabled)
 
         # Freeze specified model parameters if any
         if getattr(self.optim_conf, "frozen_module_names", None):
@@ -428,6 +438,18 @@ class Trainer:
         loss_meters = {
             name: AverageMeter(name, self.device, ":.4f") for name in loss_names
         }
+
+        metric_meters = {}
+        metrics_tracker = None
+        if self.val_metrics_conf.get("enabled", False):
+            metrics_tracker = ValMetricsAccumulator(
+                max_depth=float(self.val_metrics_conf.get("max_depth", 80.0)),
+                min_depth_pixels=int(self.val_metrics_conf.get("min_depth_pixels", 100)),
+            )
+            for key in ("abs_rel", "delta_1", "rmse", "ate", "rpe_trans", "rpe_rot"):
+                metric_meters[f"Metric/val_{key}"] = AverageMeter(
+                    f"Metric/val_{key}", self.device, ":.4f"
+                )
         
         progress = ProgressMeter(
             num_batches=len(val_loader),
@@ -437,6 +459,7 @@ class Trainer:
                 mem,
                 self.time_elapsed_meter,
                 *loss_meters.values(),
+                *metric_meters.values(),
             ],
             real_meters={},
             prefix="Val Epoch: [{}]".format(self.epoch),
@@ -460,7 +483,7 @@ class Trainer:
             data_time.update(time.time() - end)
             data_times.append(data_time.val)
             
-            with torch.cuda.amp.autocast(enabled=False):
+            with torch.amp.autocast('cuda',enabled=False):
                 batch = self._process_batch(batch)
             batch = copy_data_to_device(batch, self.device, non_blocking=True)
 
@@ -473,13 +496,20 @@ class Trainer:
             
             # compute output
             with torch.no_grad():
-                with torch.cuda.amp.autocast(
+                with torch.amp.autocast('cuda',
                     enabled=self.optim_conf.amp.enabled,
                     dtype=amp_type,
                 ):
-                    val_loss_dict = self._step(
+                    _, y_hat = self._step(
                         batch, self.model, phase, loss_meters
                     )
+                    if metrics_tracker is not None:
+                        batch_metrics = metrics_tracker.update(y_hat, batch)
+                        bs = batch["extrinsics"].shape[0]
+                        for key, val in batch_metrics.items():
+                            meter_key = key.replace("metric_", "Metric/val_")
+                            if meter_key in metric_meters:
+                                metric_meters[meter_key].update(val, bs)
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -495,6 +525,28 @@ class Trainer:
             if data_iter % self.logging_conf.log_freq == 0:
                 progress.display(data_iter)
 
+        if metrics_tracker is not None and self.rank == 0:
+            summary = metrics_tracker.compute()
+            if summary:
+                parts = []
+                if "abs_rel" in summary:
+                    parts.append(
+                        f"depth AbsRel={summary['abs_rel']:.4f} "
+                        f"d1={summary['delta_1']:.4f} RMSE={summary['rmse']:.4f} "
+                        f"({int(summary.get('depth_frames', 0))} frames)"
+                    )
+                if "ate" in summary:
+                    parts.append(
+                        f"pose ATE={summary['ate']:.4f} "
+                        f"RPE-t={summary['rpe_trans']:.4f} "
+                        f"RPE-r={summary['rpe_rot']:.4f} "
+                        f"({int(summary.get('pose_seqs', 0))} seqs)"
+                    )
+                logging.info("Val Epoch: [%s] metrics | %s", self.epoch, " | ".join(parts))
+                for key, val in summary.items():
+                    if key.endswith("_frames") or key.endswith("_seqs"):
+                        continue
+                    self.tb_writer.log(f"Metrics/val/{key}", val, self.epoch)
 
         return True
 
@@ -552,7 +604,7 @@ class Trainer:
             data_times.append(data_time.val)
 
             
-            with torch.cuda.amp.autocast(enabled=False):
+            with torch.amp.autocast('cuda',enabled=False):
                 batch = self._process_batch(batch)
 
             batch = copy_data_to_device(batch, self.device, non_blocking=True)
@@ -666,11 +718,11 @@ class Trainer:
             )
 
             with ddp_context:
-                with torch.cuda.amp.autocast(
+                with torch.amp.autocast('cuda',
                     enabled=self.optim_conf.amp.enabled,
                     dtype=amp_type,
                 ):
-                    loss_dict = self._step(
+                    loss_dict, _ = self._step(
                         chunked_batch, self.model, phase, loss_meters
                     )
 
@@ -759,7 +811,7 @@ class Trainer:
         self._log_tb_visuals(log_data, phase, self.steps[phase])
 
         self.steps[phase] += 1
-        return loss_dict
+        return loss_dict, y_hat
 
     def _update_and_log_scalars(self, data: Mapping, phase: str, step: int, loss_meters: dict):
         """Updates average meters and logs scalar values to TensorBoard."""

@@ -151,9 +151,11 @@ class ComposedDataset(Dataset, ABC):
             "world_points": world_points,
             "point_masks": point_masks,
         }
-        # NEW: include dynamic GT only when available (keeps non-dynamic datasets unaffected).
-        if motion_mask is not None:
-            sample["motion_mask"] = motion_mask
+        # Always include motion_mask so default_collate works when batch_size>1 mixes PO + static
+        # datasets (e.g. TartanAir). Static scenes use all-zero mask (m≈0); L_motion still valid.
+        if motion_mask is None:
+            motion_mask = torch.zeros_like(depths)
+        sample["motion_mask"] = motion_mask
         if scene_flow_gt is not None:
             sample["scene_flow_gt"] = scene_flow_gt
 
