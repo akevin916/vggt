@@ -12,6 +12,64 @@ from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
 
+def _load_state_dict(ckpt: str) -> dict:
+    sd = torch.load(ckpt, map_location="cpu", weights_only=False)
+    if isinstance(sd, dict) and "model" in sd:
+        sd = sd["model"]
+    return sd
+
+
+def load_vggt_for_eval(
+    ckpt: str,
+    img_size: int = 518,
+    gate_block_iter: int = 7,
+    device: str = "cuda",
+) -> VGGT:
+    """Build VGGT with architecture inferred from checkpoint keys."""
+    sd = _load_state_dict(ckpt)
+    keys = list(sd.keys())
+    has_gate = any("gate_predictor" in k for k in keys)
+    has_dyn = any(k.startswith("motion") or "scene_flow" in k or "temporal" in k for k in keys)
+
+    if has_gate:
+        model = VGGT(
+            img_size=img_size,
+            enable_camera=True,
+            enable_depth=True,
+            enable_point=False,
+            enable_track=False,
+            enable_temporal=True,
+            enable_motion=False,
+            enable_flow=False,
+            enable_gate=True,
+            gate_block_iter=gate_block_iter,
+        )
+    elif has_dyn:
+        model = VGGT(
+            img_size=img_size,
+            enable_camera=True,
+            enable_depth=True,
+            enable_point=True,
+            enable_track=False,
+            enable_temporal=True,
+            enable_motion=True,
+            enable_flow=True,
+        )
+    else:
+        model = VGGT(
+            img_size=img_size,
+            enable_camera=True,
+            enable_depth=True,
+            enable_point=True,
+            enable_track=False,
+            enable_temporal=False,
+            enable_motion=False,
+            enable_flow=False,
+        )
+    model.load_state_dict(sd, strict=False)
+    return model.to(device).eval()
+
+
 def load_dyn_vggt(
     ckpt: str,
     img_size: int = 518,
@@ -30,9 +88,7 @@ def load_dyn_vggt(
         enable_motion=motion,
         enable_flow=flow,
     )
-    sd = torch.load(ckpt, map_location="cpu", weights_only=False)
-    if isinstance(sd, dict) and "model" in sd:
-        sd = sd["model"]
+    sd = _load_state_dict(ckpt)
     model.load_state_dict(sd, strict=False)
     return model.to(device).eval()
 

@@ -31,7 +31,34 @@ SINTEL_EVAL_SEQUENCES = [
     "temple_3",
 ]
 
-DEFAULT_SINTEL_ROOT = "/home/cvml-75/Desktop/vggt/training/data"
+DEFAULT_SINTEL_ROOT = "..data/sintel/training"  # legacy typo; use resolve_sintel_root() instead
+
+
+def resolve_sintel_root(sintel_root: str | None = None) -> str:
+    """Return an existing Sintel training root (handles legacy relative defaults)."""
+    if sintel_root and sintel_root not in ("", DEFAULT_SINTEL_ROOT):
+        root = os.path.abspath(sintel_root)
+    else:
+        eval_dir = os.path.dirname(os.path.abspath(__file__))
+        training_dir = os.path.dirname(eval_dir)
+        repo_root = os.path.dirname(training_dir)
+        candidates = [
+            os.path.join(repo_root, "data", "sintel", "training"),
+            "/media/cvml-75/ssd2t1/data/sintel/training",
+            "/home/cvml-75/Desktop/3D-repo/data/sintel/training",
+            os.path.abspath(os.path.join(training_dir, "..data", "sintel", "training")),
+            os.path.abspath(os.path.join(training_dir, "../data/sintel/training")),
+        ]
+        root = next(
+            (p for p in candidates if os.path.isdir(os.path.join(p, "final"))),
+            candidates[0],
+        )
+    if not os.path.isdir(os.path.join(root, "final")):
+        raise FileNotFoundError(
+            f"Sintel not found at {root}. Pass --sintel_root explicitly "
+            f"(need final/, depth/, camdata_left/ under the path)."
+        )
+    return root
 
 
 @dataclass

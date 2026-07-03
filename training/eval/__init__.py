@@ -1,1 +1,1 @@
-# Dyn-VGGT evaluation utilities (Sintel pose + depth, online val metrics).
+# Dyn-VGGT evaluation utilities (Sintel benchmark, gate eval, shared metrics).
