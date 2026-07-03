@@ -110,11 +110,17 @@ def normalize_camera_extrinsics_and_points_batch(
             new_depths = new_depths / avg_scale.view(-1, 1, 1, 1)
         if cam_points is not None:
             new_cam_points = new_cam_points / avg_scale.view(-1, 1, 1, 1, 1)
-        # NEW (B6): scene flow is a displacement of world points → scales by the same factor (no offset),
-        #           so X^can + m·Δ stays self-consistent in the normalised space (docs §6.2 / §12-B6).
+        # B6 + v2 fix: scene flow is a world-frame displacement of world points. The world frame is
+        # rotated by R (line 92, the first camera's world→cam rotation) AND scaled by avg_scale.
+        # A displacement transforms by the SAME rotation (the translation cancels for differences),
+        # so it must be rotated by R too — not only scaled — to stay in lock-step with world_points.
         if scene_flow is not None:
+            scene_flow = scene_flow @ R.transpose(-1, -2).unsqueeze(1).unsqueeze(2)
             scene_flow = scene_flow / avg_scale.view(-1, 1, 1, 1, 1)
     else:
+        # No scaling, but the world frame is still rotated by R → rotate scene flow in lock-step.
+        if scene_flow is not None and world_points is not None:
+            scene_flow = scene_flow @ R.transpose(-1, -2).unsqueeze(1).unsqueeze(2)
         return new_extrinsics[:, :, :3], cam_points, new_world_points, depths, scene_flow
 
     new_extrinsics = new_extrinsics[:, :, :3] # 4x4 -> 3x4

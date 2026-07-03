@@ -114,6 +114,8 @@ class Trainer:
         self.checkpoint_conf = checkpoint
         self.optim_conf = optim
         self.val_metrics_conf = val_metrics or {}
+        # Best pose ATE seen so far (drives best.pt); restored on resume.
+        self.best_ate = float("inf")
 
         # Store hyperparameters
         self.accum_steps = accum_steps
@@ -230,6 +232,7 @@ class Trainer:
             self.epoch = checkpoint["epoch"]
         self.steps = checkpoint["steps"] if "steps" in checkpoint else {"train": 0, "val": 0}
         self.ckpt_time_elapsed = checkpoint.get("time_elapsed", 0)
+        self.best_ate = checkpoint.get("best_ate", float("inf"))
 
         # Load AMP scaler state if available
         if self.optim_conf.amp.enabled and "scaler" in checkpoint:
@@ -270,6 +273,21 @@ class Trainer:
             )
             logging.info(
                 f"[Done] Freezing modules: {self.optim_conf.frozen_module_names} on rank {self.distributed_rank}"
+            )
+
+        # Freeze individual nn.Parameters by substring match (handles params that are not
+        # sub-modules, e.g. aggregator.camera_token / aggregator.register_token).
+        # frozen_param_names: list of substrings; any parameter whose fully-qualified name
+        # contains one of these substrings is frozen (requires_grad = False).
+        if getattr(self.optim_conf, "frozen_param_names", None):
+            frozen_count = 0
+            for name, param in self.model.named_parameters():
+                if any(pat in name for pat in self.optim_conf.frozen_param_names):
+                    param.requires_grad = False
+                    frozen_count += 1
+            logging.info(
+                f"[Done] Freezing {frozen_count} individual params matching: "
+                f"{list(self.optim_conf.frozen_param_names)} on rank {self.distributed_rank}"
             )
 
         # Log model summary on rank 0
@@ -337,6 +355,7 @@ class Trainer:
             "prev_epoch": epoch,
             "steps": self.steps,
             "time_elapsed": self.time_elapsed_meter.val,
+            "best_ate": self.best_ate,
             "optimizer": [optim.optimizer.state_dict() for optim in self.optims],
         }
         
@@ -376,53 +395,70 @@ class Trainer:
         """Main entry point to start the training or validation process."""
         assert self.mode in ["train", "val"], f"Invalid mode: {self.mode}"
         if self.mode == "train":
+            # run_train already validates + checkpoints (last/best) every epoch,
+            # including the final epoch, so no extra post-train validation is needed.
             self.run_train()
-            # Optionally run a final validation after all training is done
-            self.run_val()
         elif self.mode == "val":
             self.run_val()
         else:
             raise ValueError(f"Invalid mode: {self.mode}")
 
     def run_train(self):
-        """Runs the main training loop over all epochs."""
+        """Runs the main training loop over all epochs.
+
+        Checkpoint policy: every epoch runs validation, then saves a rolling
+        ``last.pt`` (latest epoch) and, whenever the pose ATE improves, ``best.pt``.
+        """
         while self.epoch < self.max_epochs:
             set_seeds(self.seed_value + self.epoch * 100, self.max_epochs, self.distributed_rank)
-            
+
             dataloader = self.train_dataset.get_loader(epoch=int(self.epoch + self.distributed_rank))
             self.train_epoch(dataloader)
-            
-            # Save checkpoint after each training epoch
-            self.save_checkpoint(self.epoch)
 
-            # Clean up memory
+            # Clean up training memory before validation.
             del dataloader
             gc.collect()
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
 
-            # Run validation at the specified frequency
-            # Skips validation after the last training epoch, as it can be run separately.
-            if self.epoch % self.val_epoch_freq == 0 and self.epoch < self.max_epochs - 1:
-                self.run_val()
-            
+            # Validate every epoch to drive best-checkpoint selection.
+            summary = self.run_val()
+
+            # Rolling latest checkpoint.
+            self.save_checkpoint(self.epoch, checkpoint_names=["last"])
+
+            # Best checkpoint by pose ATE (lower is better).
+            ate = summary.get("ate") if isinstance(summary, dict) else None
+            if ate is not None and ate < self.best_ate:
+                logging.info(
+                    "New best pose ATE %.4f (prev %.4f) at epoch %s -> saving best.pt",
+                    ate, self.best_ate, self.epoch,
+                )
+                self.best_ate = float(ate)
+                self.save_checkpoint(self.epoch, checkpoint_names=["best"])
+
             self.epoch += 1
-        
+
         self.epoch -= 1
 
     def run_val(self):
-        """Runs a full validation epoch if a validation dataset is available."""
+        """Runs a full validation epoch if a validation dataset is available.
+
+        Returns the metric summary dict (e.g. {"ate": ..., "abs_rel": ...}),
+        or an empty dict when no val dataset / metrics are configured.
+        """
         if not self.val_dataset:
             logging.info("No validation dataset configured. Skipping validation.")
-            return
+            return {}
 
         dataloader = self.val_dataset.get_loader(epoch=int(self.epoch + self.distributed_rank))
-        self.val_epoch(dataloader)
-        
+        summary = self.val_epoch(dataloader)
+
         del dataloader
         gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
+        return summary
 
 
     @torch.no_grad()
@@ -525,6 +561,7 @@ class Trainer:
             if data_iter % self.logging_conf.log_freq == 0:
                 progress.display(data_iter)
 
+        summary = {}
         if metrics_tracker is not None and self.rank == 0:
             summary = metrics_tracker.compute()
             if summary:
@@ -548,7 +585,9 @@ class Trainer:
                         continue
                     self.tb_writer.log(f"Metrics/val/{key}", val, self.epoch)
 
-        return True
+        # Return the metric summary (ATE etc.) so the training loop can drive
+        # best-checkpoint selection. Empty dict when metrics are disabled.
+        return summary
 
     def train_epoch(self, train_loader):        
         batch_time = AverageMeter("Batch Time", self.device, ":.4f")

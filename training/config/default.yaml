@@ -10,8 +10,14 @@ patch_size: 14
 val_epoch_freq: 5
 max_img_per_gpu: 48
 
-limit_train_batches: 800
-limit_val_batches: 400
+limit_train_batches: 2000
+limit_val_batches: 200
+
+# Validation metrics (depth AbsRel/δ1/RMSE + pose ATE/RPE via evo; median scale depth align)
+val_metrics:
+  enabled: true
+  max_depth: 80.0
+  min_depth_pixels: 100
 
 
 data:
@@ -50,7 +56,7 @@ data:
 
 
 logging:
-  log_dir: logs
+  log_dir: logs/${exp_name}
   log_visuals: False
   log_freq: 1
   log_level_primary: DEBUG
@@ -84,7 +90,7 @@ logging:
 
 
 checkpoint:
-  save_dir: logs/${exp_name}/ckpts
+  save_dir: ${logging.log_dir}/ckpts
   save_freq: 5
   resume_checkpoint_path: /YOUR/PATH/TO/CKPT
   strict: False

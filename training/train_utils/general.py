@@ -60,11 +60,12 @@ def check_and_fix_inf_nan(input_tensor, loss_name="default", hard_max=100):
 def get_resume_checkpoint(checkpoint_save_dir):
     if not g_pathmgr.isdir(checkpoint_save_dir):
         return None
-    ckpt_file = os.path.join(checkpoint_save_dir, "checkpoint.pt")
-    if not g_pathmgr.isfile(ckpt_file):
-        return None
-
-    return ckpt_file
+    # Prefer the new rolling "last.pt"; fall back to the legacy "checkpoint.pt".
+    for name in ("last.pt", "checkpoint.pt"):
+        ckpt_file = os.path.join(checkpoint_save_dir, name)
+        if g_pathmgr.isfile(ckpt_file):
+            return ckpt_file
+    return None
 
 class DurationMeter:
     def __init__(self, name, device, fmt=":f"):
