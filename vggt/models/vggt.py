@@ -18,14 +18,20 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
     # MODIFIED: Dyn-VGGT extensions are all opt-in (default flags off) so plain VGGT() and pretrained
     #           checkpoint loading are byte-for-byte unchanged. Set enable_temporal/motion/flow to True
     #           to activate the spatio-temporal aggregator and the motion-decoupled dual-field heads.
+    #           Set enable_gate=True for v3 motion-gated camera aggregation.
     def __init__(self, img_size=518, patch_size=14, embed_dim=1024,
                  enable_camera=True, enable_point=True, enable_depth=True, enable_track=True,
-                 enable_temporal=False, enable_motion=False, enable_flow=False):
+                 enable_temporal=False, enable_motion=False, enable_flow=False,
+                 # v3: motion-gated camera aggregation
+                 enable_gate=False, gate_block_iter=7):
         super().__init__()
 
         # NEW: enable_temporal injects temporal attention into the aggregator (aa_order gains "temporal").
         aa_order = ["frame", "temporal", "global"] if enable_temporal else ["frame", "global"]
-        self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim, aa_order=aa_order)
+        self.aggregator = Aggregator(
+            img_size=img_size, patch_size=patch_size, embed_dim=embed_dim, aa_order=aa_order,
+            enable_gate=enable_gate, gate_block_iter=gate_block_iter,
+        )
 
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None
         self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1") if enable_point else None
@@ -71,9 +77,13 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         if query_points is not None and len(query_points.shape) == 2:
             query_points = query_points.unsqueeze(0)
 
-        aggregated_tokens_list, patch_start_idx = self.aggregator(images)
+        aggregated_tokens_list, patch_start_idx, gate_logits = self.aggregator(images)
 
         predictions = {}
+
+        # v3: expose gate logits for L_gate supervision (§3 / §5)
+        if gate_logits is not None:
+            predictions["gate_logits"] = gate_logits    # [B, S, P_patch], with gradients
 
         with torch.amp.autocast('cuda', enabled=False):
             if self.camera_head is not None:
@@ -95,9 +105,13 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 predictions["world_points"] = pts3d
                 predictions["world_points_conf"] = pts3d_conf
 
-            # NEW: motion-decoupled dual-field branch (Dyn-VGGT contributions ②③).
-            #      motion head → dynamic probability m; flow head → residual scene flow Δ;
-            #      assembled point X_{t,p} = X^can_{t,p} + m·Δ (docs §4.1). Heads are opt-in.
+            # Dyn-VGGT v2 (docs/dyn_vggt_method_v2.md): motion-GATED, NOT motion-composed.
+            #   motion head → dynamic probability m (M_t): used ONLY as a gate in the loss
+            #     (pose static-selection, loss masking); it is NEVER multiplied into the geometry.
+            #   flow head → scene flow Δ (Δ_t): a PARALLEL 4D output (per-pixel world-frame
+            #     displacement t→t+1), directly supervised; it is NEVER added to world_points.
+            # The v1 bilinear assembly X = X^can + m·Δ is removed — it was non-identifiable and let
+            # the unsupervised dynamic X^can absorb motion, leaving Δ idle (see method_v2 §1).
             if self.motion_head is not None:
                 motion, motion_conf = self.motion_head(
                     aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
@@ -110,11 +124,6 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 )
                 predictions["scene_flow"] = scene_flow       # [B, S, H, W, 3] residual displacement Δ
                 predictions["scene_flow_conf"] = scene_flow_conf
-            # Assemble the motion-decoupled point only when all ingredients are present.
-            if self.point_head is not None and self.motion_head is not None and self.flow_head is not None:
-                predictions["world_points_dyn"] = (
-                    predictions["world_points"] + predictions["motion_prob"] * predictions["scene_flow"]
-                )
 
         if self.track_head is not None and query_points is not None:
             track_list, vis, conf = self.track_head(

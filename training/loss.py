@@ -27,7 +27,9 @@ class MultitaskLoss(torch.nn.Module):
     # MODIFIED: Dyn-VGGT adds four task configs (motion/flow/reproj/tsmooth). All optional — if a config
     #           dict is None the corresponding branch is skipped, so the original VGGT loss is unchanged.
     def __init__(self, camera=None, depth=None, point=None, track=None,
-                 motion=None, flow=None, reproj=None, tsmooth=None, **kwargs):
+                 motion=None, flow=None, reproj=None, tsmooth=None,
+                 gate=None,    # v3: motion-gate BCE (docs/dyn_vggt_method_v3.md §5/§6)
+                 **kwargs):
         super().__init__()
         # Loss configuration dictionaries for each task
         self.camera = camera
@@ -38,6 +40,7 @@ class MultitaskLoss(torch.nn.Module):
         self.flow = flow          # NEW: 3D scene-flow supervision (docs §6.2-2)
         self.reproj = reproj      # NEW: cross-time reprojection consistency (docs §6.2-3)
         self.tsmooth = tsmooth    # NEW: temporal smoothness of flow & motion (docs §6.2-4)
+        self.gate = gate          # v3: gate-predictor BCE against GT dynamic mask
 
     def forward(self, predictions, batch) -> torch.Tensor:
         """
@@ -83,12 +86,13 @@ class MultitaskLoss(torch.nn.Module):
             total_loss = total_loss + motion_loss_dict["loss_motion"] * self.motion["weight"]
             loss_dict.update(motion_loss_dict)
 
-        # NEW: scene-flow supervision — dense "assembled point vs GT world_points" (primary, needs only
-        #      depth+camera) plus optional sparse 3D scene-flow GT. Trains the flow head Δ (docs §6.2-2).
-        if self.flow is not None and "world_points_dyn" in predictions and "world_points" in batch:
+        # v2: scene-flow supervision on the PARALLEL flow head Δ (docs/dyn_vggt_method_v2.md §4.4).
+        #     Two DIRECT signals, no bilinear assembly: (1) static-zero prior (1-M)·‖Δ‖₁ — exact GT
+        #     since static world-frame flow is 0, available everywhere; (2) sparse 3D GT (trajs_3d)
+        #     where provided. The v1 dense "assembled-point vs world_points" path is removed.
+        if self.flow is not None and "scene_flow" in predictions:
             flow_loss_dict = compute_flow_loss(predictions, batch, **self.flow)
-            flow_loss = (flow_loss_dict["loss_conf_flow"] + flow_loss_dict["loss_reg_flow"]
-                         + flow_loss_dict["loss_sparse_flow"])
+            flow_loss = flow_loss_dict["loss_static_flow"] + flow_loss_dict["loss_sparse_flow"]
             total_loss = total_loss + flow_loss * self.flow["weight"]
             loss_dict.update(flow_loss_dict)
 
@@ -103,6 +107,14 @@ class MultitaskLoss(torch.nn.Module):
             tsmooth_loss_dict = compute_tsmooth_loss(predictions, batch, **self.tsmooth)
             total_loss = total_loss + tsmooth_loss_dict["loss_tsmooth"] * self.tsmooth["weight"]
             loss_dict.update(tsmooth_loss_dict)
+
+        # v3: gate-predictor BCE (L_gate = BCE(σ(g), m*)).  m* is the GT dynamic mask
+        # averaged to patch resolution.  gate_logits are NOT detached here so that
+        # gradients flow into the gate predictor weights.
+        if self.gate is not None and "gate_logits" in predictions and "motion_mask" in batch:
+            gate_loss_dict = compute_gate_loss(predictions, batch, **self.gate)
+            total_loss = total_loss + gate_loss_dict["loss_gate"] * self.gate.get("weight", 1.0)
+            loss_dict.update(gate_loss_dict)
 
         # Tracking loss - not cleaned yet, dirty code is at the bottom of this file
         if "track" in predictions:
@@ -327,10 +339,13 @@ def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
 # NEW: Dyn-VGGT loss terms (motion / flow / reproj / tsmooth). See docs/dyn_vggt_method.md §6.2.
 # ----------------------------------------------------------------------------------------------------
 
-def compute_motion_loss(predictions, batch, supervise_valid_only=False, **kwargs):
+def compute_motion_loss(predictions, batch, supervise_valid_only=False,
+                        l1_weight=0.0, tv_weight=0.0, **kwargs):
     # NEW: dynamic-segmentation BCE. Supervises motion head m∈[0,1] against the GT dynamic mask
     #      (docs §6.2-1). When no GT mask is available a pseudo-label path would be used instead
     #      (handled by the caller's gating); here GT supervision is assumed present.
+    # v2: optional sparsity (α‖M‖₁, prevents "everything-dynamic" collapse) and spatial TV
+    #     (smooth mask) regularizers (docs/dyn_vggt_method_v2.md §3.3/§4). Default 0 → pure BCE.
     pred_m = predictions["motion_prob"][..., 0]          # (B, S, H, W), post-sigmoid in [0,1]
     gt_m = batch["motion_mask"].to(pred_m.dtype)         # (B, S, H, W)
     pred_m = pred_m.clamp(1e-6, 1 - 1e-6)
@@ -343,56 +358,62 @@ def compute_motion_loss(predictions, batch, supervise_valid_only=False, **kwargs
         loss = bce[m].mean() if m.sum() >= 1 else (0.0 * pred_m).mean()
     else:
         loss = bce.mean()
+
+    if l1_weight > 0:
+        loss = loss + l1_weight * pred_m.abs().mean()
+    if tv_weight > 0:
+        tv = (pred_m[..., 1:, :] - pred_m[..., :-1, :]).abs().mean() \
+           + (pred_m[..., :, 1:] - pred_m[..., :, :-1]).abs().mean()
+        loss = loss + tv_weight * tv
+
     loss = check_and_fix_inf_nan(loss, "loss_motion")
     return {"loss_motion": loss}
 
 
-def compute_flow_loss(predictions, batch, gamma=1.0, alpha=0.2, valid_range=-1,
-                      sparse_huber_delta=1.0, **kwargs):
+def compute_flow_loss(predictions, batch, sparse_huber_delta=1.0, dyn_thresh=0.5, **kwargs):
     """
-    Scene-flow (Δ) supervision (docs §6.2-2). Trains the flow head through TWO signals:
+    v2 scene-flow (Δ) supervision (docs/dyn_vggt_method_v2.md §4.4). The flow head is a PARALLEL
+    output (Δ never enters world_points). Two DIRECT signals — no bilinear assembly:
 
-    1. Dense "assembled point" supervision (primary, no optical flow needed):
-       GT `world_points` at frame t IS the true world position of every pixel's surface at that
-       instant (dynamic objects included), so the assembled point X = X^can + m·Δ has a dense GT
-       target. Combined with the (1-m)-masked L_point (which pins X^can on static pixels only),
-       this forces Δ to explain the dynamic-region discrepancy. Works on any depth+camera dataset.
+    1. Static-zero prior (dense, free, exact): a static point does not move in the world frame, so
+       its true scene flow is 0. We push (1-M)·‖Δ‖₁ → 0 on static pixels. M is detached (used only
+       to select "where is static"). This is genuine GT for static regions, available everywhere.
 
-    2. Optional sparse 3D scene-flow GT (e.g. PointOdyssey trajs_3d): a direct L1 on Δ where a
-       per-pixel `scene_flow_gt` (+ `scene_flow_mask`) is provided.
+    2. Sparse 3D scene-flow GT (e.g. PointOdyssey trajs_3d): a direct Huber on Δ where a per-pixel
+       `scene_flow_gt` (+ `scene_flow_mask`) is provided. NOTE: until the dataset wires trajs_3d,
+       this term is inactive and Δ is trained by the static-zero prior alone (Δ → 0 everywhere,
+       expected — the dynamic signal turns on once trajs_3d lands).
     """
-    pred_dyn = predictions["world_points_dyn"]           # (B, S, H, W, 3) assembled point
-    flow_conf = predictions.get("scene_flow_conf", predictions["world_points_conf"])
-    gt_points = batch["world_points"]
-    gt_mask = batch["point_masks"]
+    pred_flow = predictions["scene_flow"]                # (B, S, H, W, 3) Δ, world-frame
+    pred_flow = check_and_fix_inf_nan(pred_flow, "pred_flow")
 
-    gt_points = check_and_fix_inf_nan(gt_points, "gt_points_flow")
+    # (1) Static-zero prior. Weight by (1 - M) so dynamic pixels are exempt.
+    if "motion_prob" in predictions:
+        m = predictions["motion_prob"][..., 0].detach().clamp(0, 1)   # (B, S, H, W)
+        static_w = (1.0 - m)
+    else:
+        static_w = torch.ones(pred_flow.shape[:-1], device=pred_flow.device, dtype=pred_flow.dtype)
+    flow_mag = pred_flow.abs().sum(dim=-1)                # (B, S, H, W) L1 over xyz
+    denom = static_w.sum().clamp(min=1.0)
+    loss_static = (static_w * flow_mag).sum() / denom
+    loss_static = check_and_fix_inf_nan(loss_static, "loss_static_flow")
 
-    if gt_mask.sum() < 100:
-        dummy = (0.0 * pred_dyn).mean()
-        return {"loss_conf_flow": dummy, "loss_reg_flow": dummy, "loss_sparse_flow": dummy}
+    loss_dict = {"loss_static_flow": loss_static}
 
-    # Dense confidence-weighted regression of the assembled point against GT world points.
-    loss_conf, _, loss_reg = regression_loss(
-        pred_dyn, gt_points, gt_mask, conf=flow_conf,
-        gradient_loss_fn="", gamma=gamma, alpha=alpha, valid_range=valid_range,
-    )
-
-    loss_dict = {"loss_conf_flow": loss_conf, "loss_reg_flow": loss_reg}
-
-    # Optional sparse 3D scene-flow GT path.
+    # (2) Sparse 3D scene-flow GT path (inactive until trajs_3d is wired into the dataset).
     if "scene_flow_gt" in batch:
-        pred_flow = predictions["scene_flow"]
         gt_flow = batch["scene_flow_gt"]
-        valid = batch.get("scene_flow_mask", gt_mask)
-        if valid.sum() > 0:
+        valid = batch.get("scene_flow_mask", batch.get("point_masks"))
+        if valid is not None:
+            valid = valid.bool()
+        if valid is not None and valid.sum() > 0:
             diff = (pred_flow[valid] - gt_flow[valid]).abs().sum(dim=-1)
             loss_sparse = F.huber_loss(diff, torch.zeros_like(diff), delta=sparse_huber_delta)
             loss_dict["loss_sparse_flow"] = check_and_fix_inf_nan(loss_sparse, "loss_sparse_flow")
         else:
-            loss_dict["loss_sparse_flow"] = (0.0 * pred_dyn).mean()
+            loss_dict["loss_sparse_flow"] = (0.0 * pred_flow).mean()
     else:
-        loss_dict["loss_sparse_flow"] = (0.0 * pred_dyn).mean()
+        loss_dict["loss_sparse_flow"] = (0.0 * pred_flow).mean()
 
     return loss_dict
 
@@ -457,6 +478,44 @@ def compute_tsmooth_loss(predictions, batch, tv_weight=0.1, **kwargs):
         anchor = predictions.get("scene_flow", predictions.get("motion_prob"))
         total = (0.0 * anchor).mean()
     return {"loss_tsmooth": total}
+
+
+def compute_gate_loss(predictions, batch, patch_size=14, alpha_m=10.0, beta_m=0.1, **kwargs):
+    """
+    v3 gate-predictor loss  L_gate = BCE( σ(g), m* )  (docs/dyn_vggt_method_v3.md §5/§6).
+
+    gate_logits g [B, S, P_patch] are supervised against the GT dynamic mask m*
+    averaged/pooled to patch resolution.
+
+    m* sources (in order of priority):
+      1. batch["motion_mask"]  [B, S, H, W]  — binary GT dynamic mask (PointOdyssey et al.).
+         Average-pooled to patch grid to obtain a soft per-patch probability in [0, 1].
+      2. (future) Geometric residual ‖f^gt − f^cam‖ thresholded by α_m / β_m — §5.1.
+
+    The loss is a standard binary cross-entropy on the logits (autocast-safe).
+    """
+    gate_logits = predictions["gate_logits"]       # [B, S, P_patch], NOT detached → gradient flows
+    motion_mask = batch["motion_mask"]             # [B, S, H, W], float or bool
+
+    B, S, P_patch = gate_logits.shape
+    _, _, H, W = motion_mask.shape
+
+    # Derive patch grid dimensions
+    P_h = H // patch_size
+    P_w = W // patch_size
+
+    # Average-pool GT mask to patch resolution → soft probability ∈ [0, 1]
+    m_star = F.adaptive_avg_pool2d(
+        motion_mask.reshape(B * S, 1, H, W).float(),
+        (P_h, P_w),
+    ).reshape(B, S, P_h * P_w)  # [B, S, P_patch]
+
+    # BCE on logits (more numerically stable than BCE on probabilities)
+    loss = F.binary_cross_entropy_with_logits(
+        gate_logits, m_star.to(gate_logits.dtype),
+    )
+    loss = check_and_fix_inf_nan(loss, "loss_gate")
+    return {"loss_gate": loss}
 
 
 def regression_loss(pred, gt, mask, conf=None, gradient_loss_fn=None, gamma=1.0, alpha=0.2, valid_range=-1):

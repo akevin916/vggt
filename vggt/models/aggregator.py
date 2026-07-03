@@ -18,6 +18,50 @@ from vggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_g
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# v3: Motion-Gated Camera Aggregation (docs/dyn_vggt_method_v3.md §3)
+# ---------------------------------------------------------------------------
+
+class GatePredictor(nn.Module):
+    """
+    Mid-aggregator motion gate predictor (Dyn-VGGT v3 §3).
+
+    Takes patch tokens from the middle of the aggregator (~1/3 depth) and
+    predicts a per-patch dynamic logit g ∈ ℝ.  Downstream uses:
+      1. Attention bias (detached): bias = −softplus(g) added to camera/register
+         query rows in subsequent global blocks → structural motion gating.
+      2. Loss supervision (not detached): L_gate = BCE(σ(g), m*)  where m* is
+         the GT dynamic mask averaged to patch resolution.
+
+    Zero-init on the last linear so g≡0 at training step 0, which makes the
+    initial attention bias ≡0 and keeps the forward pass byte-for-byte equal
+    to pretrained VGGT (warm-start property).
+    """
+
+    def __init__(self, embed_dim: int, hidden_ratio: int = 4):
+        super().__init__()
+        hidden_dim = embed_dim // hidden_ratio
+        self.norm = nn.LayerNorm(embed_dim)
+        self.linear1 = nn.Linear(embed_dim, hidden_dim)
+        self.act = nn.GELU()
+        self.linear2 = nn.Linear(hidden_dim, 1)
+        # Zero-init → g=0 at t=0 → bias=0 → pretrained VGGT behaviour preserved
+        nn.init.zeros_(self.linear2.weight)
+        nn.init.zeros_(self.linear2.bias)
+
+    def forward(self, patch_tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            patch_tokens: [B, S, P_patch, C]  patch tokens only (no camera/register)
+        Returns:
+            g: [B, S, P_patch]  per-patch dynamic logit
+        """
+        x = self.norm(patch_tokens)
+        x = self.act(self.linear1(x))
+        g = self.linear2(x).squeeze(-1)   # [B, S, P_patch]
+        return g
+
 _RESNET_MEAN = [0.485, 0.456, 0.406]
 _RESNET_STD = [0.229, 0.224, 0.225]
 
@@ -69,6 +113,9 @@ class Aggregator(nn.Module):
         rope_freq=100,
         init_values=0.01,
         temporal_every=3,   # NEW: insert one temporal block every `temporal_every` aa-blocks (decision A3)
+        # v3: motion-gated camera aggregation
+        enable_gate: bool = False,   # v3 gate predictor + gated global attention
+        gate_block_iter: int = 7,    # fire gate after this 0-indexed aa-block iteration (~1/3 of 24)
     ):
         super().__init__()
 
@@ -160,6 +207,14 @@ class Aggregator(nn.Module):
         else:
             self.n_temporal = 0
             self.temporal_blocks = None
+
+        # v3: motion gate predictor (§3)
+        self.enable_gate = enable_gate
+        self.gate_block_iter = gate_block_iter
+        if enable_gate:
+            self.gate_predictor = GatePredictor(embed_dim)
+        else:
+            self.gate_predictor = None
 
         # Note: We have two camera tokens, one for the first frame and one for the rest
         # The same applies for register tokens
@@ -285,6 +340,9 @@ class Aggregator(nn.Module):
         temporal_idx = 0
         output_list = []
 
+        # v3: gate logits computed lazily after gate_block_iter; None until then
+        gate_logits: Optional[torch.Tensor] = None
+
         for block_iter in range(self.aa_block_num):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
@@ -293,7 +351,7 @@ class Aggregator(nn.Module):
                     )
                 elif attn_type == "global":
                     tokens, global_idx, global_intermediates = self._process_global_attention(
-                        tokens, B, S, P, C, global_idx, pos=pos
+                        tokens, B, S, P, C, global_idx, pos=pos, gate_logits=gate_logits
                     )
                 elif attn_type == "temporal":
                     # NEW: run a temporal block once every `temporal_every` aa-blocks.
@@ -306,6 +364,13 @@ class Aggregator(nn.Module):
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
 
+            # v3: compute gate logits from patch tokens after gate_block_iter is complete.
+            # tokens is in [B, S*P, C] after global attention; extract patch slice.
+            if self.gate_predictor is not None and block_iter == self.gate_block_iter:
+                tokens_4d = tokens.view(B, S, P, C)
+                patch_tokens_mid = tokens_4d[:, :, self.patch_start_idx:, :]  # [B, S, P_patch, C]
+                gate_logits = self.gate_predictor(patch_tokens_mid)            # [B, S, P_patch]
+
             for i in range(len(frame_intermediates)):
                 # concat frame and global intermediates, [B x S x P x 2C]
                 concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
@@ -314,7 +379,7 @@ class Aggregator(nn.Module):
         del concat_inter
         del frame_intermediates
         del global_intermediates
-        return output_list, self.patch_start_idx
+        return output_list, self.patch_start_idx, gate_logits
 
     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
         """
@@ -340,9 +405,14 @@ class Aggregator(nn.Module):
 
         return tokens, frame_idx, intermediates
 
-    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None):
+    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None, gate_logits=None):
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
+
+        v3 extension: when gate_logits [B, S, P_patch] is provided, the camera and register
+        query rows receive an additive attention bias of −softplus(gate_logits) on all patch
+        key positions, structurally preventing dynamic patches from polluting the camera token.
+        Patch↔patch attention is unmodified (flash-friendly, no bias). See §4.
         """
         if tokens.shape != (B, S * P, C):
             tokens = tokens.view(B, S, P, C).view(B, S * P, C)
@@ -354,14 +424,124 @@ class Aggregator(nn.Module):
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
-            if self.training:
-                tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
+            if gate_logits is not None:
+                # v3: gated attention — split into patch-query path (flash, no bias) and
+                # camera/register-query path (small, with per-patch-key bias).
+                gate_det = gate_logits.detach()   # detach: no gradient from pose back to gate
+                if self.training:
+                    blk = self.global_blocks[global_idx]
+                    _B, _S, _psi = B, S, self.patch_start_idx
+
+                    def _gated_fn(t, p):  # noqa: E306
+                        return self._gated_global_block_forward(blk, t, p, gate_det, _B, _S, _psi)
+
+                    tokens = checkpoint(_gated_fn, tokens, pos, use_reentrant=self.use_reentrant)
+                else:
+                    tokens = self._gated_global_block_forward(
+                        self.global_blocks[global_idx], tokens, pos, gate_det, B, S, self.patch_start_idx
+                    )
             else:
-                tokens = self.global_blocks[global_idx](tokens, pos=pos)
+                if self.training:
+                    tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
+                else:
+                    tokens = self.global_blocks[global_idx](tokens, pos=pos)
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, global_idx, intermediates
+
+    def _gated_global_block_forward(
+        self,
+        block: nn.Module,
+        tokens: torch.Tensor,
+        pos: Optional[torch.Tensor],
+        gate_logits_det: torch.Tensor,
+        B: int,
+        S: int,
+        patch_start_idx: int,
+    ) -> torch.Tensor:
+        """
+        One global attention block with motion-gated camera aggregation (v3 §4).
+
+        Splits the attention into two memory-efficient paths:
+          • Path 1 — Patch queries → ALL keys: standard F.sdpa, no bias (flash-friendly).
+          • Path 2 — Camera+register queries → ALL keys: small F.sdpa with per-patch-key
+            additive bias = −softplus(gate_logits_det).  Only ~patch_start_idx*S queries,
+            so the extra cost is negligible even without flash attention.
+
+        The MLP sub-layer is unchanged.
+
+        Args:
+            block:            global_blocks[i]
+            tokens:           [B, S*P, C]  (global layout)
+            pos:              [B, S*P, 2]  or None
+            gate_logits_det:  [B, S, P_patch]  detached gate logits
+            B, S:             batch / sequence dims
+            patch_start_idx:  #special tokens per frame (camera + register tokens)
+        """
+        N = tokens.shape[1]      # S * P
+        P = N // S               # tokens per frame
+        P_patch = P - patch_start_idx
+        n_special = patch_start_idx * S   # total special token positions across all frames
+
+        C_dim = tokens.shape[2]
+        H = block.attn.num_heads
+        D = block.attn.head_dim
+
+        # ---- Attention sub-layer ----
+        x_norm = block.norm1(tokens)
+
+        # QKV projection: [B, N, 3*C] → split to [3, B, H, N, D]
+        qkv = block.attn.qkv(x_norm).reshape(B, N, 3, H, D).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)    # each [B, H, N, D]
+
+        # QK norm (operates on last dim D, safe after reshape)
+        q = block.attn.q_norm(q)
+        k = block.attn.k_norm(k)
+
+        # Rotary position embedding
+        if block.attn.rope is not None and pos is not None:
+            q = block.attn.rope(q, pos)
+            k = block.attn.rope(k, pos)
+
+        # Split queries into special (camera+register) and patch
+        q_special = q[:, :, :n_special, :]   # [B, H, n_special, D]
+        q_patch   = q[:, :, n_special:, :]   # [B, H, S*P_patch, D]
+
+        # Attention bias for special queries: 0 on special keys, −softplus(g) on patch keys.
+        # Shape [B, 1, 1, N] broadcasts over heads and query positions.
+        gate_flat = gate_logits_det.reshape(B, S * P_patch)          # [B, S*P_patch]
+        bias_special_keys = torch.zeros(B, n_special, device=gate_flat.device, dtype=gate_flat.dtype)
+        bias_patch_keys   = -F.softplus(gate_flat)                   # [B, S*P_patch]
+        attn_bias = torch.cat([bias_special_keys, bias_patch_keys], dim=1)  # [B, N]
+        attn_bias = attn_bias[:, None, None, :]                      # [B, 1, 1, N]
+
+        drop_p = block.attn.attn_drop.p if self.training else 0.0
+
+        # Path 1: patch queries attend to ALL keys — no bias, flash-friendly
+        attn_patch = F.scaled_dot_product_attention(q_patch, k, v, dropout_p=drop_p)
+        # Path 2: special queries attend to ALL keys — with bias (tiny op)
+        attn_special = F.scaled_dot_product_attention(
+            q_special, k, v,
+            attn_mask=attn_bias.to(q_special.dtype),
+            dropout_p=drop_p,
+        )
+
+        # Recombine in original order [special | patch]
+        attn_out = torch.cat([attn_special, attn_patch], dim=2)      # [B, H, N, D]
+
+        # Output projection
+        attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, N, C_dim)
+        attn_out = block.attn.proj(attn_out)
+        attn_out = block.attn.proj_drop(attn_out)
+
+        # LayerScale + residual
+        tokens = tokens + block.ls1(attn_out)
+
+        # ---- MLP sub-layer (unchanged) ----
+        tokens = tokens + block.ls2(block.mlp(block.norm2(tokens)))
+
+        return tokens
 
     def _process_temporal_attention(self, tokens, B, S, P, C, temporal_idx, pos=None):
         # NEW: temporal attention (Dyn-VGGT contribution ①). Reshape so the *time* axis S is the
