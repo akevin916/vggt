@@ -24,12 +24,17 @@ def load_vggt_for_eval(
     img_size: int = 518,
     gate_block_iter: int = 7,
     device: str = "cuda",
+    require_gate: bool = False,
+    verbose: bool = True,
 ) -> VGGT:
     """Build VGGT with architecture inferred from checkpoint keys."""
     sd = _load_state_dict(ckpt)
     keys = list(sd.keys())
     has_gate = any("gate_predictor" in k for k in keys)
     has_dyn = any(k.startswith("motion") or "scene_flow" in k or "temporal" in k for k in keys)
+
+    if require_gate and not has_gate:
+        raise SystemExit(f"checkpoint has no gate_predictor weights: {ckpt}")
 
     if has_gate:
         model = VGGT(
@@ -66,7 +71,16 @@ def load_vggt_for_eval(
             enable_motion=False,
             enable_flow=False,
         )
-    model.load_state_dict(sd, strict=False)
+    miss, unexp = model.load_state_dict(sd, strict=False)
+    if verbose:
+        if has_gate:
+            n_gate = sum(1 for k in sd if "gate_predictor" in k)
+            print(
+                f"loaded {ckpt}: gate_predictor keys={n_gate} "
+                f"missing={len(miss)} unexpected={len(unexp)}"
+            )
+        else:
+            print(f"loaded {ckpt}: missing={len(miss)} unexpected={len(unexp)}")
     return model.to(device).eval()
 
 

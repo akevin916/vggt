@@ -158,3 +158,4 @@ training/logs/
 /reference/
 training/config
 training/benchmark/__pycache__/
+outputs/

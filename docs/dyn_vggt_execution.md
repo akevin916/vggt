@@ -28,7 +28,7 @@ torchrun --nproc_per_node=1 launch.py --config dyn_vggt_s
 
 ---
 
-## 2. 抽權重（跨 stage 傳遞）
+## 2. 抽權重
 
 ```bash
 python extract_weights.py --src logs/<exp>/ckpts/checkpoint_N.pt --dst checkpoints/dyn_vggt_<name>.pt
@@ -38,54 +38,42 @@ python extract_weights.py --src logs/<exp>/ckpts/checkpoint_N.pt --dst checkpoin
 
 ---
 
-## 3. 驗證 warm-start
+## 3. 評測
 
-```bash
-# 驗證 checkpoint 載入（missing/unexpected keys + temporal γ=0）
-python verify_warmstart.py checkpoints/dyn_vggt_s0.pt
-
-# 預設用 VGGT-1B.pt
-python verify_warmstart.py
-```
-
----
-
-## 4. 評測
-
-### S0 驗證（motion IoU + flow + 凍結完好）
-
-```bash
-python eval_s0.py --ckpt logs/dyn_vggt_po_s0/ckpts/checkpoint_7.pt --n_clips 20 --img_per_seq 6
-```
-
-### Sintel 評測（pose + depth）
+### Sintel benchmark（pose + depth）
 
 依賴：`pip install evo opencv-python`
 
 數據：`/home/cvml-75/Desktop/3D-repo/data/sintel/training`（`final/` + `depth/` + `camdata_left/`）
 
 ```bash
-# 跑某個 checkpoint
-python eval_sintel.py \
-  --ckpt checkpoints/<ckpt>.pt \
-  --variant <label> \
-  --out_dir logs/eval_sintel
+# 只需指定 checkpoint；輸出自動寫入 logs/<exp>/eval_sintel/results.json
+python benchmark/eval_sintel.py --ckpt logs/<exp>/ckpts/checkpoint.pt
 
-# 範例：各 stage
-python eval_sintel.py --ckpt checkpoints/VGGT-1B.pt   --variant vggt_base --out_dir logs/eval_sintel
-python eval_sintel.py --ckpt checkpoints/dyn_vggt_s0.pt  --variant s0    --out_dir logs/eval_sintel
-python eval_sintel.py --ckpt checkpoints/dyn_vggt_s1.pt  --variant s1a   --out_dir logs/eval_sintel
-python eval_sintel.py --ckpt checkpoints/dyn_vggt_s2a.pt --variant s1b   --out_dir logs/eval_sintel
-
-# 兩個 variant 比較（regression gate）
-python eval_sintel.py \
-  --compare logs/eval_sintel/results_vggt_base.json logs/eval_sintel/results_s0.json \
-  --out_dir logs/eval_sintel
+# 抽出的純權重 → logs/train/<name>/eval_sintel/
+python benchmark/eval_sintel.py --ckpt checkpoints/dyn_vggt_s0.pt
 
 # OOM 時加 --chunk_size 32；單 seq smoke 加 --seq_list alley_2
 ```
 
-輸出：`results_<variant>.json`（per-seq + mean）、`summary_<variant>.md`。
+### Gate 診斷（視覺化為主）
+
+主入口 `diag/vis_gate.py`：輸出 PO 的 `m_gt | m_star | g` 拼圖，或 Sintel 的 flow-residual pseudo mask 對照。
+
+```bash
+# PO in-domain（預設）
+python diag/vis_gate.py --ckpt logs/dyn_vggt_v3_s1/ckpts/checkpoint.pt
+
+# Sintel cross-domain
+python diag/vis_gate.py --ckpt checkpoints/dyn_vggt_v3_s1.pt --dataset sintel
+
+# 兩者都跑，並寫入最小 summary.json
+python diag/vis_gate.py --ckpt checkpoints/dyn_vggt_v3_s1.pt --dataset all --metrics
+```
+
+輸出目錄：`logs/<exp>/vis_gate/`（`po/`、`sintel/` 子目錄）。
+
+終端會印簡短診斷：`σ(g)` 在 dynamic/static patch 的分離度（gap）、acc@0.5。加 `--metrics` 才寫 `summary.json`。
 
 ### 目前結果
 

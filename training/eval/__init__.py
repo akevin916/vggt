@@ -1,1 +1,5 @@
-# Dyn-VGGT evaluation utilities (Sintel benchmark, gate eval, shared metrics).
+# Dyn-VGGT evaluation utilities (Sintel benchmark, gate diagnostics, shared metrics).
+#
+# CLI entry points (run from training/):
+#   python benchmark/eval_sintel.py --ckpt ...
+#   python diag/vis_gate.py --ckpt ...

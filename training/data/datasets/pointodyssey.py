@@ -24,6 +24,14 @@ from data.base_dataset import BaseDataset
 
 class PointOdysseyDataset(BaseDataset):
     # NEW: returns the standard VGGT fields plus a binary `motion_mask` (1=dynamic foreground).
+    # v3 §5.3: which dynamic-mask source to load as `motion_mask`.
+    #   "native"   — masks/mask_{fid:05d}.png, instance-segmentation appearance mask (NOT motion; §5.3).
+    #   "instance" — dynmask_inst/dyn_{fid:05d}.png, instance x GT-scene-flow motion label (§5.3(b),
+    #                produced by precompute_po_instance_dynmask.py). Used for PO training.
+    #   "raft"     — dynmask_raft/dyn_{fid:05d}.png, RAFT optical-flow residual motion label (§5.3(a),
+    #                produced by precompute_po_raft_dynmask.py). Domain-invariant, used cross-domain.
+    _DYNAMIC_SOURCES = ("native", "instance", "raft")
+
     def __init__(
         self,
         common_conf,
@@ -33,8 +41,13 @@ class PointOdysseyDataset(BaseDataset):
         len_train: int = 100000,
         len_test: int = 10000,
         depth_max: float = 1000.0,   # PointOdyssey depth png is uint16 normalised to [0, depth_max] meters
+        dynamic_source: str = "native",
     ):
         super().__init__(common_conf=common_conf)
+
+        if dynamic_source not in self._DYNAMIC_SOURCES:
+            raise ValueError(f"dynamic_source must be one of {self._DYNAMIC_SOURCES}, got {dynamic_source!r}")
+        self.dynamic_source = dynamic_source
 
         self.debug = common_conf.debug
         self.training = common_conf.training
@@ -88,9 +101,18 @@ class PointOdysseyDataset(BaseDataset):
         status = "Training" if self.training else "Testing"
         logging.info(f"{status}: PointOdyssey size: {self.sequence_list_len} seqs, {total_frame_num} frames")
 
+    def _motion_mask_path(self, seq_dir: str, fid: int) -> str:
+        if self.dynamic_source == "native":
+            return osp.join(seq_dir, "masks", f"mask_{fid:05d}.png")
+        elif self.dynamic_source == "instance":
+            return osp.join(seq_dir, "dynmask_inst", f"dyn_{fid:05d}.png")
+        else:  # "raft"
+            return osp.join(seq_dir, "dynmask_raft", f"dyn_{fid:05d}.png")
+
     def _binary_dynamic_mask(self, mask_path, hw):
-        # Heuristic: PointOdyssey masks segment the animated foreground agents (dynamic).
-        # Any non-black pixel -> dynamic. Returns float32 {0,1} of shape (H, W).
+        # Native: any non-black pixel -> dynamic (instance-segmentation appearance mask).
+        # instance/raft: precomputed masks are already binary {0,255}, so the same
+        # "> 0" threshold reduces to a plain binarization. Returns float32 {0,1} of shape (H, W).
         m = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
         if m is None:
             return np.zeros(hw, dtype=np.float32)
@@ -151,7 +173,7 @@ class PointOdysseyDataset(BaseDataset):
             else:
                 depth_map = None
 
-            mask_path = osp.join(seq_dir, "masks", f"mask_{fid:05d}.png")
+            mask_path = self._motion_mask_path(seq_dir, fid)
             motion_gt = self._binary_dynamic_mask(mask_path, tuple(original_size))
 
             extri_opencv = all_extri[fid][:3, :4]

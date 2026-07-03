@@ -3,10 +3,15 @@
 
 from __future__ import annotations
 
+import os
+import sys
+
+_TRAINING_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path[:0] = [_TRAINING_DIR, os.path.dirname(_TRAINING_DIR)]
+
 import argparse
 import json
 import os
-import sys
 import traceback
 from datetime import datetime
 from typing import Any, Dict, List
@@ -14,12 +19,8 @@ from typing import Any, Dict, List
 import numpy as np
 from tqdm import tqdm
 
-_TRAINING_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, _TRAINING_DIR)
-sys.path.insert(0, os.path.dirname(_TRAINING_DIR))
-
 from eval.depth_metrics import average_depth_results, eval_sequence_depth
-from eval.paths import default_eval_dir
+from eval.paths import EVAL_SINTEL, TRAINING_DIR, default_eval_dir
 from eval.pose_metrics import eval_pose_metrics
 from eval.sintel_io import (
     compute_preprocess_meta,
@@ -38,7 +39,7 @@ def parse_args():
     ap = argparse.ArgumentParser(description="Sintel pose + depth benchmark")
     ap.add_argument("--ckpt", type=str, required=True)
     ap.add_argument("--sintel_root", type=str, default=None, help="Auto-detected from repo data/ if omitted")
-    ap.add_argument("--out_dir", type=str, default=None, help="Default: logs/<exp>/eval_sintel")
+    ap.add_argument("--out_dir", type=str, default=None, help=f"Default: logs/<exp>/{EVAL_SINTEL}")
     ap.add_argument("--seq_list", type=str, nargs="*", default=None)
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--chunk_size", type=int, default=0, help="0 = full sequence; else chunk inference")
@@ -54,7 +55,7 @@ def _mean_pose(per_seq: Dict[str, Dict[str, float]]) -> Dict[str, float]:
 
 
 def evaluate(args) -> Dict[str, Any]:
-    args.out_dir = args.out_dir or default_eval_dir(args.ckpt, "eval_sintel", _TRAINING_DIR)
+    args.out_dir = args.out_dir or default_eval_dir(args.ckpt, EVAL_SINTEL, TRAINING_DIR)
     args.sintel_root = resolve_sintel_root(args.sintel_root)
     print(f"Output dir: {args.out_dir}")
     print(f"Sintel root: {args.sintel_root}")
