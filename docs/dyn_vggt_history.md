@@ -1,0 +1,30 @@
+# Dyn-VGGT：方法沿革（v1 → v2 → v3）
+
+> 一頁式摘要，只留「為什麼改版」的決策脈絡；細節都在被封存的原文件裡。
+
+---
+
+## v1：運動解耦雙場表示（[archive/dyn_vggt_method_v1.md](archive/dyn_vggt_method_v1.md)）
+
+把每像素世界點分解成 `X = X^can + m·Δ`（靜態正則點 + 動態概率 × 殘差位移），另加時空聚合器（temporal attention）、動態分割頭、場景流頭、4D 全局對齊。
+
+**為何放棄**：診斷發現兩個架構級缺陷（非訓練/數據問題）：
+1. `m·Δ` 是雙線性項，只監督組裝後的和 `X`，`(m, Δ)` 有無限多組解 → `Δ` 學不起來（動態/靜態 `Δ` 中位數比值 0.77–1.16，理想應 ≫1，即使 mask 已經很準也一樣）。
+2. 動態區 `X^can` 因 `(1−m)` 屏蔽而無監督，變成自由變量 → 網絡走「強預訓練 point 頭」的捷徑把運動塞進 `X^can`，`Δ` 閒置 ≈ 0。
+
+---
+
+## v2：診斷、未形成新架構（[archive/dyn_vggt_method_v2.md](archive/dyn_vggt_method_v2.md)）
+
+本質是 v1 失敗診斷的整理版，確認上述雙線性不可辨識性是**架構病態**、且學習式動態 mask 有**跨域崩塌**（PointOdyssey AUC≈0.88 → Sintel≈0.45，與雙場病態是兩個獨立問題）。未提出替代架構，是 v3 的前置診斷。
+
+---
+
+## v3：運動門控相機聚合（現行，[dyn_vggt_method_v3.md](dyn_vggt_method_v3.md)）
+
+放棄一切幾何重表示，範圍收斂到「VGGT 唯一輸給 MonST3R 的指標——動態場景相機 pose」。核心改動：把動態屏蔽從 **loss 端搬到 attention 端**——中段 gate predictor 出 patch 動態 logit，讓 camera/register token 在 global attention 只聚合靜態 patch；門控信號用 domain-invariant 幾何殘差監督，根治跨域崩塌；depth/point 頭原樣不動。
+
+**目前進度**（詳見對話紀錄 / memory，非本文件維護範圍）：
+- S0 換用 instance×scene-flow 動態標籤（`m*_inst`）後，Sintel 跨域 AUC 從 0.58 回升到 0.77，證實原生 PO mask 是外觀 mask 這個判斷。
+- S1 的 gate-bias 消融（含 oracle：直接用 GT mask 當 attention bias）顯示，無論是 learned gate 還是 oracle gate，Sintel/PO 的 pose ATE 都跟不加門控相差無幾 → 目前最大的懸而未決問題是「排除動態 patch 對 pose 有沒有結構性幫助」本身仍待驗證，而不只是 gate 準不準的問題。
+- `s1_inst_photo`（加 static-region 光度一致性 loss）目前數字最好，可能是這個獨立信號在起作用。

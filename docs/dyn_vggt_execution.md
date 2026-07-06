@@ -1,7 +1,7 @@
 # Dyn-VGGT：執行手冊
 
 > 所有指令在 `training/` 目錄下執行，conda env `vggt-dyn`。
-> Stage 定義與設計見 [implementation §4](dyn_vggt_implementation.md)。
+> Stage 定義與設計見 [method_v3.md](dyn_vggt_method_v3.md) §8；方法沿革見 [history](dyn_vggt_history.md)。
 
 ---
 
@@ -58,7 +58,7 @@ python benchmark/eval_sintel.py --ckpt checkpoints/dyn_vggt_s0.pt
 
 ### Gate 診斷（視覺化為主）
 
-主入口 `diag/vis_gate.py`：輸出 PO 的 `m_gt | m_star | g` 拼圖，或 Sintel 的 flow-residual pseudo mask 對照。
+主入口 `diag/vis_gate.py`：輸出 PO 的 `m_gt | m*_patch | g` 拼圖，或 Sintel 的 `m*_raft_patch`（flow-residual）對照。
 
 ```bash
 # PO in-domain（預設）

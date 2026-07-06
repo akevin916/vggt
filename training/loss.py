@@ -336,7 +336,8 @@ def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
 
 
 # ----------------------------------------------------------------------------------------------------
-# NEW: Dyn-VGGT loss terms (motion / flow / reproj / tsmooth). See docs/dyn_vggt_method.md §6.2.
+# v1/v2 Dyn-VGGT loss terms (motion / flow / reproj / tsmooth). See docs/archive/dyn_vggt_method_v1.md §6.2.
+# Superseded by v3 (docs/dyn_vggt_method_v3.md); kept for the archived v1/v2 configs under training/config/v1/.
 # ----------------------------------------------------------------------------------------------------
 
 def compute_motion_loss(predictions, batch, supervise_valid_only=False,

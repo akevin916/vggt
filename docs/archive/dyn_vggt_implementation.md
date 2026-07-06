@@ -1,5 +1,10 @@
 # Dyn-VGGT：實作對應、開放決策、與實驗執行
 
+> ⚠️ **已封存**：本文件記錄 v1/v2 架構（雙場、motion/flow 頭、S0/S1a/S1b/S2 課程）的實作細節與訓練 SOP，
+> 與 v3 的 S0/S1/S2 命名和內容皆不同，**不代表現行實作**。
+> 沿革摘要見 [../dyn_vggt_history.md](../dyn_vggt_history.md)；現行方法見 [../dyn_vggt_method_v3.md](../dyn_vggt_method_v3.md)；
+> 現行操作手冊見 [../dyn_vggt_execution.md](../dyn_vggt_execution.md)。
+
 > 本文件是 [dyn_vggt_method.md](dyn_vggt_method.md)（方法/理論）的**工程對應版**：程式落點、關鍵實作細節、開放決策、訓練/評測 SOP，以及**目前實作狀態與驗證結果**。章節編號 §M-x 指向方法文件。
 
 ---
