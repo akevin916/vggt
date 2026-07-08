@@ -16,6 +16,16 @@
 
 ---
 
+## ⚠️ 狀態更新（2026-07-06 診斷）
+
+> **實測：貢獻②的門控 attention 機制對 pose 幾乎無增益。** 在 PO 與 Sintel 上比較 `off`（無門控）/ `predicted`（模型自己的門控）/ `oracle`（GT mask 當 bias）三種消融，pose ATE 差異都在 noise 內；即使 oracle（完美排除動態）也救不回。
+>
+> 根因指向 **§4.2 的「全動態幀欠定問題」才是真正瓶頸**：最難的 frame 是巨大動態前景幾乎佔滿畫面者，不管排除得多準，camera token 剩下的靜態內容都太少——這是 information-starvation，不是 masking-accuracy 問題。
+>
+> **意涵**：下文 §4 的「在源頭清 pose」是原始假設，尚未被實證支持；若要拿回 pose，重心應移到 §4.2 的 **cross-frame 靜態上下文借用（temporal）**，而非把門控做得更準。細節見診斷記錄。
+
+---
+
 ## 1. 問題定位
 
 ### 1.1 pose 在哪裡誕生（已從 code 確認）
@@ -191,24 +201,16 @@ gate predictor 的輸入除中段特徵外，concat 一條 **`‖f^gt − f^cam�
 
 > **取捨點**：若覺得幾何殘差輸入通道工程量太重，可退為「只用 §5.1 GT 目標 + 大量混合資料」，跨域改善但不徹底，再靠 §7 test-time polish 兜底。
 
-### 5.3 動態標籤 `m*` 的產生（實作 + 資料現實）
+### 5.3 動態標籤 `m*` 的產生
 
-**問題：PointOdyssey 原生 mask 不是動態 mask。** `masks/` 是**逐 instance 分割**，dataset 用「非黑=動態」判定 → 室內場景連**牆、天花板、地板**都是 instance → 幾乎整片被標「動態」；且**靜止的前景（idle agent）也照標**。這是**外觀 mask**，會教門控學「室內/前景外觀→動態」→ 換到 Sintel 室內就全幅誤觸發（跨域崩塌的主因，非純 domain gap）。故必須改用**運動定義**的標籤。實作兩種：
+**PointOdyssey 原生 mask 不能直接用**：`masks/` 是逐 instance 分割（「非黑=動態」），室內連牆/地板都被標、idle 前景也照標 → 是**外觀 mask** 不是運動 mask，會教門控學「室內外觀→動態」而跨域崩塌。故改用**運動定義**的標籤，兩種：
 
-**(a) RAFT 光流殘差 → `m*_raft`，存於 `dynmask_raft/`（domain-invariant、無需 GT track，可用於測試端/Sintel）**
-`m*_raft = 1[‖f^gt(RAFT, t→t+Δ) − f^cam(GT depth,pose)‖ > τ_px]`。優點：純幾何、跨域一致（與 Sintel eval 同式）。**缺點（已實測，故不用於訓練標籤）**：單一固定 Δ 兩難——慢速室內需大 Δ 才累積到門檻，但**快相機**大 Δ 會讓 baseline×深度誤差把**靜態背景**殘差灌爆（整片誤標）；自適應 Δ 也不徹底。
+- **(a) RAFT 光流殘差 `m*_raft`**（`dynmask_raft/`）：`‖f^gt(RAFT) − f^cam(GT)‖ > τ`。純幾何、無需 GT track、跨域一致，**用於測試端/Sintel**。缺點是單一固定 Δ 兩難（慢速需大 Δ、快相機大 Δ 會把靜態背景灌爆），故不用於訓練標籤。
+- **(b) instance × GT scene-flow `m*_inst`**（`dynmask_inst/`，**PO 訓練標籤實際採用**）：用 GT world track（`trajs_3d`）判斷每個 instance 連通塊是否在動，動則整塊填滿。**最穩**——靜態世界點位移恆為 0，無 RAFT 的背景灌爆與快慢兩難。參數與細節見腳本 `training/data/preprocess/po_instance_dynmask.py`；dataset 以 `dynamic_source="instance"` 載入。
 
-**(b) instance × GT scene-flow → `m*_inst`，存於 `dynmask_inst/`（PO 訓練標籤實際採用）**
-點「動」定義：`‖trajs_3d[t+IG] − trajs_3d[t]‖ > ITHR`（世界公尺）。將每個 instance **顏色切連通元件(CC)**，某 CC 內「動的點比例 > IFRAC」且點數 ≥ MINTRK → **填滿整塊 CC**，跳過面積 < MINCC 或 > MAXCC（背景/過度合併）者，最後 close(3×3)+補洞實心化。
-- **為何最穩**：靜態世界點位移**恆等於 0**（任意 gap）→ 無 RAFT 的靜態背景灌爆、無 gap 快慢兩難；CC + MAXCC 解決「黑色/大片背景同色連成一塊被整片填」；不跳過黑色（室內人常被算圖成黑色）→ 用運動判斷救回。
-- 定值：`IG=5, ITHR=0.01, IFRAC=0.1, MINTRK=8, MINCC=0.001, MAXCC=0.4`。腳本 `training/data/precompute_po_instance_dynmask.py`；dataset `dynamic_source="instance"` 載入。
+**分工**：有 GT track（PO 訓練）用 (b)；無 GT track（Sintel/測試）用 (a)。兩者語義一致（動態=世界真的在動）。
 
-**分工**：**有 GT track 的訓練集（PO）→ (b) `m*_inst`**（最可靠）；**無 GT track 的測試/Sintel → (a) `m*_raft`**（或用 instance 對 RAFT 做 CC 聚合的 raft-snap 變體）。兩者語義一致（動態=世界真的在動），只是估計來源不同。
-
-**最後一步（兩者共用）**：不論 `m*_inst` 還是 `m*_raft`，兩者都是 **pixel 解析度的硬 0/1 mask**。要跟 patch 解析度的 `g` 算 BCE 前，必須先 average-pool 到 patch 格，得到本文件稱為 **`m*_patch`** 的 soft 機率（`training/loss.py` 裡的 `m_star_patch` 變數）：
-```
-m*_patch = adaptive_avg_pool2d( m*_inst (或 m*_raft), patch_grid )     # 硬 0/1 → 該 patch 內動態像素比例 ∈[0,1]
-```
+**共用最後一步**：兩者都是 pixel 級硬 0/1 mask，餵 `L_gate` 前先 average-pool 到 patch 格得到 soft 機率 `m*_patch`（`training/loss.py` 的 `m_star_patch`）。取捨與實測比較見診斷記錄。
 
 ---
 
@@ -247,7 +249,9 @@ VGGT 是強預訓練 baseline，**絕不從頭訓**。三階段漸進解凍。
 | **S1** | DINOv2 patch embed | gate predictor + 後段 global blocks + camera head | `L_gate` + `L_cam` | 門控通電，camera 學會「只看靜態」 |
 | **S2** | 無（全網，lr 1e-5）| 全部 | 全開 + 混 ~30% 靜態防遺忘 | 端到端精修 |
 
-### 8.2 硬體適配（32GB 單卡上限 4–6 幀；可用雙 24GB）
+### 8.2 硬體適配（單張 RTX 5090 32GB）
+
+實機為**單張 RTX 5090（32GB）**。config 已實測 `img_nums` 可到 8。
 
 **(a) 純 pose scope 的最大紅利：關掉用不到的 dense 頭**
 
@@ -257,15 +261,11 @@ VGGT 是強預訓練 baseline，**絕不從頭訓**。三階段漸進解凍。
 | depth | ✅ | 算 `f^cam` 殘差（§5.2 輸入通道）需預測深度 |
 | point / track / flow / motion(DPT) | ❌ 關掉 | pose 不需；`g` 已當 mask |
 
-關掉 point+track 即釋出一大塊顯存，4–6 幀上限可往上推。
+關掉 point+track 即釋出一大塊顯存，幀數上限可往上推。
 
-**(b) S0 快取凍結特徵**：S0 aggregator 全凍 → 不 backprop 穿過 aggregator → 不必存其 activation。把中段特徵**離線預算存盤**，S0 只訓 gate MLP → 顯存近零，可開長 sequence / 大 batch（24GB 也很舒服）。
+**(b) S0 快取凍結特徵**：S0 aggregator 全凍 → 不 backprop 穿過 aggregator → 不必存其 activation。把中段特徵**離線預算存盤**，S0 只訓 gate MLP → 顯存近零，可開長 sequence / 大 batch。
 
-**(c) 雙 24GB 配置**
-- **DDP（首選）**：兩卡各一份模型、各自 sequence，吞吐 ×2。前提：先用 (a)(b) 把單卡 footprint 壓進 24GB（必要時 S→3–4 或解析度→364）。
-- **FSDP**：S2 全網解凍時若 optimizer state 成瓶頸，分片參數+狀態降 per-GPU footprint。**切不了 activation**，故只適合 S2，不解 attention 峰值。
-
-**(d) 機動槓桿（按性價比）**
+**(c) 機動槓桿（按性價比）**
 1. 降解析度 518→364（P ~1369→~676，attention 記憶體約 ¼，幀數翻倍）；可低解析訓 gate、最後 518 微調。
 2. gradient checkpointing（code 已開）、bf16 autocast（已開）維持。
 3. 時序加大 stride 抽幀：更大 baseline、對 pose 更有利、幀數需求更低。
