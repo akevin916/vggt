@@ -40,7 +40,7 @@ config 用檔名編碼 curriculum：**S0**（只訓 `gate_predictor`，其餘凍
 
 ## Eval 與診斷
 
-- `training/eval/` —— 共用 lib（`vggt_infer.py`、`paths.py`、`pose_metrics.py`、`gate_metrics.py`）+ 進入點：`gate_bias_ablation.py` / `_po.py`（off/predicted/oracle 的 pose 比較）、`gate_dynamic_fraction.py`、`val_metrics.py`。
+- `training/eval/` —— 共用 lib（`vggt_infer.py`、`paths.py`、`pose_metrics.py`、`gate_common.py`）+ 進入點：`gate_bias_ablation.py`（`--dataset sintel|po`；Sintel 可加 `--report_dynamic_fraction`）、`val_metrics.py`。
 - `training/diag/` —— 視覺化：`vis_error_growth.py`（per-frame ATE，多 gate-mode 疊圖 —— **chunk_size 必須 ≥ 序列長度**，否則 `infer_sequence_chunked` 會切成獨立 pass 把 error 灌大）、`vis_trajectory.py`、`vis_gate_temporal.py`、`vis_gate_gif.py`、`plot_train_curves.py`。
 
 ## 上游 demo（未改的 base model）

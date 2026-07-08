@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gate diagnostic: visualize m_gt / m_star / g (PO) or flow-residual pseudo mask / g (Sintel).
+"""Gate diagnostic: visualize m_gt / m_star_patch / g (PO) or m_star_raft_patch / g (Sintel).
 
 Primary tool for inspecting v3 gate behavior. Optional --metrics writes a minimal summary.json.
 """

@@ -10,6 +10,8 @@ REPO_DIR = os.path.dirname(TRAINING_DIR)
 # Subdirectory names under logs/<exp>/ (or logs/train/<ckpt_stem>/ for extracted weights).
 EVAL_SINTEL = "eval_sintel"
 VIS_GATE = "vis_gate"
+GATE_BIAS_ABLATION = "gate_bias_ablation"
+GATE_BIAS_ABLATION_PO = "gate_bias_ablation_po"
 
 
 def _join_path_parts(parts: list[str]) -> str:

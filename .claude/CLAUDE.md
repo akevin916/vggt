@@ -1,6 +1,5 @@
 # Execution Policy
 
-- Never execute python script automatically.
 - Always output the command first.
 - Wait for my confirmation before execution.
 - Do not directly run long-running programs (e.g. full training / long eval). A short smoke test is fine.

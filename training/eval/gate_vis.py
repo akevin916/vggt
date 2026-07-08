@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 import cv2
@@ -12,7 +11,7 @@ import torch
 import torch.nn.functional as F
 
 from data.datasets.pointodyssey import PointOdysseyDataset
-from eval.gate_metrics import summarize_gate_diag
+from eval.gate_common import po_common_conf, pool_to_patch, summarize_gate_diag
 from eval.motion_mask import DIAG_SEQUENCES, compute_ego_flow, derive_motion_mask, load_sintel_gt_flows
 from eval.sintel_io import (
     load_sintel_gt_depths,
@@ -26,29 +25,6 @@ from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
 
 
-def po_common_conf(args) -> SimpleNamespace:
-    return SimpleNamespace(
-        img_size=args.img_size,
-        patch_size=args.patch_size,
-        augs=SimpleNamespace(scales=None),
-        rescale=True,
-        rescale_aug=False,
-        landscape_check=False,
-        debug=False,
-        training=False,
-        get_nearby=True,
-        load_depth=True,
-        inside_random=False,
-        allow_duplicate_img=False,
-    )
-
-
-def pool_to_patch(mask_shw: torch.Tensor, patch_h: int, patch_w: int) -> torch.Tensor:
-    s, h, w = mask_shw.shape
-    pooled = F.adaptive_avg_pool2d(mask_shw.reshape(s, 1, h, w).float(), (patch_h, patch_w))
-    return pooled.reshape(s, patch_h, patch_w)
-
-
 def colorize_map(x01: np.ndarray, h: int, w: int, mode: str = "nearest") -> np.ndarray:
     t = torch.from_numpy(x01)[None, None].float()
     kwargs = {} if mode == "nearest" else {"align_corners": False}
@@ -60,18 +36,19 @@ def save_po_panel(
     out_path: str,
     rgb: np.ndarray,
     m_gt: np.ndarray,
-    m_star: np.ndarray,
+    m_star_patch: np.ndarray,
     g_prob: np.ndarray,
     h: int,
     w: int,
 ) -> None:
+    """m_star_patch: m*_inst (docs §5.3b) average-pooled to patch resolution — the L_gate target."""
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     gt_col = cv2.applyColorMap((m_gt * 255).astype(np.uint8), cv2.COLORMAP_JET)
-    mstar_col = colorize_map(m_star, h, w, "nearest")
+    mstar_col = colorize_map(m_star_patch, h, w, "nearest")
     g_col = colorize_map(g_prob, h, w, "nearest")
     row = np.concatenate([bgr, gt_col, mstar_col, g_col], axis=1)
-    label = "RGB | m_gt | m_star (L_gate target) | g=sigma(gate_logits)"
+    label = "RGB | m_gt | m*_patch (L_gate target) | g=sigma(gate_logits)"
     cv2.putText(row, label, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
     cv2.imwrite(out_path, row)
 
@@ -79,18 +56,19 @@ def save_po_panel(
 def save_sintel_panel(
     out_path: str,
     rgb: np.ndarray,
-    pseudo_patch: np.ndarray,
+    m_star_raft_patch: np.ndarray,
     g_prob: np.ndarray,
     h: int,
     w: int,
 ) -> None:
+    """m_star_raft_patch: m*_raft (docs §5.3a, flow-residual threshold) pooled to patch resolution."""
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    pseudo_col = colorize_map(pseudo_patch, h, w, "nearest")
+    pseudo_col = colorize_map(m_star_raft_patch, h, w, "nearest")
     g_col = colorize_map(g_prob, h, w, "nearest")
     overlay = cv2.addWeighted(bgr, 0.55, g_col, 0.45, 0)
     row = np.concatenate([bgr, pseudo_col, g_col, overlay], axis=1)
-    label = "RGB | pseudo dynamic (flow residual) | g | overlay"
+    label = "RGB | m*_raft_patch (flow residual) | g | overlay"
     cv2.putText(row, label, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
     cv2.imwrite(out_path, row)
 
@@ -134,8 +112,8 @@ def run_po_vis(model: VGGT, args, out_dir: str) -> Dict[str, Any]:
         with torch.no_grad():
             pred = model(images=img.to(args.device))
         g_prob = torch.sigmoid(pred["gate_logits"].float()).cpu()[0].reshape(s, ph, pw).numpy()
-        m_star = pool_to_patch(mm, ph, pw).numpy()
-        labels = (m_star >= 0.5).astype(np.int8)
+        m_star_patch = pool_to_patch(mm, ph, pw).numpy()   # m*_inst (§5.3b) pooled to patch res
+        labels = (m_star_patch >= 0.5).astype(np.int8)
 
         probs_all.append(g_prob.reshape(-1))
         labels_all.append(labels.reshape(-1))
@@ -143,7 +121,7 @@ def run_po_vis(model: VGGT, args, out_dir: str) -> Dict[str, Any]:
         rgb = (img[0].permute(0, 2, 3, 1).numpy() * 255).astype(np.uint8)
         for f in range(s):
             out_path = os.path.join(vis_dir, f"clip{ci}_f{f}.png")
-            save_po_panel(out_path, rgb[f], mm[f].numpy(), m_star[f], g_prob[f], h, w)
+            save_po_panel(out_path, rgb[f], mm[f].numpy(), m_star_patch[f], g_prob[f], h, w)
             print(f"saved {out_path}")
             saved += 1
 
@@ -196,8 +174,8 @@ def run_sintel_vis(model: VGGT, args, out_dir: str, sintel_root: str) -> Dict[st
         for i in range(s):
             if masks[i] is None:
                 continue
-            pseudo = cv2.resize(masks[i], (pw, ph), interpolation=cv2.INTER_AREA)
-            lab = (pseudo >= 0.5).astype(np.int8)
+            m_star_raft_patch = cv2.resize(masks[i], (pw, ph), interpolation=cv2.INTER_AREA)  # m*_raft (§5.3a) pooled
+            lab = (m_star_raft_patch >= 0.5).astype(np.int8)
             seq_probs.append(g_prob[i].reshape(-1))
             seq_labels.append(lab.reshape(-1))
 
@@ -205,7 +183,7 @@ def run_sintel_vis(model: VGGT, args, out_dir: str, sintel_root: str) -> Dict[st
                 continue
             rgb = (images[i].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
             out_path = os.path.join(vis_dir, f"{seq}_f{i}.png")
-            save_sintel_panel(out_path, rgb, pseudo, g_prob[i], h, w)
+            save_sintel_panel(out_path, rgb, m_star_raft_patch, g_prob[i], h, w)
             print(f"saved {out_path}")
             saved += 1
             vis_count += 1
