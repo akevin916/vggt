@@ -275,11 +275,20 @@ class Aggregator(nn.Module):
             if hasattr(self.patch_embed, "mask_token"):
                 self.patch_embed.mask_token.requires_grad_(False)
 
-    def forward(self, images: torch.Tensor) -> Tuple[List[torch.Tensor], int]:
+    def forward(
+        self,
+        images: torch.Tensor,
+        gate_logits_override: Optional[torch.Tensor] = None,
+    ) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
             images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
                 B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
+            gate_logits_override: [B, S, P_patch] optional, eval-only. When given, these
+                logits (not the model's own GatePredictor output) are used to build the
+                camera/register attention bias in every gated global block — for oracle-mask
+                ablations (docs/dyn_vggt_method_v3.md gate diagnostics). The model's own
+                gate_logits are still computed and returned unaffected, for logging.
 
         Returns:
             (list[torch.Tensor], int):
@@ -350,8 +359,9 @@ class Aggregator(nn.Module):
                         tokens, B, S, P, C, frame_idx, pos=pos
                     )
                 elif attn_type == "global":
+                    gate_bias_source = gate_logits_override if gate_logits_override is not None else gate_logits
                     tokens, global_idx, global_intermediates = self._process_global_attention(
-                        tokens, B, S, P, C, global_idx, pos=pos, gate_logits=gate_logits
+                        tokens, B, S, P, C, global_idx, pos=pos, gate_logits=gate_bias_source
                     )
                 elif attn_type == "temporal":
                     # NEW: run a temporal block once every `temporal_every` aa-blocks.

@@ -2,8 +2,10 @@
 #
 # TartanAir V1 is a synthetic indoor/outdoor benchmark with dense depth maps and exact
 # 6-DoF camera poses.  We use it as a STATIC negative-example dataset for S1/S2 mixed
-# training: every scene has camera-only motion, so `motion_mask` is deliberately omitted
-# from the returned batch and ComposedDataset treats the absence as "no dynamic GT here".
+# training: every scene has camera-only motion, so `motion_mask` is always an all-zero
+# array (m=0 everywhere) — every pixel is GT-static. This lets L_gate / static_photo (and
+# anything else keyed on batch["motion_mask"]) train directly on TartanAir, not just via
+# ComposedDataset's zero-fill fallback for datasets that omit the key entirely.
 #
 # Disk layout:  <TARTANAIR_DIR>/train/<env>/<difficulty>/<traj>/
 #   image_left/<FFFFF>_left.png         RGB frames  (640 × 640, uint8)
@@ -181,6 +183,7 @@ class TartanAirDataset(BaseDataset):
         images, depths = [], []
         extrinsics, intrinsics = [], []
         cam_points, world_points, point_masks = [], [], []
+        motion_masks = []
         image_paths, original_sizes = [], []
 
         for fid in ids:
@@ -219,6 +222,7 @@ class TartanAirDataset(BaseDataset):
             cam_points.append(cam_pts)
             world_points.append(world_pts)
             point_masks.append(point_mask)
+            motion_masks.append(np.zeros(depth_t.shape, dtype=np.float32))  # camera-only motion: all-static
             image_paths.append(image_path)
             original_sizes.append(original_size)
 
@@ -233,7 +237,6 @@ class TartanAirDataset(BaseDataset):
             "cam_points": cam_points,
             "world_points": world_points,
             "point_masks": point_masks,
-            # `motion_mask` is intentionally absent: TartanAir has camera-only motion.
-            # ComposedDataset treats absence as "no dynamic supervision for this batch".
+            "motion_mask": motion_masks,   # all-zero: every scene has camera-only motion
             "original_sizes": original_sizes,
         }

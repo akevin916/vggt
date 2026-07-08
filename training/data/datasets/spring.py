@@ -2,14 +2,22 @@
 #
 # Spring is a synthetic dynamic benchmark (Blender-rendered) with dense stereo
 # disparity, 6-DoF camera poses, and animated characters.  We use it as a
-# DYNAMIC-scene dataset for depth/pose supervision; motion_mask GT is not
-# available so ComposedDataset skips L_motion for Spring batches.
+# DYNAMIC-scene dataset for depth/pose supervision.
+#
+# Dynamic GT (`motion_mask`): Spring ships no per-pixel dynamic segmentation GT, so the only
+# geometrically-derivable label is the RAFT flow-residual mask (§5.3a, precompute_spring_raft_
+# dynmask.py -> dynmask_raft/dyn_{frame_idx:04d}.png). Selected via dynamic_source:
+#   "none" — motion_mask absent from get_data() (ComposedDataset zero-fills; NOT valid for a
+#            dynamic scene, only kept as a legacy/debug escape hatch).
+#   "raft" — load dynmask_raft/dyn_{frame_idx:04d}.png (used for S1/S2 gate + static_photo).
+# A frame whose dynmask_raft png is missing falls back to an all-zero (all-static) mask.
 #
 # Disk layout:  <SPRING_DIR>/train/<NNNN>/
 #   frame_left/frame_left_NNNN.png       RGB frames  (1080 × 1920, uint8)
 #   disp1_left/disp1_left_NNNN.dsp5      Stereo disparity at 2× resolution (HDF5, float16)
 #   cam_data/extrinsics.txt              Per-frame 4×4 cam-to-world matrix (16 values/line)
 #   cam_data/intrinsics.txt              Per-frame fx fy cx cy
+#   dynmask_raft/dyn_NNNN.png            RAFT flow-residual dynamic mask (uint8 {0,255}, optional)
 #
 # Depth conversion:
 #   Disparity is stored at 2× image resolution (3840 × 2160).
@@ -43,6 +51,8 @@ class SpringDataset(BaseDataset):
 
     BASELINE = 0.065  # stereo baseline in metres (Spring benchmark spec)
 
+    _DYNAMIC_SOURCES = ("none", "raft")
+
     def __init__(
         self,
         common_conf,
@@ -51,8 +61,18 @@ class SpringDataset(BaseDataset):
         min_num_images: int = 16,
         len_train: int = 100000,
         depth_max: float = 200.0,
+        dynamic_source: str = "none",
+        dynamic_max_frac: float = 0.5,
     ):
         super().__init__(common_conf=common_conf)
+
+        if dynamic_source not in self._DYNAMIC_SOURCES:
+            raise ValueError(f"dynamic_source must be one of {self._DYNAMIC_SOURCES}, got {dynamic_source!r}")
+        self.dynamic_source = dynamic_source
+        # RAFT ego-flow on Spring blows up under large camera motion, flagging whole static
+        # backgrounds as dynamic. A frame whose mask covers > this fraction of pixels is almost
+        # certainly such a false-positive blowout, so revert it to all-static (see _binary_dynamic_mask).
+        self.dynamic_max_frac = dynamic_max_frac
 
         self.debug = common_conf.debug
         self.training = common_conf.training
@@ -105,6 +125,25 @@ class SpringDataset(BaseDataset):
             f"{status}: Spring loaded {self.sequence_list_len} sequences"
         )
 
+    def _binary_dynamic_mask(self, seq_dir, frame_idx, hw):
+        # RAFT flow-residual dynamic mask (§5.3a); precomputed as uint8 {0,255} at native res,
+        # 1-based frame_idx to match frame_left_XXXX.png. Returns float32 {0,1} of shape hw;
+        # all-zero (all-static) if disabled or the file is missing for this frame.
+        if self.dynamic_source != "raft":
+            return np.zeros(hw, dtype=np.float32)
+        mask_path = osp.join(seq_dir, "dynmask_raft", f"dyn_{frame_idx:04d}.png")
+        m = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+        if m is None:
+            return np.zeros(hw, dtype=np.float32)
+        if m.ndim == 3:
+            m = m.sum(axis=-1)
+        m = (m > 0).astype(np.float32)
+        # Reject RAFT false-positive blowouts: a frame with > dynamic_max_frac dynamic pixels is
+        # treated as unreliable and reverted to all-static (no scene is that dynamic).
+        if m.mean() > self.dynamic_max_frac:
+            return np.zeros(hw, dtype=np.float32)
+        return m
+
     def _disp_to_depth(self, disp_2x: np.ndarray, fx: float) -> np.ndarray:
         """Convert 2×-resolution disparity to depth at image resolution."""
         disp = disp_2x[::2, ::2]  # downsample to image resolution
@@ -155,6 +194,7 @@ class SpringDataset(BaseDataset):
         images, depths = [], []
         extrinsics, intrinsics = [], []
         cam_points, world_points, point_masks = [], [], []
+        motion_masks = []
         image_paths, original_sizes = [], []
 
         for fid, c2w_raw in zip(ids, c2w_all):
@@ -195,11 +235,27 @@ class SpringDataset(BaseDataset):
                 dtype=np.float32,
             )
 
+            motion_gt = self._binary_dynamic_mask(seq_dir, frame_idx, tuple(original_size))
+
+            # NEW: capture RNG state so the motion-mask transform replays the SAME augmentation.
+            pre_state = np.random.get_state()
             (image_t, depth_t, extri_t, intri_t,
              world_pts, cam_pts, point_mask, _) = self.process_one_image(
                 image, depth_map, extri_opencv, K,
                 original_size, target_image_shape, filepath=image_path,
             )
+
+            # Align motion_mask identically: restore RNG, pass the binary mask as a pseudo-depth
+            # through the same geometric pipeline, keep only its spatial output (mirrors
+            # PointOdysseyDataset.get_data).
+            post_state = np.random.get_state()
+            np.random.set_state(pre_state)
+            (_, motion_t, _, _, _, _, _, _) = self.process_one_image(
+                image, motion_gt, extri_opencv, K,
+                original_size, target_image_shape, filepath=image_path,
+            )
+            np.random.set_state(post_state)
+            motion_t = (motion_t > 0.5).astype(np.float32)
 
             images.append(image_t)
             depths.append(depth_t)
@@ -208,10 +264,11 @@ class SpringDataset(BaseDataset):
             cam_points.append(cam_pts)
             world_points.append(world_pts)
             point_masks.append(point_mask)
+            motion_masks.append(motion_t)
             image_paths.append(image_path)
             original_sizes.append(original_size)
 
-        return {
+        batch = {
             "seq_name": "spring_" + seq_name,
             "ids": ids,
             "frame_num": len(extrinsics),
@@ -222,6 +279,10 @@ class SpringDataset(BaseDataset):
             "cam_points": cam_points,
             "world_points": world_points,
             "point_masks": point_masks,
-            # motion_mask intentionally absent: no per-pixel dynamic GT available.
             "original_sizes": original_sizes,
         }
+        # RAFT flow-residual dynamic mask (§5.3a) when dynamic_source="raft"; omitted for "none"
+        # so ComposedDataset's zero-fill fallback applies.
+        if self.dynamic_source == "raft":
+            batch["motion_mask"] = motion_masks
+        return batch

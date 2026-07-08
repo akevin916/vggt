@@ -42,6 +42,7 @@ from train_utils.logging import setup_logging
 from train_utils.normalization import normalize_camera_extrinsics_and_points_batch
 from train_utils.optimizer import construct_optimizers
 from eval.val_metrics import ValMetricsAccumulator
+from loss import oracle_gate_logits_from_mask
 
 
 class Trainer:
@@ -79,6 +80,7 @@ class Trainer:
         val_metrics: Optional[Dict[str, Any]] = None,
         env_variables: Optional[Dict[str, Any]] = None,
         accum_steps: int = 1,
+        oracle_gate: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
         """
@@ -102,6 +104,10 @@ class Trainer:
             loss: Hydra config for the loss function.
             env_variables: Dictionary of environment variables to set.
             accum_steps: Number of steps to accumulate gradients before an optimizer step.
+            oracle_gate: If {"enabled": True, ...}, replaces the model's own gate bias with one
+                built directly from batch["motion_mask"] (GT dynamic mask) on every forward pass
+                (see loss.oracle_gate_logits_from_mask and dyn_vggt_v3_s1_oracle_camera_only.yaml).
+                Used to test the v3 architectural bet in isolation from gate-predictor quality.
         """
         self._setup_env_variables(env_variables)
         self._setup_timers()
@@ -114,6 +120,7 @@ class Trainer:
         self.checkpoint_conf = checkpoint
         self.optim_conf = optim
         self.val_metrics_conf = val_metrics or {}
+        self.oracle_gate_conf = oracle_gate
         # Best pose ATE seen so far (drives best.pt); restored on resume.
         self.best_ate = float("inf")
 
@@ -426,6 +433,15 @@ class Trainer:
 
             # Rolling latest checkpoint.
             self.save_checkpoint(self.epoch, checkpoint_names=["last"])
+
+            # Milestone checkpoints every checkpoint.save_freq epochs, kept permanently
+            # alongside the rolling last.pt / best.pt. self.epoch is 0-indexed, so (epoch+1)
+            # is the count of completed epochs -> epoch_10.pt, epoch_20.pt, ...
+            save_freq = int(self.checkpoint_conf.get("save_freq", 0) or 0)
+            if save_freq > 0 and (int(self.epoch) + 1) % save_freq == 0:
+                self.save_checkpoint(
+                    self.epoch, checkpoint_names=[f"epoch_{int(self.epoch) + 1}"]
+                )
 
             # Best checkpoint by pose ATE (lower is better).
             ate = summary.get("ate") if isinstance(summary, dict) else None
@@ -838,7 +854,14 @@ class Trainer:
             A dictionary containing the computed losses.
         """
         # Forward pass
-        y_hat = model(images=batch["images"])
+        gate_override = None
+        if self.oracle_gate_conf and self.oracle_gate_conf.get("enabled", False) and "motion_mask" in batch:
+            gate_override = oracle_gate_logits_from_mask(
+                batch["motion_mask"],
+                patch_size=self.oracle_gate_conf.get("patch_size", 14),
+                k=self.oracle_gate_conf.get("k", 30.0),
+            )
+        y_hat = model(images=batch["images"], gate_logits_override=gate_override)
         
         # Loss computation
         loss_dict = self.loss(y_hat, batch)

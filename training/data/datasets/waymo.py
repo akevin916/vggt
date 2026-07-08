@@ -26,10 +26,18 @@
 #   pure rigid-body shift of the world coordinate system and does not affect any
 #   relative geometry (depth, optical flow, reprojection).
 #
-# Dynamic GT:
-#   `motion_mask` is intentionally absent — no per-pixel dynamic segmentation GT is
-#   available in the preprocessed Waymo data.  ComposedDataset treats the absence as
-#   "no L_motion supervision for this batch".
+# Dynamic GT (`motion_mask`):
+#   Waymo ships no per-pixel dynamic segmentation GT, so the only geometrically-derivable
+#   label is the RAFT flow-residual mask (§5.3a, preprocess/waymo_raft_dynmask.py ->
+#   <seg>/dynmask_raft/dyn_{fid:05d}_{cam_id}.png, one dir per segment shared across cameras,
+#   with a per-camera `.done_cam{cam_id}` completion flag). Selected via dynamic_source:
+#     "none" — motion_mask absent from get_data() (ComposedDataset zero-fills; NOT a valid
+#              label for real dynamic scenes, kept only as a legacy/debug escape hatch).
+#     "raft" — load the RAFT mask. Because precompute is a long offline job that is only
+#              PARTIALLY done, in this mode a (segment, camera) sequence is ENROLLED ONLY IF
+#              its `.done_cam{cam_id}` flag exists — uncomputed segments are skipped entirely
+#              rather than fed as (wrong) all-static labels. A per-frame png that is still
+#              missing inside an enrolled sequence falls back to all-zero (all-static).
 
 import os
 import os.path as osp
@@ -62,6 +70,8 @@ def _read_waymo_depth(path: str) -> np.ndarray:
 
 class WaymoDataset(BaseDataset):
 
+    _DYNAMIC_SOURCES = ("none", "raft")
+
     def __init__(
         self,
         common_conf,
@@ -70,8 +80,18 @@ class WaymoDataset(BaseDataset):
         min_num_images: int = 16,
         len_train: int = 100000,
         depth_max: float = 80.0,   # LiDAR valid range; beyond this set to 0
+        dynamic_source: str = "none",
+        dynamic_max_frac: float = 0.5,
     ):
         super().__init__(common_conf=common_conf)
+
+        if dynamic_source not in self._DYNAMIC_SOURCES:
+            raise ValueError(f"dynamic_source must be one of {self._DYNAMIC_SOURCES}, got {dynamic_source!r}")
+        self.dynamic_source = dynamic_source
+        # Safeguard against RAFT false-positive blowouts: a frame whose mask covers > this
+        # fraction of pixels is reverted to all-static. Waymo's sparse-LiDAR masks sit at ~5%
+        # so this never triggers in practice, but it keeps the raft path uniform with Spring.
+        self.dynamic_max_frac = dynamic_max_frac
 
         self.debug = common_conf.debug
         self.training = common_conf.training
@@ -127,6 +147,13 @@ class WaymoDataset(BaseDataset):
                 frame_ids = sorted(frame_ids)
                 if len(frame_ids) < min_num_images:
                     continue
+                # In raft mode, enroll only sequences whose dynmask precompute has completed
+                # (partial offline job); otherwise we'd feed uncomputed dynamic scenes as
+                # all-static labels. See class header.
+                if self.dynamic_source == "raft":
+                    done_flag = osp.join(seg_dir, "dynmask_raft", f".done_cam{cam_id}")
+                    if not osp.isfile(done_flag):
+                        continue
                 seq_name = f"{seg_name}__cam{cam_id}"
                 self.data_store[seq_name] = {
                     "seg_dir": seg_dir,
@@ -142,6 +169,24 @@ class WaymoDataset(BaseDataset):
             f"{status}: Waymo loaded {self.sequence_list_len} sequences "
             f"(cameras={self.cameras})"
         )
+
+    def _binary_dynamic_mask(self, seg_dir, fid, cam_id, hw):
+        # RAFT flow-residual dynamic mask (§5.3a), uint8 {0,255} at native res, one dir per
+        # segment shared across cameras: dynmask_raft/dyn_{fid:05d}_{cam_id}.png. Returns float32
+        # {0,1} of shape hw; all-zero (all-static) if disabled or the per-frame png is missing.
+        if self.dynamic_source != "raft":
+            return np.zeros(hw, dtype=np.float32)
+        mask_path = osp.join(seg_dir, "dynmask_raft", f"dyn_{fid:05d}_{cam_id}.png")
+        m = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+        if m is None:
+            return np.zeros(hw, dtype=np.float32)
+        if m.ndim == 3:
+            m = m.sum(axis=-1)
+        m = (m > 0).astype(np.float32)
+        # Reject RAFT false-positive blowouts (see __init__): revert over-dynamic frames to static.
+        if m.mean() > self.dynamic_max_frac:
+            return np.zeros(hw, dtype=np.float32)
+        return m
 
     # ── Main data loading ────────────────────────────────────────────────────────────
 
@@ -197,6 +242,7 @@ class WaymoDataset(BaseDataset):
         images, depths = [], []
         extrinsics, intrinsics = [], []
         cam_points, world_points, point_masks = [], [], []
+        motion_masks = []
         image_paths, original_sizes = [], []
 
         for fid, c2w_raw in zip(selected_frame_ids, cam2world_all):
@@ -234,11 +280,27 @@ class WaymoDataset(BaseDataset):
 
             extri_opencv = np.linalg.inv(c2w)[:3].astype(np.float32)   # (3, 4)
 
+            motion_gt = self._binary_dynamic_mask(seg_dir, int(fid), cam_id, tuple(original_size))
+
+            # NEW: capture RNG state so the motion-mask transform replays the SAME augmentation.
+            pre_state = np.random.get_state()
             (image_t, depth_t, extri_t, intri_t,
              world_pts, cam_pts, point_mask, _) = self.process_one_image(
                 image, depth_map, extri_opencv, K,
                 original_size, target_image_shape, filepath=img_path,
             )
+
+            # Align motion_mask identically: restore RNG, pass the binary mask as a pseudo-depth
+            # through the same geometric pipeline, keep only its spatial output (mirrors
+            # PointOdysseyDataset.get_data).
+            post_state = np.random.get_state()
+            np.random.set_state(pre_state)
+            (_, motion_t, _, _, _, _, _, _) = self.process_one_image(
+                image, motion_gt, extri_opencv, K,
+                original_size, target_image_shape, filepath=img_path,
+            )
+            np.random.set_state(post_state)
+            motion_t = (motion_t > 0.5).astype(np.float32)
 
             images.append(image_t)
             depths.append(depth_t)
@@ -247,10 +309,11 @@ class WaymoDataset(BaseDataset):
             cam_points.append(cam_pts)
             world_points.append(world_pts)
             point_masks.append(point_mask)
+            motion_masks.append(motion_t)
             image_paths.append(img_path)
             original_sizes.append(original_size)
 
-        return {
+        batch = {
             "seq_name": "waymo_" + seq_name,
             "ids": local_ids,
             "frame_num": len(extrinsics),
@@ -261,6 +324,10 @@ class WaymoDataset(BaseDataset):
             "cam_points": cam_points,
             "world_points": world_points,
             "point_masks": point_masks,
-            # `motion_mask` intentionally absent: no dynamic segmentation GT available.
             "original_sizes": original_sizes,
         }
+        # RAFT flow-residual dynamic mask (§5.3a) when dynamic_source="raft"; omitted for "none"
+        # so ComposedDataset's zero-fill fallback applies.
+        if self.dynamic_source == "raft":
+            batch["motion_mask"] = motion_masks
+        return batch

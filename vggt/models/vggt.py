@@ -45,7 +45,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         #      output_dim=4 → 3 displacement channels + 1 confidence channel.
         self.flow_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="linear", conf_activation="expp1") if enable_flow else None
 
-    def forward(self, images: torch.Tensor, query_points: torch.Tensor = None):
+    def forward(self, images: torch.Tensor, query_points: torch.Tensor = None,
+                gate_logits_override: torch.Tensor = None):
         """
         Forward pass of the VGGT model.
 
@@ -55,6 +56,10 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             query_points (torch.Tensor, optional): Query points for tracking, in pixel coordinates.
                 Shape: [N, 2] or [B, N, 2], where N is the number of query points.
                 Default: None
+            gate_logits_override (torch.Tensor, optional): [B, S, P_patch] eval-only override for
+                the v3 gate bias (see Aggregator.forward docstring); bypasses the model's own
+                GatePredictor output when building the camera/register attention bias. Used for
+                oracle-mask gate ablations. Default: None (use the model's own predicted gate).
 
         Returns:
             dict: A dictionary containing the following predictions:
@@ -77,7 +82,9 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         if query_points is not None and len(query_points.shape) == 2:
             query_points = query_points.unsqueeze(0)
 
-        aggregated_tokens_list, patch_start_idx, gate_logits = self.aggregator(images)
+        aggregated_tokens_list, patch_start_idx, gate_logits = self.aggregator(
+            images, gate_logits_override=gate_logits_override
+        )
 
         predictions = {}
 

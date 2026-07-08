@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from dataclasses import dataclass
-from vggt.utils.pose_enc import extri_intri_to_pose_encoding
+from vggt.utils.pose_enc import extri_intri_to_pose_encoding, pose_encoding_to_extri_intri
 from train_utils.general import check_and_fix_inf_nan
 from math import ceil, floor
 
@@ -29,6 +29,8 @@ class MultitaskLoss(torch.nn.Module):
     def __init__(self, camera=None, depth=None, point=None, track=None,
                  motion=None, flow=None, reproj=None, tsmooth=None,
                  gate=None,    # v3: motion-gate BCE (docs/dyn_vggt_method_v3.md §5/§6)
+                 static_photo=None,   # v3 extension: static-region photometric consistency ("route B")
+                 camera_smooth=None,  # v3 extension: camera-trajectory smoothness regularizer
                  **kwargs):
         super().__init__()
         # Loss configuration dictionaries for each task
@@ -41,6 +43,8 @@ class MultitaskLoss(torch.nn.Module):
         self.reproj = reproj      # NEW: cross-time reprojection consistency (docs §6.2-3)
         self.tsmooth = tsmooth    # NEW: temporal smoothness of flow & motion (docs §6.2-4)
         self.gate = gate          # v3: gate-predictor BCE against GT dynamic mask
+        self.static_photo = static_photo   # v3 extension: static-region photometric consistency
+        self.camera_smooth = camera_smooth  # v3 extension: camera-trajectory smoothness regularizer
 
     def forward(self, predictions, batch) -> torch.Tensor:
         """
@@ -108,13 +112,31 @@ class MultitaskLoss(torch.nn.Module):
             total_loss = total_loss + tsmooth_loss_dict["loss_tsmooth"] * self.tsmooth["weight"]
             loss_dict.update(tsmooth_loss_dict)
 
-        # v3: gate-predictor BCE (L_gate = BCE(σ(g), m*)).  m* is the GT dynamic mask
-        # averaged to patch resolution.  gate_logits are NOT detached here so that
-        # gradients flow into the gate predictor weights.
+        # v3: gate-predictor BCE (L_gate = BCE(σ(g), m*_patch)).  m*_patch is the GT
+        # dynamic mask (m*_inst, docs §5.3b) averaged to patch resolution.
+        # gate_logits are NOT detached here so that gradients flow into the gate
+        # predictor weights.
         if self.gate is not None and "gate_logits" in predictions and "motion_mask" in batch:
             gate_loss_dict = compute_gate_loss(predictions, batch, **self.gate)
             total_loss = total_loss + gate_loss_dict["loss_gate"] * self.gate.get("weight", 1.0)
             loss_dict.update(gate_loss_dict)
+
+        # v3 extension: static-region photometric consistency ("route B" — predicted pose warps a
+        # GT-static, GT-depth point into frame t+1 and must land on matching real pixel content).
+        # Independent signal from L_cam (target is real image content, not GT-pose-derived).
+        if self.static_photo is not None and "pose_enc_list" in predictions and "motion_mask" in batch:
+            photo_loss_dict = compute_static_photo_loss(predictions, batch, **self.static_photo)
+            total_loss = total_loss + photo_loss_dict["loss_static_photo"] * self.static_photo.get("weight", 1.0)
+            loss_dict.update(photo_loss_dict)
+
+        # v3 extension: camera-trajectory smoothness regularizer — penalises 2nd-order (acceleration)
+        # jumps in the PREDICTED T/quaternion sequence, Δt-normalised by real frame-index gaps
+        # (batch["ids"]). Addresses observed trajectory jumps on hard/dynamic eval sequences;
+        # purely self-referential (no GT needed) so it's a regularizer, not supervision.
+        if self.camera_smooth is not None and "pose_enc_list" in predictions and "ids" in batch:
+            smooth_loss_dict = compute_camera_smooth_loss(predictions, batch, **self.camera_smooth)
+            total_loss = total_loss + smooth_loss_dict["loss_camera_smooth"] * self.camera_smooth.get("weight", 1.0)
+            loss_dict.update(smooth_loss_dict)
 
         # Tracking loss - not cleaned yet, dirty code is at the bottom of this file
         if "track" in predictions:
@@ -463,6 +485,202 @@ def compute_reproj_loss(predictions, batch, huber_delta=0.01, use_dyn=True, norm
     return {"loss_reproj": loss}
 
 
+def compute_static_photo_loss(predictions, batch, huber_delta=0.1, dyn_thresh=0.5, min_valid=100, **kwargs):
+    """
+    v3 extension: static-region cross-frame photometric consistency ("route B" from the
+    dyn_vggt_method_v3.md §5 discussion — not yet folded into the doc). A static GT point,
+    back-projected with GT depth and warped into frame t+1 with the model's PREDICTED pose,
+    must land on a pixel whose appearance matches the source pixel. Restricting to the GT
+    static mask (m*_inst) keeps this well-posed (dynamic points would violate the rigid-warp
+    assumption even under a perfect pose) and, unlike a GT-pose-derived reprojection target,
+    the target here is real image content — an independent signal from L_cam, not a
+    reparameterization of it.
+
+    Gradient path: only the PREDICTED extrinsics (from pose_enc_list[-1]) receive gradient,
+    via the sampling grid inside F.grid_sample. GT depth/intrinsics/images are constants.
+    Depth head is untouched (uses GT depth for back-projection), matching v3's "don't touch
+    the geometry heads" scope.
+
+    Args:
+        predictions: dict with 'pose_enc_list' (list of (B,S,9) pose encodings per refine stage).
+        batch: dict with 'images' (B,S,3,H,W) in [0,1], 'depths' (B,S,H,W) GT depth,
+            'intrinsics' (B,S,3,3) GT, 'point_masks' (B,S,H,W) bool depth validity,
+            'motion_mask' (B,S,H,W) GT dynamic mask m*_inst (1=dynamic).
+        huber_delta: Huber delta in normalized [0,1] pixel-intensity units.
+        dyn_thresh: threshold on (bilinearly warped) target-frame motion mask to reject
+            source points that land on a dynamic region in frame t+1 (occlusion guard).
+        min_valid: skip a frame pair if fewer than this many pixels pass all validity checks.
+    """
+    pose_enc = predictions["pose_enc_list"][-1]                    # (B, S, 9), final refine stage
+    images = batch["images"]                                       # (B, S, 3, H, W)
+    depths = check_and_fix_inf_nan(batch["depths"], "static_photo_depth")   # (B, S, H, W)
+    intr = batch["intrinsics"]                                     # (B, S, 3, 3), GT
+    point_masks = batch["point_masks"]                             # (B, S, H, W), bool
+    motion_mask = batch["motion_mask"]                             # (B, S, H, W), 1=dynamic (m*_inst)
+
+    B, S, _, H, W = images.shape
+    if S < 2:
+        return {"loss_static_photo": (0.0 * pose_enc).mean()}
+
+    # Predicted world-to-cam extrinsics; GT intrinsics used throughout so the loss isolates
+    # rotation/translation error (FoV is already directly supervised by L_cam).
+    extrinsics_pred, _ = pose_encoding_to_extri_intri(pose_enc, (H, W), build_intrinsics=False)
+    R = extrinsics_pred[..., :3, :3]                                # (B, S, 3, 3)
+    T = extrinsics_pred[..., :3, 3]                                 # (B, S, 3)
+
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=images.device, dtype=images.dtype),
+        torch.arange(W, device=images.device, dtype=images.dtype),
+        indexing="ij",
+    )  # (H, W) each
+
+    total_loss = images.new_tensor(0.0)
+    n_pairs = 0
+    for t in range(S - 1):
+        valid_src = point_masks[:, t] & (motion_mask[:, t] < dyn_thresh)  # (B, H, W) static + valid depth
+        if valid_src.sum() < min_valid:
+            continue
+
+        fx0 = intr[:, t, 0, 0][:, None, None]; cx0 = intr[:, t, 0, 2][:, None, None]
+        fy0 = intr[:, t, 1, 1][:, None, None]; cy0 = intr[:, t, 1, 2][:, None, None]
+        Dt = depths[:, t]                                           # (B, H, W)
+        Xc = (xx[None] - cx0) / fx0 * Dt
+        Yc = (yy[None] - cy0) / fy0 * Dt
+        pts_cam_t = torch.stack([Xc, Yc, Dt], dim=-1).reshape(B, H * W, 3)   # (B, HW, 3)
+
+        # cam_t -> world -> cam_{t+1}, using PREDICTED relative pose (row-vector convention:
+        # v_row @ R == (R^T v_col)^T, so R^T is applied by right-multiplying by R unchanged).
+        Rt, Tt = R[:, t], T[:, t]                                    # (B,3,3), (B,3)
+        Rt1, Tt1 = R[:, t + 1], T[:, t + 1]
+        pts_world = torch.matmul(pts_cam_t - Tt[:, None, :], Rt)                       # R_t^T @ (X - T_t)
+        pts_cam_t1 = torch.matmul(pts_world, Rt1.transpose(-1, -2)) + Tt1[:, None, :]  # R_{t+1} @ X + T_{t+1}
+        pts_cam_t1 = pts_cam_t1.reshape(B, H, W, 3)
+
+        fx1 = intr[:, t + 1, 0, 0][:, None, None]; cx1 = intr[:, t + 1, 0, 2][:, None, None]
+        fy1 = intr[:, t + 1, 1, 1][:, None, None]; cy1 = intr[:, t + 1, 1, 2][:, None, None]
+        Zt1 = pts_cam_t1[..., 2].clamp(min=1e-3)
+        u1 = fx1 * pts_cam_t1[..., 0] / Zt1 + cx1
+        v1 = fy1 * pts_cam_t1[..., 1] / Zt1 + cy1
+
+        gx = 2.0 * u1 / (W - 1) - 1.0
+        gy = 2.0 * v1 / (H - 1) - 1.0
+        in_bounds = (gx >= -1) & (gx <= 1) & (gy >= -1) & (gy <= 1) & (pts_cam_t1[..., 2] > 1e-3)
+        grid = torch.stack([gx, gy], dim=-1)                         # (B, H, W, 2)
+
+        sampled_rgb = F.grid_sample(images[:, t + 1], grid, mode="bilinear",
+                                     align_corners=True, padding_mode="zeros")
+        sampled_rgb = sampled_rgb.permute(0, 2, 3, 1)                # (B, H, W, 3)
+
+        # Occlusion guard: reject targets that warp onto a dynamic region in frame t+1.
+        sampled_dyn = F.grid_sample(motion_mask[:, t + 1][:, None], grid, mode="bilinear",
+                                     align_corners=True, padding_mode="zeros")[:, 0]
+        target_static = sampled_dyn < dyn_thresh
+
+        valid = valid_src & in_bounds & target_static
+        if valid.sum() < min_valid:
+            continue
+
+        img_t = images[:, t].permute(0, 2, 3, 1)                     # (B, H, W, 3)
+        err = (sampled_rgb - img_t)[valid]                           # (Nvalid, 3)
+        err = check_and_fix_inf_nan(err, "static_photo_err")
+        total_loss = total_loss + F.huber_loss(err, torch.zeros_like(err), delta=huber_delta)
+        n_pairs += 1
+
+    if n_pairs == 0:
+        return {"loss_static_photo": (0.0 * pose_enc).mean()}
+    return {"loss_static_photo": total_loss / n_pairs}
+
+
+def compute_camera_smooth_loss(predictions, batch, weight_trans=1.0, weight_rot=1.0, gamma=0.6, **kwargs):
+    """
+    v3 extension: camera-trajectory smoothness regularizer (conversation notes, not yet folded
+    into dyn_vggt_method_v3.md). Penalises 2nd-order (acceleration) discontinuities in the
+    PREDICTED pose sequence — observed as visible trajectory "jumps" on hard/dynamic Sintel
+    sequences, present in native VGGT-1B too (not a v3-specific regression). Purely
+    self-referential (no GT pose used): a regularizer on the network's own output, analogous to
+    MonST3R's trajectory-smoothness prior but applied as a training loss rather than a
+    test-time optimization term.
+
+    Δt-normalization: training clips (PointOdyssey/TartanAir, get_nearby=True) sample frames
+    from a local window with irregular spacing and possible duplicates (replace=True), not a
+    fixed stride. batch["ids"] holds the real chronological frame indices, so velocity is
+    computed as ΔT/Δt rather than raw ΔT — this makes the term valid despite irregular/duplicate
+    gaps. Pairs with Δt=0 (duplicate sampled frame) are excluded.
+
+    Rotation: quaternions are sign-corrected (consecutive-frame hemisphere alignment) before
+    differencing, since q and -q represent the same rotation and a sign flip would otherwise
+    look like a large spurious rotation jump. This is a simplified (component-wise) smoothness,
+    not a strict geodesic one.
+
+    FoV is intentionally not smoothed (unrelated to the observed jump symptom).
+
+    Args:
+        predictions: dict with 'pose_enc_list' (list of (B,S,9) pose encodings per refine stage).
+        batch: dict with 'ids' (B,S) real chronological frame indices, 'point_masks' (B,S,H,W).
+    """
+    pred_pose_encodings = predictions["pose_enc_list"]
+    n_stages = len(pred_pose_encodings)
+
+    point_masks = batch["point_masks"]
+    valid_frame_mask = point_masks[:, 0].sum(dim=[-1, -2]) > 100  # same convention as compute_camera_loss
+
+    ids = batch["ids"]
+    B, S = ids.shape
+
+    if S < 3 or valid_frame_mask.sum() == 0:
+        zero = (pred_pose_encodings[-1] * 0).mean()
+        return {"loss_camera_smooth": zero, "loss_smooth_T": zero, "loss_smooth_R": zero}
+
+    ids = ids[valid_frame_mask].float()                    # (B', S)
+    dt = ids[:, 1:] - ids[:, :-1]                          # (B', S-1)
+    pair_valid = dt > 0
+    accel_valid = pair_valid[:, 1:] & pair_valid[:, :-1]   # (B', S-2)
+    safe_dt = dt.clamp(min=1.0).unsqueeze(-1)              # (B', S-1, 1)
+
+    total_smooth_T = total_smooth_R = 0
+    for stage_idx in range(n_stages):
+        stage_weight = gamma ** (n_stages - stage_idx - 1)
+        pose = pred_pose_encodings[stage_idx][valid_frame_mask]   # (B', S, 9)
+        T = pose[..., :3]
+        quat = pose[..., 3:7]
+
+        # Sign-fix quaternion hemisphere so consecutive frames don't spuriously flip.
+        quat_fixed = [quat[:, 0]]
+        for t in range(1, S):
+            dot = (quat_fixed[-1] * quat[:, t]).sum(-1, keepdim=True)
+            sign = torch.where(dot < 0, -torch.ones_like(dot), torch.ones_like(dot))
+            quat_fixed.append(quat[:, t] * sign)
+        quat_fixed = torch.stack(quat_fixed, dim=1)   # (B', S, 4)
+
+        if accel_valid.sum() == 0:
+            loss_T_stage = (T * 0).mean()
+            loss_R_stage = (quat_fixed * 0).mean()
+        else:
+            v_T = (T[:, 1:] - T[:, :-1]) / safe_dt
+            accel_T = v_T[:, 1:] - v_T[:, :-1]             # (B', S-2, 3)
+            v_R = (quat_fixed[:, 1:] - quat_fixed[:, :-1]) / safe_dt
+            accel_R = v_R[:, 1:] - v_R[:, :-1]             # (B', S-2, 4)
+
+            mask_T = accel_valid.unsqueeze(-1).expand_as(accel_T).float()
+            mask_R = accel_valid.unsqueeze(-1).expand_as(accel_R).float()
+            loss_T_stage = (accel_T.abs() * mask_T).sum() / mask_T.sum().clamp(min=1)
+            loss_R_stage = (accel_R.abs() * mask_R).sum() / mask_R.sum().clamp(min=1)
+
+        total_smooth_T += loss_T_stage * stage_weight
+        total_smooth_R += loss_R_stage * stage_weight
+
+    avg_T = total_smooth_T / n_stages
+    avg_R = total_smooth_R / n_stages
+    loss_camera_smooth = avg_T * weight_trans + avg_R * weight_rot
+    loss_camera_smooth = check_and_fix_inf_nan(loss_camera_smooth, "loss_camera_smooth")
+
+    return {
+        "loss_camera_smooth": loss_camera_smooth,
+        "loss_smooth_T": avg_T,
+        "loss_smooth_R": avg_R,
+    }
+
+
 def compute_tsmooth_loss(predictions, batch, tv_weight=0.1, **kwargs):
     # NEW: temporal smoothness (docs §6.2-4). 2nd-order difference on scene flow (penalise jerky
     #      motion) + temporal TV on the dynamic mask. Requires sequences ordered in time.
@@ -483,20 +701,21 @@ def compute_tsmooth_loss(predictions, batch, tv_weight=0.1, **kwargs):
 
 def compute_gate_loss(predictions, batch, patch_size=14, alpha_m=10.0, beta_m=0.1, **kwargs):
     """
-    v3 gate-predictor loss  L_gate = BCE( σ(g), m* )  (docs/dyn_vggt_method_v3.md §5/§6).
+    v3 gate-predictor loss  L_gate = BCE( σ(g), m*_patch )  (docs/dyn_vggt_method_v3.md §5/§6).
 
-    gate_logits g [B, S, P_patch] are supervised against the GT dynamic mask m*
-    averaged/pooled to patch resolution.
+    gate_logits g [B, S, P_patch] are supervised against m*_patch: the GT dynamic
+    mask, averaged/pooled to patch resolution.
 
-    m* sources (in order of priority):
-      1. batch["motion_mask"]  [B, S, H, W]  — binary GT dynamic mask (PointOdyssey et al.).
-         Average-pooled to patch grid to obtain a soft per-patch probability in [0, 1].
-      2. (future) Geometric residual ‖f^gt − f^cam‖ thresholded by α_m / β_m — §5.1.
+    m*_patch is derived from (in order of priority):
+      1. batch["motion_mask"]  [B, S, H, W]  — binary GT dynamic mask m*_inst (§5.3b,
+         instance × 3D scene-flow for PointOdyssey). Average-pooled to patch grid to
+         obtain a soft per-patch probability in [0, 1] (= m*_patch).
+      2. (future) m*_geo: geometric residual ‖f^gt − f^cam‖ thresholded by α_m / β_m — §5.1.
 
     The loss is a standard binary cross-entropy on the logits (autocast-safe).
     """
     gate_logits = predictions["gate_logits"]       # [B, S, P_patch], NOT detached → gradient flows
-    motion_mask = batch["motion_mask"]             # [B, S, H, W], float or bool
+    motion_mask = batch["motion_mask"]             # [B, S, H, W], float or bool — m*_inst (§5.3b)
 
     B, S, P_patch = gate_logits.shape
     _, _, H, W = motion_mask.shape
@@ -505,18 +724,41 @@ def compute_gate_loss(predictions, batch, patch_size=14, alpha_m=10.0, beta_m=0.
     P_h = H // patch_size
     P_w = W // patch_size
 
-    # Average-pool GT mask to patch resolution → soft probability ∈ [0, 1]
-    m_star = F.adaptive_avg_pool2d(
+    # Average-pool GT mask to patch resolution → soft probability ∈ [0, 1] (= m*_patch)
+    m_star_patch = F.adaptive_avg_pool2d(
         motion_mask.reshape(B * S, 1, H, W).float(),
         (P_h, P_w),
     ).reshape(B, S, P_h * P_w)  # [B, S, P_patch]
 
     # BCE on logits (more numerically stable than BCE on probabilities)
     loss = F.binary_cross_entropy_with_logits(
-        gate_logits, m_star.to(gate_logits.dtype),
+        gate_logits, m_star_patch.to(gate_logits.dtype),
     )
     loss = check_and_fix_inf_nan(loss, "loss_gate")
     return {"loss_gate": loss}
+
+
+def oracle_gate_logits_from_mask(motion_mask: torch.Tensor, patch_size: int = 14, k: float = 30.0) -> torch.Tensor:
+    """Build a gate_logits_override straight from the GT dynamic mask (m*_inst), for the
+    oracle-gate training ablation (dyn_vggt_v3_s1_oracle_camera_only.yaml): tests whether a
+    camera token that structurally only aggregates static patches yields better pose, isolated
+    from whether the learned gate predictor is accurate (docs/dyn_vggt_method_v3.md gate
+    diagnostics). Same construction as eval/gate_bias_ablation{,_po}.py's oracle mode:
+    static patch -> -k, dynamic patch -> +k, saturating softplus so bias is ~0 / ~-k.
+
+    Args:
+        motion_mask: [B, S, H, W] GT dynamic mask (m*_inst)
+        patch_size: ViT patch size
+        k: logit magnitude
+    Returns:
+        [B, S, P_patch] gate logits, ready for Aggregator.forward's gate_logits_override
+    """
+    B, S, H, W = motion_mask.shape
+    P_h, P_w = H // patch_size, W // patch_size
+    m_patch = F.adaptive_avg_pool2d(
+        motion_mask.reshape(B * S, 1, H, W).float(), (P_h, P_w)
+    ).reshape(B, S, P_h * P_w)
+    return (m_patch * 2.0 - 1.0) * k
 
 
 def regression_loss(pred, gt, mask, conf=None, gradient_loss_fn=None, gamma=1.0, alpha=0.2, valid_range=-1):

@@ -107,11 +107,28 @@ loss:
     valid_range: 0.98
   point: null
   # If you want to enable point, use the following config
-  # point: 
+  # point:
   #   weight: 1.0
-  #   gradient_loss_fn: "normal" 
+  #   gradient_loss_fn: "normal"
   #   valid_range: 0.98
-  track: null   
+  track: null
+  static_photo: null
+  # v3 extension: static-region photometric consistency (predicted pose warps a GT-static,
+  # GT-depth point into frame t+1; must match real pixel content there). See dyn_vggt_v3_s1*.yaml.
+  # static_photo:
+  #   weight: 1.0
+  #   huber_delta: 0.1
+  #   dyn_thresh: 0.5
+  camera_smooth: null
+  # v3 extension: camera-trajectory smoothness regularizer (Δt-normalized 2nd-order term on
+  # predicted T/quaternion; addresses observed trajectory "jumps" on hard/dynamic sequences,
+  # see conversation notes). Requires img_nums with min >= 4 to avoid wasting batches (needs
+  # S>=3 frames per clip). See dyn_vggt_v3_s1_inst_smooth.yaml.
+  # camera_smooth:
+  #   weight: 0.5
+  #   weight_trans: 1.0
+  #   weight_rot: 1.0
+  #   gamma: 0.6
 
 
 
