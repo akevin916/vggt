@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -492,7 +493,6 @@ class Aggregator(nn.Module):
         N = tokens.shape[1]      # S * P
         P = N // S               # tokens per frame
         P_patch = P - patch_start_idx
-        n_special = patch_start_idx * S   # total special token positions across all frames
 
         C_dim = tokens.shape[2]
         H = block.attn.num_heads
@@ -514,17 +514,34 @@ class Aggregator(nn.Module):
             q = block.attn.rope(q, pos)
             k = block.attn.rope(k, pos)
 
-        # Split queries into special (camera+register) and patch
-        q_special = q[:, :, :n_special, :]   # [B, H, n_special, D]
-        q_patch   = q[:, :, n_special:, :]   # [B, H, S*P_patch, D]
+        # IMPORTANT: tokens are FRAME-INTERLEAVED, not [all special | all patch].
+        # Each frame s occupies positions s*P + [0..patch_start_idx) special
+        # (camera+register), then s*P + [patch_start_idx..P) patch tokens. Reshape
+        # the sequence axis to (S, P) so special/patch separate cleanly per frame.
+        q_sp = q.view(B, H, S, P, D)
+        q_special = q_sp[:, :, :, :patch_start_idx, :].reshape(B, H, S * patch_start_idx, D)
+        q_patch   = q_sp[:, :, :, patch_start_idx:, :].reshape(B, H, S * P_patch, D)
 
-        # Attention bias for special queries: 0 on special keys, −softplus(g) on patch keys.
-        # Shape [B, 1, 1, N] broadcasts over heads and query positions.
-        gate_flat = gate_logits_det.reshape(B, S * P_patch)          # [B, S*P_patch]
-        bias_special_keys = torch.zeros(B, n_special, device=gate_flat.device, dtype=gate_flat.dtype)
-        bias_patch_keys   = -F.softplus(gate_flat)                   # [B, S*P_patch]
-        attn_bias = torch.cat([bias_special_keys, bias_patch_keys], dim=1)  # [B, N]
-        attn_bias = attn_bias[:, None, None, :]                      # [B, 1, 1, N]
+        # Attention bias for special queries, in the SAME frame-interleaved KEY order:
+        # 0 on special keys, min(0, softplus(0)−softplus(g)) on patch keys. [B, 1, 1, N]
+        # broadcasts over heads and (special) query positions.
+        #
+        # Two properties, both wanted:
+        #   • warm-start: at g=0 the bias is EXACTLY 0 (softplus(0)−softplus(0)=0), so a
+        #     zero-init gate (g≡0) leaves the forward byte-for-byte equal to pretrained
+        #     VGGT. (Plain −softplus(g) gives −ln2 at g=0, halving every patch key.)
+        #   • suppress-only: clamping at max=0 keeps the gate a pure down-weighting mask —
+        #     confident-static patches (g<0) get bias 0 (full weight), never a positive
+        #     boost. Dynamic (g→+∞) → −∞ as before; the static-vs-dynamic ordering is
+        #     unchanged.
+        # The clamp has a kink at g=0, but gate_logits_det is DETACHED — no gradient flows
+        # through this bias (the gate is trained only via BCE(σ(g), m*)), so the
+        # non-smoothness is inert. The forward value stays continuous.
+        bias_key = gate_logits_det.new_zeros(B, S, P)                # [B, S, P]
+        bias_key[:, :, patch_start_idx:] = torch.clamp(
+            math.log(2.0) - F.softplus(gate_logits_det), max=0.0
+        )  # min(0, softplus(0) − softplus(g)); [B, S, P_patch] slot
+        attn_bias = bias_key.reshape(B, 1, 1, N)                     # [B, 1, 1, N]
 
         drop_p = block.attn.attn_drop.p if self.training else 0.0
 
@@ -537,8 +554,10 @@ class Aggregator(nn.Module):
             dropout_p=drop_p,
         )
 
-        # Recombine in original order [special | patch]
-        attn_out = torch.cat([attn_special, attn_patch], dim=2)      # [B, H, N, D]
+        # Recombine into original frame-interleaved order [special|patch per frame]
+        attn_special = attn_special.view(B, H, S, patch_start_idx, D)
+        attn_patch   = attn_patch.view(B, H, S, P_patch, D)
+        attn_out = torch.cat([attn_special, attn_patch], dim=3).reshape(B, H, N, D)
 
         # Output projection
         attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, N, C_dim)
