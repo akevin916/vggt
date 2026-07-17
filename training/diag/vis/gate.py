@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gate diagnostic: visualize m_gt / m_star_patch / g (PO) or m_star_raft_patch / g (Sintel).
+"""Gate diagnostic: visualize m_gt / m_star_patch / g (PO) or m_geo_patch / g (Sintel).
 
 Primary tool for inspecting v3 gate behavior. Optional --metrics writes a minimal summary.json.
 """
@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import sys
 
-_TRAINING_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_TRAINING_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path[:0] = [_TRAINING_DIR, os.path.dirname(_TRAINING_DIR)]
 
 import argparse
@@ -17,10 +17,10 @@ import json
 from datetime import datetime
 from typing import Any, Dict
 
-from eval.gate_vis import print_diag_summary, run_po_vis, run_sintel_vis
-from eval.paths import TRAINING_DIR, VIS_GATE, default_eval_dir
-from eval.sintel_io import resolve_sintel_root
-from eval.vggt_infer import load_vggt_for_eval
+from eval_utils.gate_vis import print_diag_summary, run_po_vis, run_sintel_vis
+from eval_utils.paths import VIS_GATE, default_output_dir
+from data.sintel_io import resolve_sintel_root
+from eval_utils.vggt_infer import load_vggt_for_eval
 
 
 def parse_args():
@@ -32,7 +32,7 @@ def parse_args():
         default="po",
         help="po=in-domain PO (default); sintel=cross-domain flow-residual; all=both",
     )
-    ap.add_argument("--out_dir", default=None, help=f"Default: logs/<exp>/{VIS_GATE}")
+    ap.add_argument("--out_dir", default=None, help=f"Default: outputs/<exp>/{VIS_GATE}")
     ap.add_argument("--metrics", action="store_true", help="Write minimal summary.json")
     ap.add_argument("--n_clips", type=int, default=2, help="PO clips to visualize")
     ap.add_argument("--img_per_seq", type=int, default=4)
@@ -51,7 +51,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    args.out_dir = args.out_dir or default_eval_dir(args.ckpt, VIS_GATE, TRAINING_DIR)
+    args.out_dir = args.out_dir or default_output_dir(args.ckpt, VIS_GATE)
     os.makedirs(args.out_dir, exist_ok=True)
     print(f"Output dir: {args.out_dir}")
 

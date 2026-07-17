@@ -32,7 +32,7 @@ import numpy as np
 from data.dataset_util import read_image_cv2, threshold_depth_map
 from data.base_dataset import BaseDataset
 
-from eval.sintel_io import (
+from data.sintel_io import (
     SINTEL_EVAL_SEQUENCES,
     read_sintel_depth,
     sintel_cam_read,
@@ -41,7 +41,7 @@ from eval.sintel_io import (
     matching_depth_path,
     load_sintel_rgb_paths,
 )
-from eval.motion_mask import read_flo, compute_ego_flow, derive_motion_mask
+from data.motion_mask import read_flo, compute_ego_flow, derive_motion_mask
 
 
 class SintelDataset(BaseDataset):

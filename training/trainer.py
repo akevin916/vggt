@@ -41,7 +41,7 @@ from train_utils.general import *
 from train_utils.logging import setup_logging
 from train_utils.normalization import normalize_camera_extrinsics_and_points_batch
 from train_utils.optimizer import construct_optimizers
-from eval.val_metrics import ValMetricsAccumulator
+from eval_utils.metrics_val import ValMetricsAccumulator
 from loss import oracle_gate_logits_from_mask
 
 

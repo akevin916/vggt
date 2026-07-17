@@ -192,3 +192,22 @@ def resize_pred_to_gt(pred: np.ndarray, meta: PreprocessMeta) -> np.ndarray:
         resized = resized[y0 : y0 + model_h, :]
     out = cv2.resize(resized, (meta.orig_w, meta.orig_h), interpolation=cv2.INTER_LINEAR)
     return out.astype(np.float32)
+
+
+def resize_gt_to_pred(gt: np.ndarray, meta: PreprocessMeta, model_hw: Tuple[int, int]) -> np.ndarray:
+    """Inverse of ``resize_pred_to_gt``: GT-resolution map -> model crop space.
+
+    Uses INTER_AREA (area average) so a binary mask downsamples to the same soft
+    occupancy that ``adaptive_avg_pool2d`` gives the patch labels elsewhere; callers
+    re-binarize at their own threshold.
+    """
+    import cv2
+
+    model_h, model_w = model_hw
+    resized = cv2.resize(gt.astype(np.float32), (meta.new_w, meta.new_h), interpolation=cv2.INTER_AREA)
+    if meta.new_h > model_h:
+        y0 = meta.crop_y0
+        resized = resized[y0 : y0 + model_h, :]
+    if resized.shape != (model_h, model_w):
+        raise ValueError(f"resize_gt_to_pred produced {resized.shape}, expected {(model_h, model_w)}")
+    return resized.astype(np.float32)

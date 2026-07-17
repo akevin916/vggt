@@ -7,12 +7,12 @@ from typing import Dict, Mapping, Optional
 import numpy as np
 import torch
 
-from eval.depth_metrics import depth_evaluation
-from eval.pose_metrics import eval_pose_metrics, extrinsics_w2c_to_tum
+from eval_utils.metrics_depth import depth_evaluation
+from eval_utils.metrics_pose import eval_pose_metrics, extrinsics_w2c_to_tum
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
-_DEPTH_KEYS = ("abs_rel", "delta_1", "rmse")
-_POSE_KEYS = ("ate", "rpe_trans", "rpe_rot")
+DEPTH_KEYS = ("abs_rel", "delta_1", "rmse")
+POSE_KEYS = ("ate", "rpe_trans", "rpe_rot")
 
 
 class ValMetricsAccumulator:
@@ -24,9 +24,9 @@ class ValMetricsAccumulator:
         self.reset()
 
     def reset(self) -> None:
-        self._depth = {k: 0.0 for k in _DEPTH_KEYS}
+        self._depth = {k: 0.0 for k in DEPTH_KEYS}
         self._depth_frames = 0
-        self._pose = {k: 0.0 for k in _POSE_KEYS}
+        self._pose = {k: 0.0 for k in POSE_KEYS}
         self._pose_seqs = 0
 
     def update(self, predictions: Mapping, batch: Mapping) -> Dict[str, float]:
@@ -44,11 +44,11 @@ class ValMetricsAccumulator:
     def compute(self) -> Dict[str, float]:
         out: Dict[str, float] = {}
         if self._depth_frames > 0:
-            for k in _DEPTH_KEYS:
+            for k in DEPTH_KEYS:
                 out[k] = self._depth[k] / self._depth_frames
             out["depth_frames"] = float(self._depth_frames)
         if self._pose_seqs > 0:
-            for k in _POSE_KEYS:
+            for k in POSE_KEYS:
                 out[k] = self._pose[k] / self._pose_seqs
             out["pose_seqs"] = float(self._pose_seqs)
         return out
@@ -61,7 +61,7 @@ class ValMetricsAccumulator:
         gt_depth = batch["depths"]
         masks = batch["point_masks"]
 
-        batch_depth = {k: 0.0 for k in _DEPTH_KEYS}
+        batch_depth = {k: 0.0 for k in DEPTH_KEYS}
         n_frames = 0
 
         bsz, seq_len = gt_depth.shape[:2]
@@ -75,7 +75,7 @@ class ValMetricsAccumulator:
                 )
                 if m["valid_pixels"] < self.min_depth_pixels:
                     continue
-                for k in _DEPTH_KEYS:
+                for k in DEPTH_KEYS:
                     batch_depth[k] += m[k]
                     self._depth[k] += m[k]
                 n_frames += 1
@@ -83,7 +83,7 @@ class ValMetricsAccumulator:
 
         if n_frames == 0:
             return {}
-        return {f"metric_{k}": batch_depth[k] / n_frames for k in _DEPTH_KEYS}
+        return {f"metric_{k}": batch_depth[k] / n_frames for k in DEPTH_KEYS}
 
     def _update_pose(self, predictions: Mapping, batch: Mapping) -> Dict[str, float]:
         images = batch["images"]
@@ -96,7 +96,7 @@ class ValMetricsAccumulator:
         pred_ext = pred_ext.detach().float().cpu().numpy()
         gt_ext = batch["extrinsics"].detach().float().cpu().numpy()
 
-        batch_pose = {k: 0.0 for k in _POSE_KEYS}
+        batch_pose = {k: 0.0 for k in POSE_KEYS}
         n_seqs = 0
 
         for b in range(pred_ext.shape[0]):
@@ -107,7 +107,7 @@ class ValMetricsAccumulator:
                 pm = eval_pose_metrics(pred_ext[b], gt_tum, gt_ts)
             except Exception:
                 continue
-            for k in _POSE_KEYS:
+            for k in POSE_KEYS:
                 batch_pose[k] += pm[k]
                 self._pose[k] += pm[k]
             n_seqs += 1
@@ -115,4 +115,4 @@ class ValMetricsAccumulator:
 
         if n_seqs == 0:
             return {}
-        return {f"metric_{k}": batch_pose[k] / n_seqs for k in _POSE_KEYS}
+        return {f"metric_{k}": batch_pose[k] / n_seqs for k in POSE_KEYS}

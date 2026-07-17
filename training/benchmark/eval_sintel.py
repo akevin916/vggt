@@ -19,10 +19,10 @@ from typing import Any, Dict, List
 import numpy as np
 from tqdm import tqdm
 
-from eval.depth_metrics import average_depth_results, eval_sequence_depth
-from eval.paths import EVAL_SINTEL, TRAINING_DIR, default_eval_dir
-from eval.pose_metrics import eval_pose_metrics
-from eval.sintel_io import (
+from eval_utils.metrics_depth import average_depth_results, eval_sequence_depth
+from eval_utils.paths import EVAL_SINTEL, default_output_dir
+from eval_utils.metrics_pose import eval_pose_metrics
+from data.sintel_io import (
     compute_preprocess_meta,
     list_sintel_sequences,
     load_sintel_gt_depths,
@@ -32,14 +32,14 @@ from eval.sintel_io import (
     resize_pred_to_gt,
     sintel_seq_paths,
 )
-from eval.vggt_infer import infer_sequence, infer_sequence_chunked, load_vggt_for_eval
+from eval_utils.vggt_infer import infer_sequence, infer_sequence_chunked, load_vggt_for_eval
 
 
 def parse_args():
     ap = argparse.ArgumentParser(description="Sintel pose + depth benchmark")
     ap.add_argument("--ckpt", type=str, required=True)
     ap.add_argument("--sintel_root", type=str, default=None, help="Auto-detected from repo data/ if omitted")
-    ap.add_argument("--out_dir", type=str, default=None, help=f"Default: logs/<exp>/{EVAL_SINTEL}")
+    ap.add_argument("--out_dir", type=str, default=None, help=f"Default: outputs/<exp>/{EVAL_SINTEL}")
     ap.add_argument("--seq_list", type=str, nargs="*", default=None)
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--chunk_size", type=int, default=0, help="0 = full sequence; else chunk inference")
@@ -54,12 +54,20 @@ def _mean_pose(per_seq: Dict[str, Dict[str, float]]) -> Dict[str, float]:
     return {k: float(np.mean([v[k] for v in per_seq.values()])) for k in keys}
 
 
-def evaluate(args) -> Dict[str, Any]:
-    args.out_dir = args.out_dir or default_eval_dir(args.ckpt, EVAL_SINTEL, TRAINING_DIR)
+def evaluate(args, model=None) -> Dict[str, Any]:
+    """Run the Sintel pose(+depth) benchmark.
+
+    ``model``: optional preloaded (in-memory) VGGT. When given, the checkpoint on disk
+    is NOT reloaded -- lets the trainer score its own live model periodically without
+    building a second model on the GPU (see trainer.run_pose_eval). When None, the model
+    is loaded from ``args.ckpt`` as in standalone CLI use.
+    """
+    args.out_dir = args.out_dir or default_output_dir(args.ckpt, EVAL_SINTEL)
     args.sintel_root = resolve_sintel_root(args.sintel_root)
     print(f"Output dir: {args.out_dir}")
     print(f"Sintel root: {args.sintel_root}")
-    model = load_vggt_for_eval(args.ckpt, device=args.device)
+    if model is None:
+        model = load_vggt_for_eval(args.ckpt, device=args.device)
 
     sequences = list_sintel_sequences(args.seq_list)
     os.makedirs(args.out_dir, exist_ok=True)
@@ -84,15 +92,18 @@ def evaluate(args) -> Dict[str, Any]:
             pred = infer_fn(model, rgb_paths, **infer_kw)
             pose_per_seq[seq] = eval_pose_metrics(pred["extrinsic"], gt_tum, gt_ts)
 
-            pred_on_gt = []
-            for i, rgb_path in enumerate(rgb_paths):
-                meta = compute_preprocess_meta(rgb_path)
-                frame_depth = pred["depth"][i]
-                if frame_depth.ndim == 3:
-                    frame_depth = frame_depth[..., 0]
-                pred_on_gt.append(resize_pred_to_gt(frame_depth, meta))
+            # Pose-only checkpoints (e.g. the gate/camera-only v3 configs with depth_head
+            # disabled) return no depth -- score pose only in that case.
+            if "depth" in pred:
+                pred_on_gt = []
+                for i, rgb_path in enumerate(rgb_paths):
+                    meta = compute_preprocess_meta(rgb_path)
+                    frame_depth = pred["depth"][i]
+                    if frame_depth.ndim == 3:
+                        frame_depth = frame_depth[..., 0]
+                    pred_on_gt.append(resize_pred_to_gt(frame_depth, meta))
 
-            depth_per_seq[seq] = eval_sequence_depth(pred_on_gt, gt_depths, max_depth=args.max_depth)
+                depth_per_seq[seq] = eval_sequence_depth(pred_on_gt, gt_depths, max_depth=args.max_depth)
         except Exception as e:
             msg = f"{seq}: {e}\n{traceback.format_exc()}"
             errors.append(msg)

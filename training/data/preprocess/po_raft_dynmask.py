@@ -22,7 +22,7 @@ import os, os.path as osp, glob, argparse, sys
 sys.path.insert(0, osp.dirname(osp.dirname(osp.dirname(osp.abspath(__file__)))))  # training/
 import numpy as np, cv2, torch
 from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
-from eval.motion_mask import compute_ego_flow
+from data.motion_mask import compute_ego_flow
 
 DEPTH_MAX = 1000.0  # matches PointOdysseyDataset.depth_max
 PROC_W, PROC_H = 480, 272  # RAFT processing res (both divisible by 8); ~half native, gate is patch-level

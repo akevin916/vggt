@@ -19,29 +19,25 @@ sys.path[:0] = [_TRAINING_DIR, os.path.dirname(_TRAINING_DIR)]
 import argparse
 import json
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-import cv2
 import numpy as np
 import torch
 from tqdm import tqdm
 
 from data.datasets.pointodyssey import PointOdysseyDataset
-from eval.gate_common import po_common_conf, pool_to_patch
-from eval.motion_mask import DIAG_SEQUENCES, compute_ego_flow, derive_motion_mask, load_sintel_gt_flows
-from eval.paths import GATE_BIAS_ABLATION, GATE_BIAS_ABLATION_PO, TRAINING_DIR, default_eval_dir
-from eval.pose_metrics import eval_pose_metrics, extrinsics_w2c_to_tum
-from eval.sintel_io import (
+from eval_utils.gate_common import oracle_logits_from_masks, po_common_conf, pool_to_patch
+from data.motion_mask import DIAG_SEQUENCES, sintel_masks_and_fraction
+from eval_utils.paths import GATE_BIAS_ABLATION, GATE_BIAS_ABLATION_PO, default_output_dir
+from eval_utils.metrics_pose import eval_pose_metrics, extrinsics_w2c_to_tum
+from data.sintel_io import (
     SINTEL_EVAL_SEQUENCES,
-    load_sintel_gt_depths,
     load_sintel_gt_poses,
     load_sintel_rgb_paths,
-    matching_cam_path,
     resolve_sintel_root,
-    sintel_cam_read,
     sintel_seq_paths,
 )
-from eval.vggt_infer import infer_sequence_chunked, load_vggt_for_eval
+from eval_utils.vggt_infer import infer_sequence_chunked, load_vggt_for_eval
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
@@ -69,6 +65,12 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Require ckpt to contain gate_predictor weights.",
+    )
+    ap.add_argument(
+        "--force_gate",
+        action="store_true",
+        help="Build the gate mechanism even if the ckpt has no gate_predictor (e.g. pretrained "
+        "VGGT-1B). GatePredictor is random-init -> only off/oracle modes are meaningful.",
     )
 
     # Sintel-specific
@@ -139,48 +141,10 @@ def _save_results(out_dir: str, results: Dict[str, Any]) -> str:
     return json_path
 
 
-def _sintel_masks_and_fraction(
-    sintel_root: str, seq: str, rgb_paths: List[str], motion_thr: float
-) -> Tuple[List[Optional[np.ndarray]], float]:
-    _, _, cam_dir = sintel_seq_paths(sintel_root, seq)
-    gt_flows = load_sintel_gt_flows(sintel_root, seq, rgb_paths)
-    gt_depths = load_sintel_gt_depths(sintel_root, seq, rgb_paths)
-    intrinsics, extrinsics = [], []
-    for p in rgb_paths:
-        K, ext = sintel_cam_read(matching_cam_path(cam_dir, p))
-        intrinsics.append(K)
-        extrinsics.append(ext)
-
-    masks: List[Optional[np.ndarray]] = []
-    fracs: List[float] = []
-    for i in range(len(rgb_paths)):
-        if gt_flows[i] is None or i + 1 >= len(extrinsics):
-            masks.append(None)
-            continue
-        ego = compute_ego_flow(gt_depths[i], intrinsics[i], extrinsics[i], extrinsics[i + 1])
-        mask = derive_motion_mask(gt_flows[i], ego, threshold=motion_thr)
-        masks.append(mask)
-        fracs.append(float(mask.mean()))
-    mean_frac = float(np.mean(fracs)) if fracs else float("nan")
-    return masks, mean_frac
-
-
 def seq_dynamic_fraction(sintel_root: str, seq: str, max_frames: int, motion_thr: float) -> float:
     rgb_paths = load_sintel_rgb_paths(sintel_root, seq)[:max_frames]
-    _, mean_frac = _sintel_masks_and_fraction(sintel_root, seq, rgb_paths, motion_thr)
+    _, mean_frac = sintel_masks_and_fraction(sintel_root, seq, rgb_paths, motion_thr)
     return mean_frac
-
-
-def _build_oracle_logits_from_masks(
-    masks: List[Optional[np.ndarray]], s: int, ph: int, pw: int, k: float
-) -> torch.Tensor:
-    patch_probs = np.zeros((s, ph, pw), dtype=np.float32)
-    for i in range(min(s, len(masks))):
-        if masks[i] is None:
-            continue
-        patch_probs[i] = cv2.resize(masks[i], (pw, ph), interpolation=cv2.INTER_AREA)
-    logits = (torch.from_numpy(patch_probs) * 2.0 - 1.0) * k
-    return logits.reshape(1, s, ph * pw)
 
 
 def _infer_extrinsic(model, img, h, w, device: str, gate_override: Optional[torch.Tensor]):
@@ -202,9 +166,9 @@ def _run_sintel_seq(model, args, sintel_root: str, seq: str) -> Dict[str, Any]:
     s, _, h, w = images.shape
     ph, pw = h // args.patch_size, w // args.patch_size
 
-    masks, dyn_frac = _sintel_masks_and_fraction(sintel_root, seq, rgb_paths, args.motion_thr)
+    masks, dyn_frac = sintel_masks_and_fraction(sintel_root, seq, rgb_paths, args.motion_thr)
     off_logits = torch.full((1, s, ph * pw), -args.k)
-    oracle_logits = _build_oracle_logits_from_masks(masks, s, ph, pw, args.k)
+    oracle_logits = oracle_logits_from_masks(masks, s, ph, pw, args.k)
 
     infer_kw = {"device": args.device}
     if args.chunk_size > 0:
@@ -232,14 +196,14 @@ def _run_sintel_seq(model, args, sintel_root: str, seq: str) -> Dict[str, Any]:
 
 
 def _evaluate_sintel(args) -> Dict[str, Any]:
-    args.out_dir = args.out_dir or default_eval_dir(args.ckpt, GATE_BIAS_ABLATION, TRAINING_DIR)
+    args.out_dir = args.out_dir or default_output_dir(args.ckpt, GATE_BIAS_ABLATION)
     sintel_root = resolve_sintel_root(args.sintel_root)
     seqs = SINTEL_EVAL_SEQUENCES if args.all_seqs else (args.seqs or DIAG_SEQUENCES)
     print(f"Output dir: {args.out_dir}")
     print(f"Sintel root: {sintel_root}")
     print(f"Sequences: {seqs}")
 
-    model = load_vggt_for_eval(args.ckpt, device=args.device, require_gate=args.require_gate)
+    model = load_vggt_for_eval(args.ckpt, device=args.device, require_gate=args.require_gate, force_gate=args.force_gate)
 
     per_seq: Dict[str, Dict[str, Dict[str, float]]] = {}
     dynamic_fraction_by_seq: Dict[str, float] = {}
@@ -320,11 +284,11 @@ def _run_po_clip(model, args, ds: PointOdysseyDataset, seq_index: int) -> Dict[s
 
 
 def _evaluate_po(args) -> Dict[str, Any]:
-    args.out_dir = args.out_dir or default_eval_dir(args.ckpt, GATE_BIAS_ABLATION_PO, TRAINING_DIR)
+    args.out_dir = args.out_dir or default_output_dir(args.ckpt, GATE_BIAS_ABLATION_PO)
     print(f"Output dir: {args.out_dir}")
     print(f"PO dir: {args.po_dir}")
 
-    model = load_vggt_for_eval(args.ckpt, img_size=args.img_size, device=args.device, require_gate=args.require_gate)
+    model = load_vggt_for_eval(args.ckpt, img_size=args.img_size, device=args.device, require_gate=args.require_gate, force_gate=args.force_gate)
     ds = PointOdysseyDataset(
         common_conf=po_common_conf(args),
         split="test",

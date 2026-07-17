@@ -25,6 +25,7 @@ def load_vggt_for_eval(
     gate_block_iter: int = 7,
     device: str = "cuda",
     require_gate: bool = False,
+    force_gate: bool = False,
     verbose: bool = True,
 ) -> VGGT:
     """Build VGGT with architecture inferred from checkpoint keys.
@@ -36,7 +37,10 @@ def load_vggt_for_eval(
     """
     sd = _load_state_dict(ckpt)
     keys = list(sd.keys())
-    has_gate = any("gate_predictor" in k for k in keys)
+    # force_gate: build the gate mechanism even when the checkpoint has no gate_predictor
+    # weights (e.g. pretrained VGGT-1B). The GatePredictor is then random-init and only the
+    # oracle/off modes -- which override the predictor output -- are meaningful.
+    has_gate = any("gate_predictor" in k for k in keys) or force_gate
     has_temporal = any("temporal" in k for k in keys)
     has_depth = any(k.startswith("depth_head") for k in keys)
     has_point = any(k.startswith("point_head") for k in keys)
@@ -109,7 +113,14 @@ def infer_sequence(
     device: str = "cuda",
     dtype: Optional[torch.dtype] = None,
     gate_logits_override: Optional[torch.Tensor] = None,
+    want_point: bool = False,
 ) -> Dict[str, np.ndarray]:
+    """Run VGGT on one sequence.
+
+    ``want_point`` opts in to returning the point head's ``world_points`` /
+    ``world_points_conf``. It is off by default because those are [S,H,W,3] fp32
+    arrays (~160 MB for a 50-frame Sintel sequence) that only diag/pnp_pose.py wants.
+    """
     if dtype is None:
         dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
@@ -139,6 +150,10 @@ def infer_sequence(
         # [S, P_patch] fp32 — the model's own predicted gate logits (pre-bias), for
         # reuse as a (possibly rescaled) gate_logits_override in follow-up ablations.
         out["gate_logits"] = pred["gate_logits"].squeeze(0).float().cpu().numpy()
+    if want_point and "world_points" in pred:
+        # [S, H, W, 3] in the frame-0 camera frame, plus its [S, H, W] confidence.
+        out["world_points"] = pred["world_points"].squeeze(0).float().cpu().numpy()
+        out["world_points_conf"] = pred["world_points_conf"].squeeze(0).float().cpu().numpy()
     return out
 
 

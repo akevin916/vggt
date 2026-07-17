@@ -35,7 +35,7 @@ from collections import defaultdict
 sys.path.insert(0, osp.dirname(osp.dirname(osp.dirname(osp.abspath(__file__)))))  # training/
 import numpy as np, cv2, torch
 from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
-from eval.motion_mask import compute_ego_flow
+from data.motion_mask import compute_ego_flow
 from data.datasets.waymo import _read_waymo_depth
 
 DEPTH_MAX = 80.0  # matches WaymoDataset.depth_max (LiDAR valid range)

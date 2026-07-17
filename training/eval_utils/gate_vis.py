@@ -11,9 +11,9 @@ import torch
 import torch.nn.functional as F
 
 from data.datasets.pointodyssey import PointOdysseyDataset
-from eval.gate_common import po_common_conf, pool_to_patch, summarize_gate_diag
-from eval.motion_mask import DIAG_SEQUENCES, compute_ego_flow, derive_motion_mask, load_sintel_gt_flows
-from eval.sintel_io import (
+from eval_utils.gate_common import po_common_conf, pool_to_patch, summarize_gate_diag
+from data.motion_mask import DIAG_SEQUENCES, compute_ego_flow, derive_motion_mask, load_sintel_gt_flows
+from data.sintel_io import (
     load_sintel_gt_depths,
     load_sintel_rgb_paths,
     matching_cam_path,
@@ -56,19 +56,19 @@ def save_po_panel(
 def save_sintel_panel(
     out_path: str,
     rgb: np.ndarray,
-    m_star_raft_patch: np.ndarray,
+    m_geo_patch: np.ndarray,
     g_prob: np.ndarray,
     h: int,
     w: int,
 ) -> None:
-    """m_star_raft_patch: m*_raft (docs §5.3a, flow-residual threshold) pooled to patch resolution."""
+    """m_geo_patch: m_geo (docs §5.3a, flow-residual threshold) pooled to patch resolution."""
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    pseudo_col = colorize_map(m_star_raft_patch, h, w, "nearest")
+    pseudo_col = colorize_map(m_geo_patch, h, w, "nearest")
     g_col = colorize_map(g_prob, h, w, "nearest")
     overlay = cv2.addWeighted(bgr, 0.55, g_col, 0.45, 0)
     row = np.concatenate([bgr, pseudo_col, g_col, overlay], axis=1)
-    label = "RGB | m*_raft_patch (flow residual) | g | overlay"
+    label = "RGB | m_geo_patch (flow residual) | g | overlay"
     cv2.putText(row, label, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
     cv2.imwrite(out_path, row)
 
@@ -174,8 +174,8 @@ def run_sintel_vis(model: VGGT, args, out_dir: str, sintel_root: str) -> Dict[st
         for i in range(s):
             if masks[i] is None:
                 continue
-            m_star_raft_patch = cv2.resize(masks[i], (pw, ph), interpolation=cv2.INTER_AREA)  # m*_raft (§5.3a) pooled
-            lab = (m_star_raft_patch >= 0.5).astype(np.int8)
+            m_geo_patch = cv2.resize(masks[i], (pw, ph), interpolation=cv2.INTER_AREA)  # m_geo (§5.3a) pooled
+            lab = (m_geo_patch >= 0.5).astype(np.int8)
             seq_probs.append(g_prob[i].reshape(-1))
             seq_labels.append(lab.reshape(-1))
 
@@ -183,7 +183,7 @@ def run_sintel_vis(model: VGGT, args, out_dir: str, sintel_root: str) -> Dict[st
                 continue
             rgb = (images[i].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
             out_path = os.path.join(vis_dir, f"{seq}_f{i}.png")
-            save_sintel_panel(out_path, rgb, m_star_raft_patch, g_prob[i], h, w)
+            save_sintel_panel(out_path, rgb, m_geo_patch, g_prob[i], h, w)
             print(f"saved {out_path}")
             saved += 1
             vis_count += 1
