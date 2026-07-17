@@ -118,6 +118,11 @@ class PointOdysseyDataset(BaseDataset):
         # instance/raft: precomputed masks are already binary {0,255}, so the same
         # "> 0" threshold reduces to a plain binarization. Returns float32 {0,1} of shape (H, W),
         # or None if the file doesn't exist / can't be read.
+        # Check existence first: instance sequences without dynmask_inst legitimately miss this
+        # file and fall back to raft (see _binary_dynamic_mask). cv2.imread would return None
+        # anyway, but only after printing a noisy "can't open/read file" warning to stderr.
+        if not osp.exists(mask_path):
+            return None
         m = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
         if m is None:
             return None
