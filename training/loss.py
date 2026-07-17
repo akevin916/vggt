@@ -699,7 +699,8 @@ def compute_tsmooth_loss(predictions, batch, tv_weight=0.1, **kwargs):
     return {"loss_tsmooth": total}
 
 
-def compute_gate_loss(predictions, batch, patch_size=14, alpha_m=10.0, beta_m=0.1, **kwargs):
+def compute_gate_loss(predictions, batch, patch_size=14, alpha_m=10.0, beta_m=0.1,
+                      hard_lo=None, hard_hi=None, **kwargs):
     """
     v3 gate-predictor loss  L_gate = BCE( σ(g), m*_patch )  (docs/dyn_vggt_method_v3.md §5/§6).
 
@@ -713,6 +714,13 @@ def compute_gate_loss(predictions, batch, patch_size=14, alpha_m=10.0, beta_m=0.
       2. (future) m*_geo: geometric residual ‖f^gt − f^cam‖ thresholded by α_m / β_m — §5.1.
 
     The loss is a standard binary cross-entropy on the logits (autocast-safe).
+
+    C-1 (hard label + ignore-band). When `hard_lo`/`hard_hi` are set, the soft pooled
+    label is discretised: patches with m*_patch >= hard_hi -> 1, <= hard_lo -> 0, and the
+    boundary band (hard_lo, hard_hi) is IGNORED (excluded from the mean). This removes the
+    irreducible BCE floor that soft boundary targets impose, which otherwise trains the gate
+    to hedge (σ(g) capped ~0.3-0.5). Defaults (None) keep the original soft-label behaviour
+    byte-for-byte. Typical: hard_lo=0.3, hard_hi=0.7.
     """
     gate_logits = predictions["gate_logits"]       # [B, S, P_patch], NOT detached → gradient flows
     motion_mask = batch["motion_mask"]             # [B, S, H, W], float or bool — m*_inst (§5.3b)
@@ -730,10 +738,21 @@ def compute_gate_loss(predictions, batch, patch_size=14, alpha_m=10.0, beta_m=0.
         (P_h, P_w),
     ).reshape(B, S, P_h * P_w)  # [B, S, P_patch]
 
-    # BCE on logits (more numerically stable than BCE on probabilities)
-    loss = F.binary_cross_entropy_with_logits(
-        gate_logits, m_star_patch.to(gate_logits.dtype),
-    )
+    if hard_lo is not None and hard_hi is not None:
+        # C-1: hard label + boundary ignore-band. Keep only confident patches.
+        keep = (m_star_patch <= hard_lo) | (m_star_patch >= hard_hi)  # [B, S, P_patch] bool
+        target = (m_star_patch >= hard_hi).to(gate_logits.dtype)
+        per_patch = F.binary_cross_entropy_with_logits(
+            gate_logits, target, reduction="none",
+        )
+        keep = keep.to(per_patch.dtype)
+        denom = keep.sum().clamp_min(1.0)
+        loss = (per_patch * keep).sum() / denom
+    else:
+        # BCE on logits (more numerically stable than BCE on probabilities)
+        loss = F.binary_cross_entropy_with_logits(
+            gate_logits, m_star_patch.to(gate_logits.dtype),
+        )
     loss = check_and_fix_inf_nan(loss, "loss_gate")
     return {"loss_gate": loss}
 
@@ -743,7 +762,7 @@ def oracle_gate_logits_from_mask(motion_mask: torch.Tensor, patch_size: int = 14
     oracle-gate training ablation (dyn_vggt_v3_s1_oracle_camera_only.yaml): tests whether a
     camera token that structurally only aggregates static patches yields better pose, isolated
     from whether the learned gate predictor is accurate (docs/dyn_vggt_method_v3.md gate
-    diagnostics). Same construction as eval/gate_bias_ablation{,_po}.py's oracle mode:
+    diagnostics). Same construction as diag/gate_bias_ablation.py's oracle mode:
     static patch -> -k, dynamic patch -> +k, saturating softplus so bias is ~0 / ~-k.
 
     Args:
