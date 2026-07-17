@@ -13,11 +13,25 @@ max_img_per_gpu: 48
 limit_train_batches: 2000
 limit_val_batches: 200
 
-# Validation metrics (depth AbsRel/δ1/RMSE + pose ATE/RPE via evo; median scale depth align)
+# Validation metrics (depth AbsRel/δ1/RMSE + pose ATE/RPE via evo; median scale depth align).
+# When pose_eval is enabled these become monitoring-only (they no longer select best.pt).
 val_metrics:
   enabled: true
   max_depth: 80.0
   min_depth_pixels: 100
+
+# MonST3R-style channel B: deterministic full-sequence Sintel pose eval that drives best.pt.
+# Runs on the live model every `every_n_epochs` (plus the final epoch), on fixed full-length
+# sequences -- no random [4,16] windowing / re-sampling, so its ATE is a stable selection
+# signal (unlike the windowed val_metrics ATE). Disabled by default -> legacy behaviour
+# (best.pt driven by the windowed val ATE). See trainer.run_pose_eval.
+pose_eval:
+  enabled: false
+  every_n_epochs: 5
+  sintel_root: null   # null -> auto-detect from repo data/ (eval.sintel_io.resolve_sintel_root)
+  seq_list: null      # null -> all Sintel eval sequences
+  chunk_size: 0       # 0 = full sequence (required: chunking inflates ATE, see CLAUDE.md)
+  max_depth: 80.0
 
 
 data:
@@ -204,3 +218,9 @@ cuda:
     cudnn_deterministic: False
     cudnn_benchmark: False
     allow_tf32: True
+    # Workaround: the flash-attention SDPA kernel in torch 2.12+cu130 segfaults intermittently
+    # on RTX 5090 (Blackwell sm_120) / driver 595 -- it took down training 3× (SIGBUS/SIGSEGV in
+    # attention/rope forward). A/B compute repro (outputs/gpu_repro_*.log): flash crashed at
+    # ~94 min, mem-efficient ran 120 min clean. Disabling flash makes F.scaled_dot_product_attention
+    # fall back to the mem-efficient kernel (identical math, numerically equivalent, stable).
+    disable_flash_sdp: True

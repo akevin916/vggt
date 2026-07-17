@@ -41,8 +41,21 @@ from train_utils.general import *
 from train_utils.logging import setup_logging
 from train_utils.normalization import normalize_camera_extrinsics_and_points_batch
 from train_utils.optimizer import construct_optimizers
-from eval_utils.metrics_val import ValMetricsAccumulator
+from eval_utils.metrics_val import DEPTH_KEYS, POSE_KEYS, ValMetricsAccumulator
 from loss import oracle_gate_logits_from_mask
+
+# TensorBoard tag layout: "<phase>/<group>_<key>" -- train/loss_*, validation/loss_*,
+# validation/depth_*, validation/pose_*. The internal phase name is 'val'; TB spells it out.
+_TB_PHASE = {"train": "train", "val": "validation"}
+
+
+def _tb_metric_group(key: str) -> str:
+    """Map a flat val-metric key onto its TB group ('depth' / 'pose')."""
+    if key in POSE_KEYS:
+        return "pose"
+    if key in DEPTH_KEYS:
+        return "depth"
+    return "metric"
 
 
 class Trainer:
@@ -78,6 +91,7 @@ class Trainer:
         optim: Optional[Dict[str, Any]] = None,
         loss: Optional[Dict[str, Any]] = None,
         val_metrics: Optional[Dict[str, Any]] = None,
+        pose_eval: Optional[Dict[str, Any]] = None,
         env_variables: Optional[Dict[str, Any]] = None,
         accum_steps: int = 1,
         oracle_gate: Optional[Dict[str, Any]] = None,
@@ -120,6 +134,10 @@ class Trainer:
         self.checkpoint_conf = checkpoint
         self.optim_conf = optim
         self.val_metrics_conf = val_metrics or {}
+        # MonST3R-style second validation channel: a deterministic full-sequence Sintel
+        # pose eval that drives best.pt. Runs on its own (sparser) cadence, separate from
+        # the per-epoch windowed val (which becomes monitoring-only when this is enabled).
+        self.pose_eval_conf = pose_eval or {}
         self.oracle_gate_conf = oracle_gate
         # Best pose ATE seen so far (drives best.pt); restored on resume.
         self.best_ate = float("inf")
@@ -199,6 +217,15 @@ class Trainer:
             torch.backends.cudnn.benchmark = cuda_conf.cudnn_benchmark
             torch.backends.cuda.matmul.allow_tf32 = cuda_conf.allow_tf32
             torch.backends.cudnn.allow_tf32 = cuda_conf.allow_tf32
+            # The flash-attention SDPA kernel on torch 2.12+cu130 / RTX 5090 (Blackwell) segfaults
+            # intermittently (see cuda.disable_flash_sdp note in default.yaml). Disable it so SDPA
+            # falls back to the numerically-equivalent, stable mem-efficient kernel.
+            if cuda_conf.get("disable_flash_sdp", False):
+                torch.backends.cuda.enable_flash_sdp(False)
+                logging.info(
+                    "Disabled flash SDPA backend (using mem-efficient) — workaround for "
+                    "torch 2.12+cu130 flash-attn segfault on RTX 5090 (see outputs/gpu_repro_*.log)."
+                )
 
         # Initialize the DDP process group
         dist.init_process_group(
@@ -232,11 +259,22 @@ class Trainer:
             else:
                 self.optims[0].optimizer.load_state_dict(opt_states)
 
-        # Load training progress
-        if "prev_epoch" in checkpoint:
-            self.epoch = checkpoint["prev_epoch"] + 1
-        elif "epoch" in checkpoint:
-            self.epoch = checkpoint["epoch"]
+        # Load training progress. A checkpoint is either an END-OF-EPOCH save
+        # (epoch_completed=True, or a legacy checkpoint without the flag) -> resume at
+        # the NEXT epoch; or a MID-EPOCH save (epoch_completed=False) -> resume the SAME
+        # epoch and fast-forward the (deterministically-seeded) dataloader to resume_iter.
+        if not checkpoint.get("epoch_completed", True):
+            self.epoch = int(checkpoint.get("prev_epoch", checkpoint.get("epoch", 0)))
+            self._resume_iter = int(checkpoint.get("resume_iter", 0))
+            logging.info(
+                f"Mid-epoch resume: epoch {self.epoch}, fast-forwarding to iter {self._resume_iter}"
+            )
+        else:
+            if "prev_epoch" in checkpoint:
+                self.epoch = checkpoint["prev_epoch"] + 1
+            elif "epoch" in checkpoint:
+                self.epoch = checkpoint["epoch"]
+            self._resume_iter = 0
         self.steps = checkpoint["steps"] if "steps" in checkpoint else {"train": 0, "val": 0}
         self.ckpt_time_elapsed = checkpoint.get("time_elapsed", 0)
         self.best_ate = checkpoint.get("best_ate", float("inf"))
@@ -261,6 +299,9 @@ class Trainer:
         logging.info("Setting up components: Model, Loss, Logger, etc.")
         self.epoch = 0
         self.steps = {'train': 0, 'val': 0}
+        # Iter within the current epoch to fast-forward to on a mid-epoch resume.
+        # 0 = start the epoch from scratch (fresh run or end-of-epoch resume).
+        self._resume_iter = 0
 
         # Instantiate components from configs
         self.tb_writer = instantiate(self.logging_conf.tensorboard_writer, _recursive_=False)
@@ -338,7 +379,12 @@ class Trainer:
             **ddp_options,
         )
 
-    def save_checkpoint(self, epoch: int, checkpoint_names: Optional[List[str]] = None):
+    def save_checkpoint(
+        self,
+        epoch: int,
+        checkpoint_names: Optional[List[str]] = None,
+        data_iter: Optional[int] = None,
+    ):
         """
         Saves a training checkpoint.
 
@@ -346,6 +392,10 @@ class Trainer:
             epoch: The current epoch number.
             checkpoint_names: A list of names for the checkpoint file (e.g., "checkpoint_latest").
                               If None, saves "checkpoint" and "checkpoint_{epoch}" on frequency.
+            data_iter: If None, this is an END-OF-EPOCH checkpoint (resume starts the next
+                       epoch). If an int, this is a MID-EPOCH checkpoint taken after the
+                       optimizer step for that iter -> resume re-enters this same epoch and
+                       fast-forwards the dataloader to data_iter + 1.
         """
         checkpoint_folder = self.checkpoint_conf.save_dir
         safe_makedirs(checkpoint_folder)
@@ -364,6 +414,10 @@ class Trainer:
             "time_elapsed": self.time_elapsed_meter.val,
             "best_ate": self.best_ate,
             "optimizer": [optim.optimizer.state_dict() for optim in self.optims],
+            # Mid-epoch resume bookkeeping (see _load_resuming_checkpoint). data_iter is None
+            # for the normal end-of-epoch save -> epoch_completed=True, resume_iter unused.
+            "epoch_completed": data_iter is None,
+            "resume_iter": 0 if data_iter is None else int(data_iter) + 1,
         }
         
         if len(self.optims) == 1:
@@ -413,8 +467,10 @@ class Trainer:
     def run_train(self):
         """Runs the main training loop over all epochs.
 
-        Checkpoint policy: every epoch runs validation, then saves a rolling
-        ``last.pt`` (latest epoch) and, whenever the pose ATE improves, ``best.pt``.
+        Checkpoint policy: every epoch saves a rolling ``last.pt`` (latest epoch).
+        ``best.pt`` is saved whenever pose ATE improves — from the deterministic
+        full-sequence pose eval (channel B, the sole validation signal) when ``pose_eval``
+        is enabled, else from the legacy windowed val ATE.
         """
         while self.epoch < self.max_epochs:
             set_seeds(self.seed_value + self.epoch * 100, self.max_epochs, self.distributed_rank)
@@ -428,9 +484,6 @@ class Trainer:
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
 
-            # Validate every epoch to drive best-checkpoint selection.
-            summary = self.run_val()
-
             # Rolling latest checkpoint.
             self.save_checkpoint(self.epoch, checkpoint_names=["last"])
 
@@ -443,8 +496,23 @@ class Trainer:
                     self.epoch, checkpoint_names=[f"epoch_{int(self.epoch) + 1}"]
                 )
 
-            # Best checkpoint by pose ATE (lower is better).
-            ate = summary.get("ate") if isinstance(summary, dict) else None
+            # Two complementary validation channels run every epoch:
+            #   channel A (run_val / windowed) -> the val LOSS source (validation/loss_*),
+            #     for train/val overfitting monitoring. When channel B is enabled it does NOT
+            #     write validation/{pose,depth}_* (B owns the metric tags -- see val_epoch).
+            #   channel B (run_pose_eval / full-sequence Sintel) -> the eval METRICS source
+            #     (validation/{pose,depth}_*) and the best.pt selection signal (full-seq ATE).
+            #   pose_eval disabled -> best.pt falls back to channel A's windowed ATE.
+            summary_a = self.run_val()
+            if self.pose_eval_conf.get("enabled", False):
+                every_n = int(self.pose_eval_conf.get("every_n_epochs", 1) or 1)
+                is_last_epoch = int(self.epoch) + 1 >= self.max_epochs
+                if (int(self.epoch) + 1) % every_n == 0 or is_last_epoch:
+                    ate = self.run_pose_eval()
+                else:
+                    ate = None
+            else:
+                ate = summary_a.get("ate") if isinstance(summary_a, dict) else None
             if ate is not None and ate < self.best_ate:
                 logging.info(
                     "New best pose ATE %.4f (prev %.4f) at epoch %s -> saving best.pt",
@@ -476,6 +544,69 @@ class Trainer:
         torch.cuda.reset_peak_memory_stats()
         return summary
 
+    @torch.no_grad()
+    def run_pose_eval(self) -> Optional[float]:
+        """Deterministic full-sequence Sintel pose eval on the live model (MonST3R channel B).
+
+        Scores the in-memory model on fixed, full-length Sintel sequences (no random
+        [4,16] windowing, no re-sampling across epochs) so the resulting ATE is a stable
+        trend/selection signal. Returns the mean ATE (rank 0 computes; broadcast to all
+        ranks so best.pt selection stays consistent). Returns None on failure.
+        """
+        from types import SimpleNamespace
+
+        from benchmark.eval_sintel import evaluate as eval_sintel_evaluate
+
+        cfg = self.pose_eval_conf
+        model = self.model.module if isinstance(
+            self.model, torch.nn.parallel.DistributedDataParallel
+        ) else self.model
+
+        was_training = model.training
+        model.eval()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        ate_val = torch.full((1,), float("inf"), device=self.device)
+        try:
+            if self.rank == 0:
+                out_dir = os.path.join(
+                    self.logging_conf.log_dir, "pose_eval", f"epoch_{int(self.epoch) + 1}"
+                )
+                args = SimpleNamespace(
+                    ckpt=f"live_epoch_{int(self.epoch) + 1}",
+                    sintel_root=cfg.get("sintel_root", None),
+                    out_dir=out_dir,
+                    seq_list=cfg.get("seq_list", None),
+                    device=self.device if isinstance(self.device, str) else "cuda",
+                    chunk_size=int(cfg.get("chunk_size", 0) or 0),
+                    max_depth=float(cfg.get("max_depth", 80.0)),
+                )
+                results = eval_sintel_evaluate(args, model=model)
+                ate = results.get("pose", {}).get("mean", {}).get("ate", None)
+                if ate is not None and ate > 0:
+                    ate_val[0] = float(ate)
+                logging.info(
+                    "Pose eval (full-seq Sintel) at epoch %s: ATE=%.4f", self.epoch, ate_val.item()
+                )
+                # Channel B is now the sole validation signal -> log its full-sequence mean
+                # metrics to TensorBoard under the same validation/{pose,depth}_* tags (drop-in
+                # replacing the removed windowed channel A) so the TB curves are all full-sequence.
+                for group in ("pose", "depth"):
+                    for key, val in results.get(group, {}).get("mean", {}).items():
+                        self.tb_writer.log(f"validation/{group}_{key}", val, self.epoch)
+        finally:
+            if was_training:
+                model.train()
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+
+        # Share rank-0's ATE with every rank so best.pt selection is identical everywhere.
+        if is_dist_avail_and_initialized():
+            dist.broadcast(ate_val, src=0)
+        ate = ate_val.item()
+        return ate if ate != float("inf") else None
 
     @torch.no_grad()
     def val_epoch(self, val_loader):
@@ -596,10 +727,17 @@ class Trainer:
                         f"({int(summary.get('pose_seqs', 0))} seqs)"
                     )
                 logging.info("Val Epoch: [%s] metrics | %s", self.epoch, " | ".join(parts))
-                for key, val in summary.items():
-                    if key.endswith("_frames") or key.endswith("_seqs"):
-                        continue
-                    self.tb_writer.log(f"Metrics/val/{key}", val, self.epoch)
+                # Channel A always prints its windowed metrics to the log, but only writes
+                # them to TensorBoard when channel B (pose_eval) is NOT the metric source.
+                # When B is enabled it owns validation/{pose,depth}_* (full-sequence); A stays
+                # loss-only on TB to avoid clobbering the same tags at the same epoch step.
+                if not self.pose_eval_conf.get("enabled", False):
+                    for key, val in summary.items():
+                        if key.endswith("_frames") or key.endswith("_seqs"):
+                            continue
+                        self.tb_writer.log(
+                            f"validation/{_tb_metric_group(key)}_{key}", val, self.epoch
+                        )
 
         # Return the metric summary (ATE etc.) so the training loop can drive
         # best-checkpoint selection. Empty dict when metrics are disabled.
@@ -650,10 +788,26 @@ class Trainer:
             # setup gradient clipping at the beginning of training
             self.gradient_clipper.setup_clipping(self.model)
 
+        # Mid-epoch checkpointing / resume. start_iter is consumed once: only the first
+        # epoch after a mid-epoch resume fast-forwards; later epochs start at 0. The epoch
+        # is deterministically re-seeded in run_train (set_seeds(seed + epoch*100)), so
+        # skipping to start_iter lands on the same samples the crashed run had reached.
+        start_iter = getattr(self, "_resume_iter", 0)
+        self._resume_iter = 0
+        save_steps_freq = int(self.checkpoint_conf.get("save_steps_freq", 0) or 0)
+        if start_iter > 0:
+            logging.info(
+                f"Fast-forwarding train dataloader to iter {start_iter} (mid-epoch resume)"
+            )
+
         for data_iter, batch in enumerate(train_loader):
             if data_iter > limit_train_batches:
                 break
-            
+            # Skip already-completed iters on a mid-epoch resume (keep timers fresh).
+            if data_iter < start_iter:
+                end = time.time()
+                continue
+
             # measure data loading time
             data_time.update(time.time() - end)
             data_times.append(data_time.val)
@@ -739,6 +893,16 @@ class Trainer:
 
             if data_iter % self.logging_conf.log_freq == 0:
                 progress.display(data_iter)
+
+            # Rolling mid-epoch checkpoint: overwrite last.pt every save_steps_freq iters so a
+            # crash mid-epoch resumes from here (fast-forward to data_iter+1) instead of losing
+            # the whole epoch. save_steps_freq <= 0 disables (default -> original behaviour).
+            # Cost: one full ~7 GB last.pt write per trigger; robust_torch_save keeps a .bak so
+            # a crash during the write can't corrupt the previous good checkpoint.
+            if save_steps_freq > 0 and data_iter > 0 and data_iter % save_steps_freq == 0:
+                self.save_checkpoint(
+                    self.epoch, checkpoint_names=["last"], data_iter=data_iter
+                )
 
         return True
 
@@ -885,7 +1049,7 @@ class Trainer:
                 value = data[key].item() if torch.is_tensor(data[key]) else data[key]
                 loss_meters[f"Loss/{phase}_{key}"].update(value, batch_size)
                 if step % self.logging_conf.log_freq == 0 and self.rank == 0:
-                    self.tb_writer.log(f"Values/{phase}/{key}", value, step)
+                    self.tb_writer.log(f"{_TB_PHASE.get(phase, phase)}/{key}", value, step)
 
     def _log_tb_visuals(self, batch: Mapping, phase: str, step: int) -> None:
         """Logs image or video visualizations to TensorBoard."""
