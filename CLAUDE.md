@@ -18,7 +18,7 @@ cd training && torchrun --nproc_per_node=1 launch.py --config <name>
 ```
 config name = `training/config/` 裡的檔名去掉 `.yaml`（如 `dyn_vggt_v3_s1_inst`）。Hydra 載入後 `launch.py` 建 `Trainer(**cfg)`。
 
-沒有配置 test suite / linter。改動要驗證就跑 `training/eval/` 或 `training/diag/` 下對應的 script（每支都是獨立、帶 argparse 的 `python … .py`）。
+沒有配置 test suite / linter。改動要驗證就跑 `training/diag/` 或 `training/benchmark/` 下對應的 script（每支都是獨立、帶 argparse 的 `python … .py`）。
 
 ## 架構 —— v3 gate 機制
 
@@ -40,8 +40,17 @@ config 用檔名編碼 curriculum：**S0**（只訓 `gate_predictor`，其餘凍
 
 ## Eval 與診斷
 
-- `training/eval/` —— 共用 lib（`vggt_infer.py`、`paths.py`、`pose_metrics.py`、`gate_common.py`）+ 進入點：`gate_bias_ablation.py`（`--dataset sintel|po`；Sintel 可加 `--report_dynamic_fraction`）、`val_metrics.py`。
-- `training/diag/` —— 視覺化：`vis_error_growth.py`（per-frame ATE，多 gate-mode 疊圖 —— **chunk_size 必須 ≥ 序列長度**，否則 `infer_sequence_chunked` 會切成獨立 pass 把 error 灌大）、`vis_trajectory.py`、`vis_gate_temporal.py`、`vis_gate_gif.py`、`plot_train_curves.py`。
+三個目錄各有明確角色，**新增檔案前先確認放哪**：
+
+- `training/eval_utils/` —— **純 library，不放 argparse 進入點**。`vggt_infer.py`、`paths.py`、`metrics_pose.py`、`metrics_depth.py`、`metrics_val.py`（trainer 直接依賴）、`gate_common.py`、`gate_vis.py`。
+- `training/benchmark/` —— **要寫進論文的數字**。進入點契約要穩定（ckpt 進、json 出、CLI 參數別亂改名）。目前只有 `eval_sintel.py`（Sintel pose+depth 主表）。
+- `training/diag/` —— **中間探索/找問題的工具**，壞掉或砍掉不影響論文：`gate_bias_ablation.py`（`--dataset sintel|po`；Sintel 可加 `--report_dynamic_fraction`）、`gate_quality.py`（gate AUC/F1）、`run.sh`（×3/×10 temperature sweep）。視覺化一律放 `diag/vis/`：`error_growth.py`（per-frame ATE，多 gate-mode 疊圖 —— **chunk_size 必須 ≥ 序列長度**，否則 `infer_sequence_chunked` 會切成獨立 pass 把 error 灌大）、`trajectory.py`、`gate.py`、`gate_temporal.py`、`gate_gif.py`、`train_curves.py`。
+
+搬家規則：diag → benchmark 的時機是**你決定那個數字要進論文的那一刻**，不是等它「看起來穩了」。
+
+**輸出路徑**：`logs/<exp>/` 只放訓練產物（`ckpts/`、`tensorboard/`、`log.txt`、trainer 的 `pose_eval/`）；訓練之後產生的一切（benchmark json、ablation、診斷、圖）一律 `outputs/<exp>/<tool>/`，由 `eval_utils/paths.py` 的 `default_output_dir(ckpt, TOOL)` 解析，別自己拼路徑。
+
+Sintel/flow 的共用 IO 與 mask 推導在 `training/data/`（`sintel_io.py`、`motion_mask.py`）——它們被 `data/preprocess/`、`data/datasets/`、benchmark、diag 共用，屬 data layer 而非 eval layer。
 
 ## 上游 demo（未改的 base model）
 

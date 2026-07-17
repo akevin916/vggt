@@ -53,22 +53,22 @@ python benchmark/eval_sintel.py --ckpt logs/<exp>/ckpts/checkpoint.pt
 # 抽出的純權重 → logs/train/<name>/eval_sintel/
 python benchmark/eval_sintel.py --ckpt checkpoints/dyn_vggt_s0.pt
 
-# OOM 時加 --chunk_size 32；單 seq smoke 加 --seq_list alley_2
+# 單 seq smoke 加 --seq_list alley_2
 ```
 
 ### Gate 診斷（視覺化為主）
 
-主入口 `diag/vis_gate.py`：輸出 PO 的 `m_gt | m*_patch | g` 拼圖，或 Sintel 的 `m*_raft_patch`（flow-residual）對照。
+主入口 `diag/vis/gate.py`：輸出 PO 的 `m_gt | m*_patch | g` 拼圖，或 Sintel 的 `m*_raft_patch`（flow-residual）對照。
 
 ```bash
 # PO in-domain（預設）
-python diag/vis_gate.py --ckpt logs/dyn_vggt_v3_s1/ckpts/checkpoint.pt
+python diag/vis/gate.py --ckpt logs/dyn_vggt_v3_s1/ckpts/checkpoint.pt
 
 # Sintel cross-domain
-python diag/vis_gate.py --ckpt checkpoints/dyn_vggt_v3_s1.pt --dataset sintel
+python diag/vis/gate.py --ckpt checkpoints/dyn_vggt_v3_s1.pt --dataset sintel
 
 # 兩者都跑，並寫入最小 summary.json
-python diag/vis_gate.py --ckpt checkpoints/dyn_vggt_v3_s1.pt --dataset all --metrics
+python diag/vis/gate.py --ckpt checkpoints/dyn_vggt_v3_s1.pt --dataset all --metrics
 ```
 
 輸出目錄：`logs/<exp>/vis_gate/`（`po/`、`sintel/` 子目錄）。
