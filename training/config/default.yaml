@@ -7,27 +7,21 @@ num_workers: 8
 seed_value: 42
 accum_steps: 2    # We did not use gradient accumulation in our training, while if you suffer from OOM, you can try to use it.
 patch_size: 14
-val_epoch_freq: 5
 max_img_per_gpu: 48
 
 limit_train_batches: 2000
 limit_val_batches: 200
 
-# Validation metrics (depth AbsRel/δ1/RMSE + pose ATE/RPE via evo; median scale depth align).
-# When pose_eval is enabled these become monitoring-only (they no longer select best.pt).
-val_metrics:
-  enabled: true
-  max_depth: 80.0
-  min_depth_pixels: 100
-
-# MonST3R-style channel B: deterministic full-sequence Sintel pose eval that drives best.pt.
-# Runs on the live model every `every_n_epochs` (plus the final epoch), on fixed full-length
-# sequences -- no random [4,16] windowing / re-sampling, so its ATE is a stable selection
-# signal (unlike the windowed val_metrics ATE). Disabled by default -> legacy behaviour
-# (best.pt driven by the windowed val ATE). See trainer.run_pose_eval.
+# Two validation channels, structurally separate -- neither ever produces the other's signal:
+#   channel A (run_val / val_epoch) -- windowed forward on held-out PO-test (data.val below),
+#     LOSS ONLY (no depth/pose metric computation). Its mean camera loss drives best_loss.pt,
+#     an in-domain-generalization / overfitting-health signal independent of the report data.
+#   channel B (run_pose_eval / pose_eval below) -- deterministic full-sequence Sintel forward,
+#     METRIC ONLY (MonST3R-style depth + evo ATE/RPE). Drives best_ate.pt, the report metric.
+# See trainer.val_epoch / trainer.run_pose_eval.
 pose_eval:
-  enabled: false
-  every_n_epochs: 5
+  enabled: true
+  every_n_epochs: 1
   sintel_root: null   # null -> auto-detect from repo data/ (eval.sintel_io.resolve_sintel_root)
   seq_list: null      # null -> all Sintel eval sequences
   chunk_size: 0       # 0 = full sequence (required: chunking inflates ATE, see CLAUDE.md)
@@ -53,6 +47,8 @@ data:
           CO3D_DIR: /YOUR/PATH/TO/CO3D
           CO3D_ANNOTATION_DIR: /YOUR/PATH/TO/CO3D_ANNOTATION
   val:
+    # Channel A: held-out PO-test (disjoint sequences from train), fixed 8-frame clip length
+    # (no random [4,16] range) so the camera-loss signal is stable epoch-to-epoch.
     _target_: data.dynamic_dataloader.DynamicTorchDataset
     num_workers: ${num_workers}
     max_img_per_gpu: ${max_img_per_gpu}
@@ -60,13 +56,15 @@ data:
       img_size: ${img_size}
       patch_size: ${patch_size}
       debug: False
+      img_nums: [8, 8]
     dataset:
       _target_: data.composed_dataset.ComposedDataset
       dataset_configs:
-        - _target_: data.datasets.co3d.Co3dDataset
+        - _target_: data.datasets.pointodyssey.PointOdysseyDataset
           split: test
-          CO3D_DIR: /YOUR/PATH/TO/CO3D
-          CO3D_ANNOTATION_DIR: /YOUR/PATH/TO/CO3D_ANNOTATION
+          PO_DIR: /media/cvml-75/ssd2t1/data/point_odyssey
+          dynamic_source: instance
+          len_test: 8
 
 
 logging:

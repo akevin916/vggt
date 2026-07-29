@@ -41,21 +41,13 @@ from train_utils.general import *
 from train_utils.logging import setup_logging
 from train_utils.normalization import normalize_camera_extrinsics_and_points_batch
 from train_utils.optimizer import construct_optimizers
-from eval_utils.metrics_val import DEPTH_KEYS, POSE_KEYS, ValMetricsAccumulator
 from loss import oracle_gate_logits_from_mask
 
 # TensorBoard tag layout: "<phase>/<group>_<key>" -- train/loss_*, validation/loss_*,
 # validation/depth_*, validation/pose_*. The internal phase name is 'val'; TB spells it out.
+# validation/loss_* comes exclusively from channel A (val_epoch); validation/{depth,pose}_*
+# comes exclusively from channel B (run_pose_eval) -- see val_epoch / run_pose_eval docstrings.
 _TB_PHASE = {"train": "train", "val": "validation"}
-
-
-def _tb_metric_group(key: str) -> str:
-    """Map a flat val-metric key onto its TB group ('depth' / 'pose')."""
-    if key in POSE_KEYS:
-        return "pose"
-    if key in DEPTH_KEYS:
-        return "depth"
-    return "metric"
 
 
 class Trainer:
@@ -83,14 +75,12 @@ class Trainer:
         mode: str = "train",
         device: str = "cuda",
         seed_value: int = 123,
-        val_epoch_freq: int = 1,
         distributed: Dict[str, bool] = None,
         cuda: Dict[str, bool] = None,
         limit_train_batches: Optional[int] = None,
         limit_val_batches: Optional[int] = None,
         optim: Optional[Dict[str, Any]] = None,
         loss: Optional[Dict[str, Any]] = None,
-        val_metrics: Optional[Dict[str, Any]] = None,
         pose_eval: Optional[Dict[str, Any]] = None,
         env_variables: Optional[Dict[str, Any]] = None,
         accum_steps: int = 1,
@@ -109,7 +99,6 @@ class Trainer:
             mode: "train" for training and validation, "val" for validation only.
             device: "cuda" or "cpu".
             seed_value: A random seed for reproducibility.
-            val_epoch_freq: Frequency (in epochs) to run validation.
             distributed: Hydra config for DDP settings.
             cuda: Hydra config for CUDA-specific settings (e.g., cuDNN).
             limit_train_batches: Limit the number of training batches per epoch (for debugging).
@@ -133,20 +122,22 @@ class Trainer:
         self.logging_conf = logging
         self.checkpoint_conf = checkpoint
         self.optim_conf = optim
-        self.val_metrics_conf = val_metrics or {}
-        # MonST3R-style second validation channel: a deterministic full-sequence Sintel
-        # pose eval that drives best.pt. Runs on its own (sparser) cadence, separate from
-        # the per-epoch windowed val (which becomes monitoring-only when this is enabled).
+        # channel B: a deterministic, MonST3R-style full-sequence Sintel pose+depth eval.
+        # The sole source of validation/{pose,depth}_* and the best_ate.pt selection signal --
+        # channel A (val_epoch) never computes metrics, only loss. See val_epoch docstring.
         self.pose_eval_conf = pose_eval or {}
         self.oracle_gate_conf = oracle_gate
-        # Best pose ATE seen so far (drives best.pt); restored on resume.
+        # Two independently-selected best checkpoints, both restored on resume:
+        #   best_ate  -> lowest channel-B full-sequence Sintel ATE (the report metric).
+        #   best_loss -> lowest channel-A held-out (PO-test) camera loss (unbiased vs the
+        #                report data; a complementary in-domain-generalization pick).
         self.best_ate = float("inf")
+        self.best_loss = float("inf")
 
         # Store hyperparameters
         self.accum_steps = accum_steps
         self.max_epochs = max_epochs
         self.mode = mode
-        self.val_epoch_freq = val_epoch_freq
         self.limit_train_batches = limit_train_batches
         self.limit_val_batches = limit_val_batches
         self.seed_value = seed_value
@@ -278,6 +269,7 @@ class Trainer:
         self.steps = checkpoint["steps"] if "steps" in checkpoint else {"train": 0, "val": 0}
         self.ckpt_time_elapsed = checkpoint.get("time_elapsed", 0)
         self.best_ate = checkpoint.get("best_ate", float("inf"))
+        self.best_loss = checkpoint.get("best_loss", float("inf"))
 
         # Load AMP scaler state if available
         if self.optim_conf.amp.enabled and "scaler" in checkpoint:
@@ -413,6 +405,7 @@ class Trainer:
             "steps": self.steps,
             "time_elapsed": self.time_elapsed_meter.val,
             "best_ate": self.best_ate,
+            "best_loss": self.best_loss,
             "optimizer": [optim.optimizer.state_dict() for optim in self.optims],
             # Mid-epoch resume bookkeeping (see _load_resuming_checkpoint). data_iter is None
             # for the normal end-of-epoch save -> epoch_completed=True, resume_iter unused.
@@ -467,10 +460,14 @@ class Trainer:
     def run_train(self):
         """Runs the main training loop over all epochs.
 
-        Checkpoint policy: every epoch saves a rolling ``last.pt`` (latest epoch).
-        ``best.pt`` is saved whenever pose ATE improves — from the deterministic
-        full-sequence pose eval (channel B, the sole validation signal) when ``pose_eval``
-        is enabled, else from the legacy windowed val ATE.
+        Checkpoint policy: every epoch saves a rolling ``last.pt`` (latest epoch), plus two
+        independently-selected bests:
+          ``best_ate.pt``  -- lowest channel-B full-sequence Sintel ATE (the report metric).
+                              Only updates on epochs where channel B ran; if pose_eval is
+                              disabled for a given experiment, best_ate.pt is simply never
+                              produced (no fallback to channel A -- channel A has no metric).
+          ``best_loss.pt`` -- lowest channel-A held-out (PO-test) camera loss (an unbiased
+                              pick whose selection signal never touches the report data).
         """
         while self.epoch < self.max_epochs:
             set_seeds(self.seed_value + self.epoch * 100, self.max_epochs, self.distributed_rank)
@@ -496,13 +493,12 @@ class Trainer:
                     self.epoch, checkpoint_names=[f"epoch_{int(self.epoch) + 1}"]
                 )
 
-            # Two complementary validation channels run every epoch:
-            #   channel A (run_val / windowed) -> the val LOSS source (validation/loss_*),
-            #     for train/val overfitting monitoring. When channel B is enabled it does NOT
-            #     write validation/{pose,depth}_* (B owns the metric tags -- see val_epoch).
-            #   channel B (run_pose_eval / full-sequence Sintel) -> the eval METRICS source
-            #     (validation/{pose,depth}_*) and the best.pt selection signal (full-seq ATE).
-            #   pose_eval disabled -> best.pt falls back to channel A's windowed ATE.
+            # Two structurally-separate validation channels run every epoch:
+            #   channel A (run_val / windowed, held-out PO-test) -> LOSS ONLY
+            #     (validation/loss_*); drives best_loss.pt (see below).
+            #   channel B (run_pose_eval / full-sequence Sintel) -> METRIC ONLY
+            #     (validation/{pose,depth}_*); drives best_ate.pt (the report metric).
+            # Neither ever produces the other's signal -- no flag-based tag muxing.
             summary_a = self.run_val()
             if self.pose_eval_conf.get("enabled", False):
                 every_n = int(self.pose_eval_conf.get("every_n_epochs", 1) or 1)
@@ -512,24 +508,36 @@ class Trainer:
                 else:
                     ate = None
             else:
-                ate = summary_a.get("ate") if isinstance(summary_a, dict) else None
+                ate = None
+            # best_ate.pt: lowest channel-B full-sequence Sintel ATE (the report metric).
             if ate is not None and ate < self.best_ate:
                 logging.info(
-                    "New best pose ATE %.4f (prev %.4f) at epoch %s -> saving best.pt",
+                    "New best pose ATE %.4f (prev %.4f) at epoch %s -> saving best_ate.pt",
                     ate, self.best_ate, self.epoch,
                 )
                 self.best_ate = float(ate)
-                self.save_checkpoint(self.epoch, checkpoint_names=["best"])
+                self.save_checkpoint(self.epoch, checkpoint_names=["best_ate"])
+            # best_loss.pt: lowest channel-A held-out (PO-test) camera loss -- an unbiased
+            # pick (its selection signal never touches the Sintel report data).
+            val_cam = summary_a.get("loss_camera") if isinstance(summary_a, dict) else None
+            if val_cam is not None and val_cam < self.best_loss:
+                logging.info(
+                    "New best val camera loss %.4f (prev %.4f) at epoch %s -> saving best_loss.pt",
+                    val_cam, self.best_loss, self.epoch,
+                )
+                self.best_loss = float(val_cam)
+                self.save_checkpoint(self.epoch, checkpoint_names=["best_loss"])
 
             self.epoch += 1
 
         self.epoch -= 1
 
     def run_val(self):
-        """Runs a full validation epoch if a validation dataset is available.
+        """Runs channel A: a full loss-only validation epoch (held-out PO-test by default).
 
-        Returns the metric summary dict (e.g. {"ate": ..., "abs_rel": ...}),
-        or an empty dict when no val dataset / metrics are configured.
+        Returns the per-epoch mean loss summary dict (e.g. {"loss_camera": ..., ...}),
+        or an empty dict when no val dataset is configured. Never computes depth/pose
+        metrics -- that is channel B's (run_pose_eval) exclusive job.
         """
         if not self.val_dataset:
             logging.info("No validation dataset configured. Skipping validation.")
@@ -622,18 +630,6 @@ class Trainer:
             name: AverageMeter(name, self.device, ":.4f") for name in loss_names
         }
 
-        metric_meters = {}
-        metrics_tracker = None
-        if self.val_metrics_conf.get("enabled", False):
-            metrics_tracker = ValMetricsAccumulator(
-                max_depth=float(self.val_metrics_conf.get("max_depth", 80.0)),
-                min_depth_pixels=int(self.val_metrics_conf.get("min_depth_pixels", 100)),
-            )
-            for key in ("abs_rel", "delta_1", "rmse", "ate", "rpe_trans", "rpe_rot"):
-                metric_meters[f"Metric/val_{key}"] = AverageMeter(
-                    f"Metric/val_{key}", self.device, ":.4f"
-                )
-        
         progress = ProgressMeter(
             num_batches=len(val_loader),
             meters=[
@@ -642,7 +638,6 @@ class Trainer:
                 mem,
                 self.time_elapsed_meter,
                 *loss_meters.values(),
-                *metric_meters.values(),
             ],
             real_meters={},
             prefix="Val Epoch: [{}]".format(self.epoch),
@@ -683,16 +678,7 @@ class Trainer:
                     enabled=self.optim_conf.amp.enabled,
                     dtype=amp_type,
                 ):
-                    _, y_hat = self._step(
-                        batch, self.model, phase, loss_meters
-                    )
-                    if metrics_tracker is not None:
-                        batch_metrics = metrics_tracker.update(y_hat, batch)
-                        bs = batch["extrinsics"].shape[0]
-                        for key, val in batch_metrics.items():
-                            meter_key = key.replace("metric_", "Metric/val_")
-                            if meter_key in metric_meters:
-                                metric_meters[meter_key].update(val, bs)
+                    self._step(batch, self.model, phase, loss_meters)
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -708,39 +694,16 @@ class Trainer:
             if data_iter % self.logging_conf.log_freq == 0:
                 progress.display(data_iter)
 
+        # Expose channel-A val losses (epoch mean) so run_train can select best_loss.
+        # loss_meters keys look like "Loss/val_loss_camera" -> exposed as "loss_camera".
+        # Losses are already logged per-step to TB (validation/loss_*) by
+        # _update_and_log_scalars; this summary dict is only for best_loss.pt selection.
         summary = {}
-        if metrics_tracker is not None and self.rank == 0:
-            summary = metrics_tracker.compute()
-            if summary:
-                parts = []
-                if "abs_rel" in summary:
-                    parts.append(
-                        f"depth AbsRel={summary['abs_rel']:.4f} "
-                        f"d1={summary['delta_1']:.4f} RMSE={summary['rmse']:.4f} "
-                        f"({int(summary.get('depth_frames', 0))} frames)"
-                    )
-                if "ate" in summary:
-                    parts.append(
-                        f"pose ATE={summary['ate']:.4f} "
-                        f"RPE-t={summary['rpe_trans']:.4f} "
-                        f"RPE-r={summary['rpe_rot']:.4f} "
-                        f"({int(summary.get('pose_seqs', 0))} seqs)"
-                    )
-                logging.info("Val Epoch: [%s] metrics | %s", self.epoch, " | ".join(parts))
-                # Channel A always prints its windowed metrics to the log, but only writes
-                # them to TensorBoard when channel B (pose_eval) is NOT the metric source.
-                # When B is enabled it owns validation/{pose,depth}_* (full-sequence); A stays
-                # loss-only on TB to avoid clobbering the same tags at the same epoch step.
-                if not self.pose_eval_conf.get("enabled", False):
-                    for key, val in summary.items():
-                        if key.endswith("_frames") or key.endswith("_seqs"):
-                            continue
-                        self.tb_writer.log(
-                            f"validation/{_tb_metric_group(key)}_{key}", val, self.epoch
-                        )
+        _prefix = f"Loss/{phase}_"
+        for _name, _meter in loss_meters.items():
+            _short = _name[len(_prefix):] if _name.startswith(_prefix) else _name
+            summary[_short] = float(_meter.avg)
 
-        # Return the metric summary (ATE etc.) so the training loop can drive
-        # best-checkpoint selection. Empty dict when metrics are disabled.
         return summary
 
     def train_epoch(self, train_loader):        
