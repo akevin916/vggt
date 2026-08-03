@@ -27,6 +27,8 @@ ERROR_GROWTH = "error_growth"
 TRAJECTORY = "trajectory"
 GATE_TEMPORAL = "gate_temporal"
 GATE_GIF = "gate_gif"
+POINTCLOUD_GT = "pointcloud_gt"
+POINTCLOUD_EXPORT = "pointcloud_export"
 TRAIN_CURVES = "train_curves"
 
 
