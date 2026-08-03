@@ -26,6 +26,7 @@ def load_vggt_for_eval(
     device: str = "cuda",
     require_gate: bool = False,
     force_gate: bool = False,
+    force_point: bool = False,
     verbose: bool = True,
 ) -> VGGT:
     """Build VGGT with architecture inferred from checkpoint keys.
@@ -43,7 +44,10 @@ def load_vggt_for_eval(
     has_gate = any("gate_predictor" in k for k in keys) or force_gate
     has_temporal = any("temporal" in k for k in keys)
     has_depth = any(k.startswith("depth_head") for k in keys)
-    has_point = any(k.startswith("point_head") for k in keys)
+    # force_point: same idea for the point head, which the v3 configs disable entirely
+    # (method §7.2). The head is then random-init and only useful once real weights are
+    # grafted in -- see graft_point_head.
+    has_point = any(k.startswith("point_head") for k in keys) or force_point
     has_motion = any(k.startswith("motion_head") for k in keys)
     has_flow = any(k.startswith("flow_head") for k in keys)
 
@@ -73,6 +77,33 @@ def load_vggt_for_eval(
         else:
             print(f"loaded {ckpt}: missing={len(miss)} unexpected={len(unexp)}")
     return model.to(device).eval()
+
+
+def graft_point_head(model: VGGT, donor_ckpt: str, verbose: bool = True) -> VGGT:
+    """Load ``point_head`` weights from ``donor_ckpt`` into an already-built model.
+
+    Lets a v3 checkpoint -- which never builds a point head -- borrow the pretrained
+    VGGT-1B one. Build ``model`` with ``force_point=True`` first.
+
+    ⚠️ The grafted head reads trunk features it was never trained on: the v3 S1 runs
+    train global blocks 8-23, so the aggregator has drifted from what the donor head saw.
+    Treat its output as indicative, not as the point head's true quality on that trunk.
+    (The frozen depth_head survives the same drift -- AbsRel 0.2747 -> 0.2136 on run1 --
+    which is why this is worth trying at all, but it is not proof.)
+    """
+    if model.point_head is None:
+        raise RuntimeError("model has no point_head; build it with force_point=True")
+
+    sd = _load_state_dict(donor_ckpt)
+    prefix = "point_head."
+    point_sd = {k[len(prefix) :]: v for k, v in sd.items() if k.startswith(prefix)}
+    if not point_sd:
+        raise SystemExit(f"donor checkpoint has no point_head weights: {donor_ckpt}")
+
+    model.point_head.load_state_dict(point_sd, strict=True)
+    if verbose:
+        print(f"grafted point_head from {donor_ckpt}: {len(point_sd)} keys")
+    return model
 
 
 def load_dyn_vggt(
