@@ -85,6 +85,7 @@ class Trainer:
         env_variables: Optional[Dict[str, Any]] = None,
         accum_steps: int = 1,
         oracle_gate: Optional[Dict[str, Any]] = None,
+        resume: bool = False,
         **kwargs,
     ):
         """
@@ -111,6 +112,12 @@ class Trainer:
                 built directly from batch["motion_mask"] (GT dynamic mask) on every forward pass
                 (see loss.oracle_gate_logits_from_mask and dyn_vggt_v3_s1_oracle_camera_only.yaml).
                 Used to test the v3 architectural bet in isolation from gate-predictor quality.
+            resume: CLI-driven (--resume), not config-driven. False (default): always load
+                checkpoint.resume_checkpoint_path (the experiment's warm-start/base weights);
+                refuses to start if logs/<exp>/ckpts/last.pt already exists, so a forgotten flag
+                can't silently overwrite an in-progress or crashed run. True: loads that last.pt
+                (full trainer state -- epoch/optimizer/steps) instead; refuses to start if it's
+                missing. See the checkpoint-loading block below for the four-case guard.
         """
         self._setup_env_variables(env_variables)
         self._setup_timers()
@@ -121,6 +128,23 @@ class Trainer:
         self.loss_conf = loss
         self.logging_conf = logging
         self.checkpoint_conf = checkpoint
+        self.resume_flag = resume
+        # Fail fast, before any model/dataloader setup: an existing last.pt and the --resume
+        # flag must agree, or this launch is ambiguous (see __init__ docstring's `resume` arg).
+        _existing_last_ckpt = get_resume_checkpoint(checkpoint.save_dir)
+        if self.resume_flag and _existing_last_ckpt is None:
+            raise RuntimeError(
+                f"--resume was passed but no checkpoint found under {checkpoint.save_dir}. "
+                f"Nothing to resume from."
+            )
+        if not self.resume_flag and _existing_last_ckpt is not None:
+            raise RuntimeError(
+                f"Found an existing checkpoint at {_existing_last_ckpt}, but --resume was not "
+                f"passed.\n"
+                f"  - To continue this run: re-launch with --resume\n"
+                f"  - To start a fresh run under this exp_name: first archive/rename "
+                f"{checkpoint.save_dir} (e.g. append _buggy or _archived), then re-launch."
+            )
         self.optim_conf = optim
         # channel B: a deterministic, MonST3R-style full-sequence Sintel pose+depth eval.
         # The sole source of validation/{pose,depth}_* and the best_ate.pt selection signal --
@@ -174,13 +198,12 @@ class Trainer:
         if self.mode != "val":
             self.optims = construct_optimizers(self.model, self.optim_conf)
 
-        # Load checkpoint if available or specified
-        if self.checkpoint_conf.resume_checkpoint_path is not None:
+        # Load checkpoint: the guard above already proved these are consistent with
+        # resume_flag, so no existence checks needed here.
+        if self.resume_flag:
+            self._load_resuming_checkpoint(get_resume_checkpoint(self.checkpoint_conf.save_dir))
+        elif self.checkpoint_conf.resume_checkpoint_path is not None:
             self._load_resuming_checkpoint(self.checkpoint_conf.resume_checkpoint_path)
-        else:   
-            ckpt_path = get_resume_checkpoint(self.checkpoint_conf.save_dir)
-            if ckpt_path is not None:
-                self._load_resuming_checkpoint(ckpt_path)
 
         # Wrap the model with DDP
         self._setup_ddp_distributed_training(distributed, device)

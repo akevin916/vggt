@@ -76,6 +76,16 @@ def list_sintel_sequences(seq_list: Optional[List[str]] = None) -> List[str]:
     return list(seq_list or SINTEL_EVAL_SEQUENCES)
 
 
+def list_sintel_full_sequences(sintel_root: str) -> List[str]:
+    """All 23 training sequences (every dir under final/). MonST3R evaluates *depth*
+    on the full set (its ``--full_seq``), while *pose* stays on the 14-seq subset
+    (SINTEL_EVAL_SEQUENCES)."""
+    final_dir = os.path.join(sintel_root, "final")
+    return sorted(
+        d for d in os.listdir(final_dir) if os.path.isdir(os.path.join(final_dir, d))
+    )
+
+
 def sintel_seq_paths(sintel_root: str, seq: str) -> Tuple[str, str, str]:
     rgb_dir = os.path.join(sintel_root, "final", seq)
     depth_dir = os.path.join(sintel_root, "depth", seq)

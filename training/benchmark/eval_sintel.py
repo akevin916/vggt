@@ -23,7 +23,9 @@ from eval_utils.metrics_depth import average_depth_results, eval_sequence_depth
 from eval_utils.paths import EVAL_SINTEL, default_output_dir
 from eval_utils.metrics_pose import eval_pose_metrics
 from data.sintel_io import (
+    SINTEL_EVAL_SEQUENCES,
     compute_preprocess_meta,
+    list_sintel_full_sequences,
     list_sintel_sequences,
     load_sintel_gt_depths,
     load_sintel_gt_poses,
@@ -43,7 +45,8 @@ def parse_args():
     ap.add_argument("--seq_list", type=str, nargs="*", default=None)
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--chunk_size", type=int, default=0, help="0 = full sequence; else chunk inference")
-    ap.add_argument("--max_depth", type=float, default=80.0)
+    ap.add_argument("--max_depth", type=float, default=70.0,
+                    help="MonST3R Sintel depth protocol uses 70 (+post-clip 70)")
     return ap.parse_args()
 
 
@@ -69,7 +72,14 @@ def evaluate(args, model=None) -> Dict[str, Any]:
     if model is None:
         model = load_vggt_for_eval(args.ckpt, device=args.device)
 
-    sequences = list_sintel_sequences(args.seq_list)
+    # MonST3R protocol: depth over the full 23-seq set, pose over the 14-seq subset.
+    # An explicit --seq_list overrides both (used for smoke tests / debugging).
+    if args.seq_list:
+        depth_sequences = list_sintel_sequences(args.seq_list)
+        pose_set = set(args.seq_list)
+    else:
+        depth_sequences = list_sintel_full_sequences(args.sintel_root)
+        pose_set = set(SINTEL_EVAL_SEQUENCES)
     os.makedirs(args.out_dir, exist_ok=True)
     error_log = os.path.join(args.out_dir, "_error_log.txt")
 
@@ -82,15 +92,17 @@ def evaluate(args, model=None) -> Dict[str, Any]:
     if args.chunk_size > 0:
         infer_kw["chunk_size"] = args.chunk_size
 
-    for seq in tqdm(sequences, desc="eval_sintel"):
+    for seq in tqdm(depth_sequences, desc="eval_sintel"):
         try:
             rgb_paths = load_sintel_rgb_paths(args.sintel_root, seq)
-            _, _, cam_dir = sintel_seq_paths(args.sintel_root, seq)
-            gt_tum, gt_ts = load_sintel_gt_poses(cam_dir, rgb_paths)
             gt_depths = load_sintel_gt_depths(args.sintel_root, seq, rgb_paths)
 
             pred = infer_fn(model, rgb_paths, **infer_kw)
-            pose_per_seq[seq] = eval_pose_metrics(pred["extrinsic"], gt_tum, gt_ts)
+
+            if seq in pose_set:
+                _, _, cam_dir = sintel_seq_paths(args.sintel_root, seq)
+                gt_tum, gt_ts = load_sintel_gt_poses(cam_dir, rgb_paths)
+                pose_per_seq[seq] = eval_pose_metrics(pred["extrinsic"], gt_tum, gt_ts)
 
             # Pose-only checkpoints (e.g. the gate/camera-only v3 configs with depth_head
             # disabled) return no depth -- score pose only in that case.
@@ -115,8 +127,11 @@ def evaluate(args, model=None) -> Dict[str, Any]:
             "ckpt": args.ckpt,
             "sintel_root": args.sintel_root,
             "timestamp": datetime.now().isoformat(timespec="seconds"),
-            "num_sequences": len(sequences),
-            "num_ok": len(pose_per_seq),
+            "num_depth_sequences": len(depth_sequences),
+            "num_pose_sequences": len(pose_set),
+            "num_pose_ok": len(pose_per_seq),
+            "num_depth_ok": len(depth_per_seq),
+            "protocol": "monst3r: depth=full-23 (lad2 scale+shift, pooled, max70), pose=14-seq",
         },
         "pose": {"per_seq": pose_per_seq, "mean": _mean_pose(pose_per_seq)},
         "depth": {"per_seq": depth_per_seq, "mean": average_depth_results(depth_per_seq)},
@@ -135,7 +150,10 @@ def evaluate(args, model=None) -> Dict[str, Any]:
 def print_summary(results: Dict[str, Any]):
     pm = results["pose"]["mean"]
     dm = results["depth"]["mean"]
+    meta = results.get("meta", {})
     print("\n========== SINTEL BENCHMARK ==========")
+    print(f"  pose seqs={meta.get('num_pose_ok', '?')}/{meta.get('num_pose_sequences', '?')}  "
+          f"depth seqs={meta.get('num_depth_ok', '?')}/{meta.get('num_depth_sequences', '?')}")
     print(f"  Pose  ATE={pm['ate']:.4f}  RPE-trans={pm['rpe_trans']:.4f}  RPE-rot={pm['rpe_rot']:.4f}")
     print(
         f"  Depth AbsRel={dm.get('abs_rel', 0):.4f}  "

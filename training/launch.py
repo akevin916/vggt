@@ -13,17 +13,24 @@ from trainer import Trainer
 def main():
     parser = argparse.ArgumentParser(description="Train model with configurable YAML file")
     parser.add_argument(
-        "--config", 
-        type=str, 
+        "--config",
+        type=str,
         default="default",
         help="Name of the config file (without .yaml extension, default: default)"
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue this exp_name's own logs/<exp>/ckpts/last.pt instead of the config's "
+             "warm-start checkpoint. Without this flag, an existing last.pt makes the trainer "
+             "refuse to start (see Trainer.__init__) rather than silently overwrite it."
     )
     args = parser.parse_args()
 
     with initialize(version_base=None, config_path="config"):
         cfg = compose(config_name=args.config)
 
-    trainer = Trainer(**cfg)
+    trainer = Trainer(resume=args.resume, **cfg)
     trainer.run()
 
 
