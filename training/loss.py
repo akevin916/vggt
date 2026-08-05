@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from vggt.utils.pose_enc import extri_intri_to_pose_encoding, pose_encoding_to_extri_intri
 from train_utils.general import check_and_fix_inf_nan
+from ego_flow import ego_flow_from_disp, pixel_grid, relative_w2c
 from math import ceil, floor
 
 
@@ -31,6 +32,7 @@ class MultitaskLoss(torch.nn.Module):
                  gate=None,    # v3: motion-gate BCE (docs/dyn_vggt_method_v3.md §5/§6)
                  static_photo=None,   # v3 extension: static-region photometric consistency ("route B")
                  camera_smooth=None,  # v3 extension: camera-trajectory smoothness regularizer
+                 ego_flow=None,       # v3 extension: pixel-space ego-flow reprojection consistency
                  **kwargs):
         super().__init__()
         # Loss configuration dictionaries for each task
@@ -45,6 +47,7 @@ class MultitaskLoss(torch.nn.Module):
         self.gate = gate          # v3: gate-predictor BCE against GT dynamic mask
         self.static_photo = static_photo   # v3 extension: static-region photometric consistency
         self.camera_smooth = camera_smooth  # v3 extension: camera-trajectory smoothness regularizer
+        self.ego_flow = ego_flow  # v3 extension: ego-flow reprojection consistency (MonST3R geometry, GT target)
 
     def forward(self, predictions, batch) -> torch.Tensor:
         """
@@ -137,6 +140,16 @@ class MultitaskLoss(torch.nn.Module):
             smooth_loss_dict = compute_camera_smooth_loss(predictions, batch, **self.camera_smooth)
             total_loss = total_loss + smooth_loss_dict["loss_camera_smooth"] * self.camera_smooth.get("weight", 1.0)
             loss_dict.update(smooth_loss_dict)
+
+        # v3 extension: ego-flow reprojection consistency — MonST3R's disparity-form ego-flow
+        # geometry, scored against the GT-derived ego-flow instead of RAFT. Couples camera head
+        # and depth head in pixel space. Needs the depth head (predicted depth is half the
+        # geometry) and a depth constraint to anchor it — see compute_ego_flow_loss.
+        if self.ego_flow is not None and "pose_enc_list" in predictions and "depth" in predictions \
+                and "ids" in batch:
+            ego_flow_dict = compute_ego_flow_loss(predictions, batch, **self.ego_flow)
+            total_loss = total_loss + ego_flow_dict["loss_ego_flow"] * self.ego_flow.get("weight", 1.0)
+            loss_dict.update(ego_flow_dict)
 
         # Tracking loss - not cleaned yet, dirty code is at the bottom of this file
         if "track" in predictions:
@@ -589,6 +602,202 @@ def compute_static_photo_loss(predictions, batch, huber_delta=0.1, dyn_thresh=0.
     if n_pairs == 0:
         return {"loss_static_photo": (0.0 * pose_enc).mean()}
     return {"loss_static_photo": total_loss / n_pairs}
+
+
+def compute_ego_flow_loss(predictions, batch, beta=1.0, per_pixel_thre=50.0, dyn_thresh=0.5,
+                          max_dt=5, bidirectional=True, use_dynamic_mask=True, min_valid=100,
+                          max_depth_ratio=None, target_from_pose_encoding=True, **kwargs):
+    """Pixel-space ego-flow (reprojection) consistency between predicted and GT geometry.
+
+    The geometry is MonST3R's flow term ported verbatim (disparity-form ego-flow, smooth-L1,
+    per-pixel outlier rejection; see `ego_flow.py`), but the TARGET is the GT-derived
+    ego-flow rather than RAFT optical flow. That difference is not cosmetic and must not be
+    papered over in the write-up: MonST3R's RAFT target is valuable precisely because it is
+    an observation that does NOT know the GT, which is what makes it an anchor during
+    test-time optimization. With a GT-derived target this is a REPROJECTION LOSS — a
+    pixel-space, depth-weighted restatement of the pose error — not a port of MonST3R's
+    flow loss (docs/monst3r_loss_diff.md).
+
+    What it still buys over L_cam: the error is measured where it is observable (pixels,
+    weighted by disparity) and it couples camera and depth heads through a single
+    constraint, the way MonST3R's does.
+
+    Gradient path: predicted extrinsics AND predicted depth AND predicted intrinsics (the
+    full-prediction variant). depth_head must be unfrozen for the depth path to matter, and
+    a depth constraint (loss.depth) must be on, because ego-flow's translation term is
+    `disparity * t`: a depth error and a translation error can cancel inside this residual,
+    so the term alone does not pin either. That is a property of the equation, not an
+    empirical finding — do NOT cite the RAFT-target headroom probe for it (that probe
+    measured a different residual; see diag/ego_flow_residual.py).
+
+    SCALE: no alignment needed, and this is a property of the formulation, not luck. The
+    translation term of ego-flow is `disparity * t`, invariant to a global scene rescale.
+    The predicted depth and translation share VGGT's normalised scale; the GT depth and
+    extrinsics are rescaled in lock-step by trainer._process_batch (trainer.py:979-993).
+    Each flow is therefore internally consistent and both come out in pixels. (The mixed
+    variants in diag/flow_loss_probe.py DO need a median-ratio factor — without it they
+    measure unit mismatch, a spurious 5x degradation.)
+
+    Not ported: MonST3R's whole-term fuse (`if flow_loss > thre: flow_loss = 0`). It exists
+    to survive RAFT's catastrophic outliers early in test-time optimization — a target
+    computed from GT geometry has no such failure mode, and a fuse would instead silently
+    disable the loss on exactly the hard clips where the pose error is largest. Per-pixel
+    rejection is kept (depth discontinuities still produce a heavy tail); its keep rate is
+    reported as a diagnostic so the threshold can be set from measurement rather than
+    inherited from MonST3R's RAFT-era constant.
+
+    Args:
+        predictions: needs 'pose_enc_list' (B,S,9 per stage) and 'depth' (B,S,H,W,1).
+        batch: 'extrinsics' (B,S,3,4) GT w2c, 'intrinsics' (B,S,3,3) GT, 'depths' (B,S,H,W)
+            GT, 'point_masks' (B,S,H,W) bool, 'ids' (B,S) chronological frame indices,
+            'motion_mask' (B,S,H,W) optional (1=dynamic).
+        beta: smooth-L1 transition point, in pixels (MonST3R uses 1.0).
+        per_pixel_thre: drop pixels whose raw smooth-L1 exceeds this (MonST3R: 50).
+        dyn_thresh: motion_mask threshold above which a pixel counts as dynamic.
+        max_dt: skip frame pairs further apart than this many real frames (duplicate frames,
+            dt == 0, are always skipped — they carry zero flow by construction).
+        bidirectional: score t->t+1 and t+1->t, as MonST3R sums both directions.
+        use_dynamic_mask: exclude dynamic pixels. The theory that a GT-derived target makes
+            this inert is FALSE by measurement (diag/ego_flow_residual.py: dropping the mask
+            raises the residual 65% on Sintel, 24% on Spring). The extra error enters from
+            the PREDICTION side — predicted depth is much worse on moving objects — not from
+            the target. Kept switchable to quantify that contribution.
+        min_valid: skip a frame pair with fewer than this many valid source pixels.
+        max_depth_ratio: if set, drop source pixels whose GT depth exceeds this multiple of
+            the frame's median valid GT depth (e.g. 5.0 = drop anything past 5x median).
+            Far pixels are where this loss is least trustworthy: ego-flow's translation term
+            is `disparity * t`, so a far point contributes almost no translation signal while
+            its depth is the least reliable thing the model predicts — a bad ratio in a term
+            that has no other way to tell depth error from pose error. Measured effect: on
+            Waymo (a driving set that is mostly far road/sky) this term is 50% of the
+            objective at weight 1.0 versus 0.4% on PointOdyssey, so without a cap most of the
+            gradient goes into distant depth. The cut uses GT depth, never predicted depth:
+            a mask keyed on the prediction would reward pushing depth outward to escape the
+            loss. None keeps every pixel (original behaviour).
+        target_from_pose_encoding: build the GT ego-flow from GT extrinsics/intrinsics that
+            have been round-tripped through the pose encoding, instead of the raw ones.
+            This removes an otherwise irreducible floor. Measured on PointOdyssey
+            (diag/ego_flow_selftest.py --dataset po): the GT rotation matrices are off SO(3)
+            by 5e-4 — float32 drift through the dataset's crop/resize/rotate path — and the
+            quaternion in the pose encoding can only represent a proper rotation, so decoding
+            silently re-orthonormalises. The prediction therefore CANNOT reproduce the raw GT
+            flow: identity residual 0.061 px, against a signal of 0.13 px on the same set.
+            (The dropped principal point costs nothing by comparison: shifting it translates
+            the whole flow field rather than changing its values.) compute_camera_loss has no
+            such floor because it encodes the GT and compares in encoding space; this makes
+            the pixel-space term consistent with that. Off = compare against the raw GT, i.e.
+            penalise the model for not reproducing a camera it cannot represent.
+    """
+    pose_enc = predictions["pose_enc_list"][-1]                 # (B,S,9), final refine stage
+    images = batch["images"]
+    B, S, _, H, W = images.shape
+    zero = (0.0 * pose_enc).mean()
+    if S < 2:
+        return {"loss_ego_flow": zero, "loss_ego_flow_kept": zero.detach(),
+                "loss_ego_flow_pairs": zero.detach()}
+
+    # fp32 throughout: the perspective divide in ego_flow_from_disp loses pixel-level
+    # precision under bf16, and this loss is measured in pixels.
+    with torch.amp.autocast("cuda", enabled=False):
+        pr_extri, pr_intri = pose_encoding_to_extri_intri(pose_enc.float(), (H, W), build_intrinsics=True)
+        pr_depth = predictions["depth"][..., 0].float()          # (B,S,H,W)
+        gt_extri = batch["extrinsics"].float()
+        gt_intri = batch["intrinsics"].float()
+        if target_from_pose_encoding:
+            # Project the GT onto what a pose encoding can express (proper rotation, centred
+            # principal point), so the target is reachable. See the docstring.
+            gt_extri, gt_intri = pose_encoding_to_extri_intri(
+                extri_intri_to_pose_encoding(gt_extri, gt_intri, (H, W)), (H, W),
+                build_intrinsics=True,
+            )
+        gt_depth = check_and_fix_inf_nan(batch["depths"].float(), "ego_flow_gt_depth")
+        point_masks = batch["point_masks"]
+        motion_mask = batch.get("motion_mask", None)
+        ids = batch["ids"]
+
+        coord = pixel_grid(H, W, images.device, torch.float32)
+        eps = 1e-6
+
+        # Per-frame far-pixel cap, from GT depth only (see max_depth_ratio in the docstring).
+        # Computed once for all frames rather than per pair, and on a strided subsample: the
+        # median of ~16k pixels is more than accurate enough to set a cut, and quantile() over
+        # the full 518x518 grid would sort a quarter of a million values per frame per step.
+        depth_cap = None
+        if max_depth_ratio is not None:
+            with torch.no_grad():
+                sub = max(1, (H * W) // 16384)
+                d = gt_depth.reshape(B * S, -1)[:, ::sub]
+                mk = point_masks.reshape(B * S, -1)[:, ::sub]
+                med = torch.nanquantile(d.masked_fill(~mk, float("nan")), 0.5, dim=-1)
+                # Frames with no valid depth yield NaN -> no cap rather than an empty mask.
+                depth_cap = torch.where(torch.isnan(med), torch.full_like(med, float("inf")),
+                                        med * max_depth_ratio).reshape(B, S)
+
+        total_loss = pose_enc.new_zeros(())
+        n_pairs = 0
+        kept_num = 0.0
+        kept_den = 0.0
+
+        directions = [(0, 1)] + ([(1, 0)] if bidirectional else [])
+        for t in range(S - 1):
+            dt = (ids[:, t + 1] - ids[:, t]).float()             # (B,)
+            pair_ok = (dt > 0) & (dt <= max_dt)                  # duplicate frames carry no flow
+            if not bool(pair_ok.any()):
+                continue
+
+            for off_src, off_tgt in directions:
+                s_idx, t_idx = t + off_src, t + off_tgt
+
+                pr_disp = 1.0 / pr_depth[:, s_idx].clamp(min=eps)
+                gt_disp = 1.0 / gt_depth[:, s_idx].clamp(min=eps)
+
+                R_pr, t_pr = relative_w2c(pr_extri[:, s_idx], pr_extri[:, t_idx])
+                R_gt, t_gt = relative_w2c(gt_extri[:, s_idx], gt_extri[:, t_idx])
+
+                flow_pr, z_pr = ego_flow_from_disp(
+                    R_pr, t_pr, pr_disp[:, None], pr_intri[:, t_idx],
+                    torch.linalg.inv(pr_intri[:, s_idx]), coord,
+                )
+                flow_gt, z_gt = ego_flow_from_disp(
+                    R_gt, t_gt, gt_disp[:, None], gt_intri[:, t_idx],
+                    torch.linalg.inv(gt_intri[:, s_idx]), coord,
+                )
+
+                # Source-frame validity. z <= 0 means the point warps behind the target
+                # camera, where the perspective divide flips sign and the gradient points
+                # the wrong way.
+                valid = point_masks[:, s_idx] & (z_pr > eps) & (z_gt > eps)
+                if use_dynamic_mask and motion_mask is not None:
+                    valid = valid & (motion_mask[:, s_idx] < dyn_thresh)
+                if depth_cap is not None:
+                    valid = valid & (gt_depth[:, s_idx] <= depth_cap[:, s_idx, None, None])
+                valid = valid & pair_ok[:, None, None]
+                m = valid.float()[:, None]                        # (B,1,H,W)
+
+                raw = F.smooth_l1_loss(flow_pr * m, flow_gt * m, beta=beta, reduction="none")
+                keep = m.expand_as(raw) if per_pixel_thre <= 0 else (raw < per_pixel_thre).float() * m
+
+                n_valid_px = m.sum(dim=(1, 2, 3))                 # (B,)
+                denom = keep.sum(dim=(1, 2, 3))                   # (B,), counts both channels
+                usable = (n_valid_px >= min_valid) & (denom > 0)
+                if not bool(usable.any()):
+                    continue
+
+                per_sample = (raw * keep).sum(dim=(1, 2, 3)) / denom.clamp(min=1.0)
+                total_loss = total_loss + per_sample[usable].sum()
+                n_pairs += int(usable.sum())
+
+                kept_num += float(keep.sum().detach())
+                kept_den += float(m.sum().detach()) * raw.shape[1]
+
+    if n_pairs == 0:
+        return {"loss_ego_flow": zero, "loss_ego_flow_kept": zero.detach(),
+                "loss_ego_flow_pairs": zero.detach()}
+
+    loss = check_and_fix_inf_nan(total_loss / n_pairs, "loss_ego_flow")
+    kept = torch.as_tensor(kept_num / max(kept_den, 1.0), device=loss.device, dtype=loss.dtype)
+    pairs = torch.as_tensor(float(n_pairs), device=loss.device, dtype=loss.dtype)
+    return {"loss_ego_flow": loss, "loss_ego_flow_kept": kept, "loss_ego_flow_pairs": pairs}
 
 
 def compute_camera_smooth_loss(predictions, batch, weight_trans=1.0, weight_rot=1.0, gamma=0.6, **kwargs):

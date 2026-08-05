@@ -30,6 +30,8 @@ GATE_GIF = "gate_gif"
 POINTCLOUD_GT = "pointcloud_gt"
 POINTCLOUD_EXPORT = "pointcloud_export"
 TRAIN_CURVES = "train_curves"
+FLOW_LOSS_PROBE = "flow_loss_probe"
+EGO_FLOW_RESIDUAL = "ego_flow_residual"
 
 
 def _join_path_parts(parts: list[str]) -> str:

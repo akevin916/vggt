@@ -131,6 +131,20 @@ loss:
   #   weight: 1.0
   #   huber_delta: 0.1
   #   dyn_thresh: 0.5
+  ego_flow: null
+  # v3 extension: ego-flow reprojection consistency. MonST3R's disparity-form ego-flow geometry
+  # (ego_flow.py) scored against the GT-derived ego-flow rather than RAFT — so it is a pixel-space
+  # reprojection loss, NOT a port of MonST3R's flow loss (docs/monst3r_loss_diff.md). Requires the
+  # depth head to be predicting AND unfrozen for the depth path to matter, plus loss.depth on:
+  # flow-driven depth without a depth anchor lowers the residual and worsens ATE (headroom probe).
+  # See dyn_vggt_v3_s1_inst_egoflow.yaml.
+  # ego_flow:
+  #   weight: 1.0
+  #   beta: 1.0
+  #   per_pixel_thre: 50.0
+  #   max_dt: 5
+  #   bidirectional: True
+  #   use_dynamic_mask: True
   camera_smooth: null
   # v3 extension: camera-trajectory smoothness regularizer (Δt-normalized 2nd-order term on
   # predicted T/quaternion; addresses observed trajectory "jumps" on hard/dynamic sequences,
