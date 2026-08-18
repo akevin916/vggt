@@ -31,6 +31,7 @@ import numpy as np
 
 from data.dataset_util import read_image_cv2, threshold_depth_map
 from data.base_dataset import BaseDataset
+from data.paths import data_path
 
 from data.sintel_io import (
     SINTEL_EVAL_SEQUENCES,
@@ -51,7 +52,7 @@ class SintelDataset(BaseDataset):
     def __init__(
         self,
         common_conf,
-        SINTEL_DIR: str = "/media/cvml-75/ssd2t1/data/sintel/training",
+        SINTEL_DIR: str = data_path("eval", "sintel"),
         sequences: list = None,     # default: MonST3R's 14-seq eval split
         min_num_images: int = 16,
         len_train: int = 10000,

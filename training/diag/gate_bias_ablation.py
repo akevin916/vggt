@@ -26,6 +26,7 @@ import torch
 from tqdm import tqdm
 
 from data.datasets.pointodyssey import PointOdysseyDataset
+from data.paths import data_path
 from eval_utils.gate_common import oracle_logits_from_masks, po_common_conf, pool_to_patch
 from data.motion_mask import DIAG_SEQUENCES, sintel_masks_and_fraction
 from eval_utils.paths import GATE_BIAS_ABLATION, GATE_BIAS_ABLATION_PO, default_output_dir
@@ -91,7 +92,7 @@ def parse_args():
     )
 
     # PointOdyssey-specific
-    ap.add_argument("--po_dir", default="/media/cvml-75/ssd2t1/data/point_odyssey")
+    ap.add_argument("--po_dir", default=data_path("train", "point_odyssey"))
     ap.add_argument("--n_clips", type=int, default=10, help="number of PO test clips")
     ap.add_argument("--img_per_seq", type=int, default=12)
     ap.add_argument("--img_size", type=int, default=518)

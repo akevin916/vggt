@@ -26,7 +26,10 @@ import os.path as osp
 import glob
 import sys
 
+sys.path.insert(0, osp.dirname(osp.dirname(osp.dirname(osp.abspath(__file__)))))  # training/
 import numpy as np
+
+from data.paths import data_path
 
 KEEP_KEYS = ("intrinsics", "extrinsics")
 
@@ -53,7 +56,7 @@ def slim_one(src_path: str, dst_path: str, compress: bool) -> tuple[int, int]:
 
 def main():
     ap = argparse.ArgumentParser(description="Slim PointOdyssey anno.npz to camera-only arrays.")
-    ap.add_argument("--po_dir", default="/media/cvml-75/ssd2t1/data/point_odyssey",
+    ap.add_argument("--po_dir", default=data_path("train", "point_odyssey"),
                     help="PointOdyssey root (contains train/ test/).")
     ap.add_argument("--splits", nargs="+", default=["train"], help="Splits to process.")
     ap.add_argument("--out", default=None,

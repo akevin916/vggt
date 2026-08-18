@@ -36,7 +36,12 @@ gate 是否真的改善 pose 屬**未定論的研究問題**，最新進展與�
 
 config 用檔名編碼 curriculum：**S0**（只訓 `gate_predictor`，其餘凍結）→ **S1**（gate + 後段 global block + camera head）→ **S2**（全網）。檔名 suffix 是命名慣例，標示該 config 用的標籤/loss 組合：`_inst`（instance 標籤）、`_raft`（RAFT 標籤）、`_photo`（加 static-photo loss）、`_smooth`/`_temporal`（額外 loss/aggregator 變體）、`_oracle_camera_only`（oracle-mask 消融）。哪個組合有效屬研究結論，見 project memory。
 
-動態 mask **標籤**由 `training/data/preprocess/po_*` script 離線預算：`dynmask_inst/`（instance × GT scene-flow —— PO 訓練標籤）或 `dynmask_raft/`（RAFT flow-residual —— 用於 Sintel/測試 eval）。`training/data/datasets/` 下的 dataset（`pointodyssey.py`、`tartanair.py`、`spring.py`、`waymo.py`、`co3d.py`）透過 `dynamic_source=` 載入。資料集實體在 `/media/cvml-75/ssd2t1/data/`（symlink 成 `./data`）。
+動態 mask **標籤**由 `training/data/preprocess/po_*` script 離線預算：`dynmask_inst/`（instance × GT scene-flow —— PO 訓練標籤）或 `dynmask_raft/`（RAFT flow-residual —— 用於 Sintel/測試 eval）。`training/data/datasets/` 下的 dataset（`pointodyssey.py`、`tartanair.py`、`spring.py`、`waymo.py`、`co3d.py`）透過 `dynamic_source=` 載入。資料集實體在另一顆碟上，一律**透過 repo root 的 `data` symlink** 存取，並依角色分兩個 bucket：
+
+- `data/train/` —— 訓練混合：`point_odyssey/`、`tartanair/`、`waymo_processed/`、`spring/`（PO 雖然也被 diag 拿來探測，仍歸 train —— bucket 記錄的是資料的身分，不是誰在讀它）。
+- `data/eval/` —— benchmark：`sintel/`（**已扁平化**，`final/`、`depth/`、`camdata_left/` 直接在底下，不再有上游的 `training/` 那層）、`bonn/`、`scannetv2/`。
+
+python 端走 `training/data/paths.py` 的 `data_path("train", "point_odyssey")` / `data_path("eval", "sintel")`（可用 `VGGT_DATA_ROOT` 覆寫 root），yaml 端寫相對的 `../data/train/...`（cwd = `training/`）。**不要再把 `/media/...` 掛載點寫死** —— udisks 以 filesystem label 命名 automount 並在撞名時加數字，掛載點不是穩定識別。
 
 ## Eval 與診斷
 
@@ -48,7 +53,7 @@ config 用檔名編碼 curriculum：**S0**（只訓 `gate_predictor`，其餘凍
 
 搬家規則：diag → benchmark 的時機是**你決定那個數字要進論文的那一刻**，不是等它「看起來穩了」。
 
-**輸出路徑**：`logs/<exp>/` 只放訓練產物（`ckpts/`、`tensorboard/`、`log.txt`、trainer 的 `pose_eval/`）；訓練之後產生的一切（benchmark json、ablation、診斷、圖）一律 `outputs/<exp>/<tool>/`，由 `eval_utils/paths.py` 的 `default_output_dir(ckpt, TOOL)` 解析，別自己拼路徑。
+**輸出路徑**：`logs/<exp>/` 只放訓練產物（`ckpts/`、`tensorboard/`、`log.txt`、trainer 的 `pose_eval/`）；訓練之後產生的一切（benchmark json、ablation、診斷、圖）一律 `outputs/<tool>/<exp>/`，由 `eval_utils/paths.py` 的 `default_output_dir(ckpt, TOOL)` 解析，別自己拼路徑。
 
 Sintel/flow 的共用 IO 與 mask 推導在 `training/data/`（`sintel_io.py`、`motion_mask.py`）——它們被 `data/preprocess/`、`data/datasets/`、benchmark、diag 共用，屬 data layer 而非 eval layer。
 

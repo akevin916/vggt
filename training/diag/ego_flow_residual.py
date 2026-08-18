@@ -46,6 +46,7 @@ from typing import Dict, List
 import numpy as np
 import torch
 
+from data.paths import data_path
 from diag.flow_loss_probe import build_train_dataset, load_sintel_clip, load_train_clip
 from ego_flow import ego_flow_from_disp, pixel_grid, relative_w2c
 from eval_utils.paths import EGO_FLOW_RESIDUAL as TOOL
@@ -189,10 +190,10 @@ def main():
                     help="training sampling counts per dataset (len_train in the config); the "
                          "weight suggestion is mixed by these. sintel is val-only -> 0")
     # dataset locations / probe args, reused by build_train_dataset & load_*_clip
-    ap.add_argument("--po_dir", default="/media/cvml-75/ssd2t1/data/point_odyssey")
-    ap.add_argument("--tartanair_dir", default="/media/cvml-75/ssd2t1/data/tartanair")
-    ap.add_argument("--waymo_dir", default="/media/cvml-75/ssd2t1/data/waymo_processed")
-    ap.add_argument("--spring_dir", default="/media/cvml-75/ssd2t1/data/spring")
+    ap.add_argument("--po_dir", default=data_path("train", "point_odyssey"))
+    ap.add_argument("--tartanair_dir", default=data_path("train", "tartanair"))
+    ap.add_argument("--waymo_dir", default=data_path("train", "waymo_processed"))
+    ap.add_argument("--spring_dir", default=data_path("train", "spring"))
     ap.add_argument("--sintel_root", default=None)
     ap.add_argument("--motion_thr", type=float, default=2.0)
     ap.add_argument("--max_depth", type=float, default=80.0)

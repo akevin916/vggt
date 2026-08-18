@@ -6,7 +6,7 @@ two checkpoints (e.g. native VGGT-1B vs a Dyn-VGGT v3 variant) by looking at the
 trajectory shape, not just the scalar ATE/RPE. Both trajectories are Sim(3)-aligned to GT
 independently (same convention as eval/pose_metrics.eval_pose_metrics), then plotted top-down.
 
-Images are saved under outputs/<exp>/trajectory/ (repo root), never shown interactively.
+Images are saved under outputs/trajectory/<exp>/ (repo root), never shown interactively.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ def parse_args():
     ap.add_argument("--sintel_root", default=None)
     ap.add_argument("--max_frames", type=int, default=12)
     ap.add_argument("--chunk_size", type=int, default=0)
-    ap.add_argument("--out_dir", default=None, help="Default: outputs/<exp>/{}".format(TRAJECTORY))
+    ap.add_argument("--out_dir", default=None, help="Default: outputs/{}/<exp>".format(TRAJECTORY))
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     args.out_dir = args.out_dir or default_output_dir(args.ckpt, TRAJECTORY)

@@ -38,6 +38,7 @@ from data.motion_mask import (  # noqa: E402
     mask_cache_dir,
     mask_cache_meta_path,
 )
+from data.paths import data_path  # noqa: E402
 from data.sintel_io import (  # noqa: E402
     load_sintel_gt_depths,
     load_sintel_rgb_paths,
@@ -46,7 +47,7 @@ from data.sintel_io import (  # noqa: E402
     sintel_seq_paths,
 )
 
-DEFAULT_ROOT = "/media/cvml-75/ssd2t1/data/sintel/training"
+DEFAULT_ROOT = data_path("eval", "sintel")
 
 
 def list_sequences(sintel_root: str):

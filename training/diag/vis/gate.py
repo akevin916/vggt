@@ -32,7 +32,7 @@ def parse_args():
         default="po",
         help="po=in-domain PO (default); sintel=cross-domain flow-residual; all=both",
     )
-    ap.add_argument("--out_dir", default=None, help=f"Default: outputs/<exp>/{VIS_GATE}")
+    ap.add_argument("--out_dir", default=None, help=f"Default: outputs/{VIS_GATE}/<exp>")
     ap.add_argument("--metrics", action="store_true", help="Write minimal summary.json")
     ap.add_argument("--n_clips", type=int, default=2, help="PO clips to visualize")
     ap.add_argument("--img_per_seq", type=int, default=4)

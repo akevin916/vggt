@@ -2,7 +2,7 @@
 
 Single rule: ``logs/`` holds training artifacts only (ckpts, tensorboard, log.txt, and
 the trainer's own pose_eval). Everything produced *after* training -- benchmark numbers,
-ablation json, diagnostics, plots -- goes to ``outputs/<exp>/<tool>/``.
+ablation json, diagnostics, plots -- goes to ``outputs/<tool>/<exp>/``.
 
 ``<exp>`` is derived from the checkpoint, so a plot and the json next to it share one key
 and re-running with a different ckpt can no longer silently overwrite the previous one.
@@ -16,7 +16,7 @@ TRAINING_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO_DIR = os.path.dirname(TRAINING_DIR)
 OUTPUTS_DIR = os.path.join(REPO_DIR, "outputs")
 
-# Tool names -> the <tool> level under outputs/<exp>/.
+# Tool names -> the first level under outputs/.
 EVAL_SINTEL = "eval_sintel"
 GATE_BIAS_ABLATION = "gate_bias_ablation"
 GATE_BIAS_ABLATION_PO = "gate_bias_ablation_po"
@@ -62,10 +62,10 @@ def exp_name_from_ckpt(ckpt: str, training_dir: str | None = None) -> str:
 
 
 def default_output_dir(ckpt: str, tool_name: str, training_dir: str | None = None) -> str:
-    """Default output directory for any post-training script: ``outputs/<exp>/<tool>/``."""
-    return os.path.abspath(os.path.join(OUTPUTS_DIR, exp_name_from_ckpt(ckpt, training_dir), tool_name))
+    """Default output directory for any post-training script: ``outputs/<tool>/<exp>/``."""
+    return os.path.abspath(os.path.join(OUTPUTS_DIR, tool_name, exp_name_from_ckpt(ckpt, training_dir)))
 
 
 def output_dir_for_exp(exp_name: str, tool_name: str) -> str:
     """Same as ``default_output_dir`` for callers keyed by an experiment name, not a ckpt."""
-    return os.path.abspath(os.path.join(OUTPUTS_DIR, exp_name, tool_name))
+    return os.path.abspath(os.path.join(OUTPUTS_DIR, tool_name, exp_name))

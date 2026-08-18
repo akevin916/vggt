@@ -36,6 +36,7 @@ sys.path.insert(0, osp.dirname(osp.dirname(osp.dirname(osp.abspath(__file__)))))
 import numpy as np, cv2, torch
 from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 from data.motion_mask import compute_ego_flow
+from data.paths import data_path
 from data.datasets.waymo import _read_waymo_depth
 
 DEPTH_MAX = 80.0  # matches WaymoDataset.depth_max (LiDAR valid range)
@@ -130,7 +131,7 @@ def process_seq(seg_dir, cam_id, frame_ids, model, tf, device, thr, gap=5, save_
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--waymo_dir", default="/media/cvml-75/ssd2t1/data/waymo_processed")
+    ap.add_argument("--waymo_dir", default=data_path("train", "waymo_processed"))
     ap.add_argument("--cameras", nargs="*", type=int, default=None, help="subset of camera ids 1-5; default all")
     ap.add_argument("--segments", nargs="*", default=None, help="subset of segment dir names; default all")
     ap.add_argument("--thr", type=float, default=2.0, help="flow-residual threshold in NATIVE px")

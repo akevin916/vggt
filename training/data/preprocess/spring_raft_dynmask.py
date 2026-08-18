@@ -27,6 +27,7 @@ sys.path.insert(0, osp.dirname(osp.dirname(osp.dirname(osp.abspath(__file__)))))
 import numpy as np, cv2, torch, h5py
 from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 from data.motion_mask import compute_ego_flow
+from data.paths import data_path
 
 BASELINE = 0.065  # Spring stereo baseline, metres (matches SpringDataset.BASELINE)
 DEPTH_MAX = 200.0  # matches SpringDataset.depth_max
@@ -126,7 +127,7 @@ def process_seq(seq_dir, model, tf, device, thr, gap=5, save_vis=False):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--spring_dir", default="/media/cvml-75/ssd2t1/data/spring")
+    ap.add_argument("--spring_dir", default=data_path("train", "spring"))
     ap.add_argument("--split", default="train")
     ap.add_argument("--seqs", nargs="*", default=None, help="subset of seq names; default all")
     ap.add_argument("--thr", type=float, default=2.0, help="flow-residual threshold in NATIVE px")

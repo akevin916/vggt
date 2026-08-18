@@ -11,6 +11,8 @@ import numpy as np
 from PIL import Image
 from scipy.spatial.transform import Rotation
 
+from data.paths import data_path
+
 TAG_FLOAT = 202021.25
 
 # MonST3R standard Sintel training eval split (14 sequences).
@@ -39,15 +41,9 @@ def resolve_sintel_root(sintel_root: str | None = None) -> str:
     if sintel_root and sintel_root not in ("", DEFAULT_SINTEL_ROOT):
         root = os.path.abspath(sintel_root)
     else:
-        eval_dir = os.path.dirname(os.path.abspath(__file__))
-        training_dir = os.path.dirname(eval_dir)
-        repo_root = os.path.dirname(training_dir)
         candidates = [
-            os.path.join(repo_root, "data", "sintel", "training"),
-            "/media/cvml-75/ssd2t1/data/sintel/training",
+            data_path("eval", "sintel"),
             "/home/cvml-75/Desktop/3D-repo/data/sintel/training",
-            os.path.abspath(os.path.join(training_dir, "..data", "sintel", "training")),
-            os.path.abspath(os.path.join(training_dir, "../data/sintel/training")),
         ]
         root = next(
             (p for p in candidates if os.path.isdir(os.path.join(p, "final"))),

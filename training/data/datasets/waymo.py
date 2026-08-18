@@ -52,6 +52,7 @@ import numpy as np
 
 from data.dataset_util import read_image_cv2, threshold_depth_map
 from data.base_dataset import BaseDataset
+from data.paths import data_path
 
 
 def _read_waymo_depth(path: str) -> np.ndarray:
@@ -75,7 +76,7 @@ class WaymoDataset(BaseDataset):
     def __init__(
         self,
         common_conf,
-        WAYMO_DIR: str = "/media/cvml-75/ssd2t1/data/waymo_processed",
+        WAYMO_DIR: str = data_path("train", "waymo_processed"),
         cameras: list = None,      # which cameras to include; None → all five (1–5)
         min_num_images: int = 16,
         len_train: int = 100000,

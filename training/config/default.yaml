@@ -62,7 +62,7 @@ data:
       dataset_configs:
         - _target_: data.datasets.pointodyssey.PointOdysseyDataset
           split: test
-          PO_DIR: /media/cvml-75/ssd2t1/data/point_odyssey
+          PO_DIR: ../data/train/point_odyssey
           dynamic_source: instance
           len_test: 8
 

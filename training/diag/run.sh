@@ -7,7 +7,7 @@ set -euo pipefail
 CKPT="logs/dyn_vggt_v3_s1_inst/ckpts/best.pt"        # clean run 1, epoch 15
 # One dir per frame budget: a sweep legitimately needs the setting in the path, since
 # gate_bias_ablation.py always writes results.json.
-OUT_ROOT="../outputs/dyn_vggt_v3_s1_inst/gate_sweep_scales"
+OUT_ROOT="../outputs/gate_sweep_scales/dyn_vggt_v3_s1_inst"
 
 for F in 4 8 16 32; do
     echo "=== max_frames=chunk_size=${F} ==="

@@ -163,7 +163,7 @@ def parse_args():
         help="add a panel: error vs this frame's own GT dynamic-pixel fraction (no comparison to "
         "frame 0 -- direct proxy for the §4.2 information-starvation mechanism)",
     )
-    ap.add_argument("--out_dir", default=None, help="Default: outputs/<exp>/{}".format(ERROR_GROWTH))
+    ap.add_argument("--out_dir", default=None, help="Default: outputs/{}/<exp>".format(ERROR_GROWTH))
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     args.out_dir = args.out_dir or default_output_dir(args.ckpt, ERROR_GROWTH)

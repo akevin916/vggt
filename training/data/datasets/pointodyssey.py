@@ -20,6 +20,7 @@ import numpy as np
 
 from data.dataset_util import *
 from data.base_dataset import BaseDataset
+from data.paths import data_path
 
 
 class PointOdysseyDataset(BaseDataset):
@@ -40,7 +41,7 @@ class PointOdysseyDataset(BaseDataset):
         self,
         common_conf,
         split: str = "train",
-        PO_DIR: str = "/media/cvml-75/ssd2t1/data/point_odyssey",
+        PO_DIR: str = data_path("train", "point_odyssey"),
         min_num_images: int = 24,
         len_train: int = 100000,
         len_test: int = 10000,

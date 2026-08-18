@@ -19,10 +19,13 @@ Run (from training/):
   python data/preprocess/po_instance_dynmask.py --split test           # small, do first
   python data/preprocess/po_instance_dynmask.py --split train          # full (background)
 """
-import os, os.path as osp, glob, argparse
+import os, os.path as osp, glob, argparse, sys
+
+sys.path.insert(0, osp.dirname(osp.dirname(osp.dirname(osp.abspath(__file__)))))  # training/
 import numpy as np, cv2
 from scipy import ndimage
 from tqdm import tqdm
+from data.paths import data_path
 
 
 def keymap(mask):
@@ -84,7 +87,7 @@ def refined_mask(mask, anno, fid, ig, ithr, ifrac, mintrk, mincc, maxcc, open_it
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--po_dir", default="/media/cvml-75/ssd2t1/data/point_odyssey")
+    ap.add_argument("--po_dir", default=data_path("train", "point_odyssey"))
     ap.add_argument("--split", default="test", choices=["train", "test"])
     ap.add_argument("--seqs", nargs="*", default=None)
     ap.add_argument("--ig", type=int, default=5)

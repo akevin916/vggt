@@ -16,6 +16,7 @@ import numpy as np, cv2, torch
 from scipy import ndimage
 from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 from data.motion_mask import compute_ego_flow
+from data.paths import data_path
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--method", choices=["old", "refined", "raft_snap", "all"], default="old",
@@ -23,7 +24,7 @@ ap.add_argument("--method", choices=["old", "refined", "raft_snap", "all"], defa
                      "all = 5-panel compare gap5 | raft_snap | instance x GT-flow")
 ap.add_argument("--snap_thr", type=float, default=0.2,
                 help="raft_snap: fraction of a CC's pixels that must be RAFT-positive to fill it")
-ap.add_argument("--po_dir", default="/media/cvml-75/ssd2t1/data/point_odyssey")
+ap.add_argument("--po_dir", default=data_path("train", "point_odyssey"))
 ap.add_argument("--split", default="test")
 ap.add_argument("--seqs", nargs="*", default=["ALL"])
 ap.add_argument("--frames", type=int, default=3)

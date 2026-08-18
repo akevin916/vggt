@@ -50,7 +50,7 @@ def parse_args():
     ap.add_argument("--motion_thr", type=float, default=2.0)
     ap.add_argument("--patch_size", type=int, default=14)
     ap.add_argument("--duration_ms", type=int, default=200, help="ms per frame in the GIF")
-    ap.add_argument("--out_dir", default=None, help="Default: outputs/<exp>/{}".format(GATE_GIF))
+    ap.add_argument("--out_dir", default=None, help="Default: outputs/{}/<exp>".format(GATE_GIF))
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     args.out_dir = args.out_dir or default_output_dir(args.ckpt, GATE_GIF)

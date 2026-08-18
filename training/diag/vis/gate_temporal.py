@@ -7,7 +7,7 @@ enough to cleanly exclude it -- show frame-to-frame FLICKER in gate confidence, 
 this flicker lines up with frame-to-frame pose jitter (the "trajectory zigzags" observed
 in diag/vis/trajectory.py), which would explain the RPE regression despite improved ATE.
 
-Two stacked subplots per sequence, saved to outputs/<exp>/gate_temporal/<seq>.png:
+Two stacked subplots per sequence, saved to outputs/gate_temporal/<exp>/<seq>.png:
   top:    mean sigma(g) over GT-dynamic patches vs GT-static patches, per frame (m_geo, §5.3a)
   bottom: relative rotation angle (deg) between consecutive frames, GT vs predicted
           (alignment-free: relative rotation between consecutive poses is invariant to
@@ -59,7 +59,7 @@ def parse_args():
     ap.add_argument("--motion_thr", type=float, default=2.0)
     ap.add_argument("--patch_size", type=int, default=14)
     ap.add_argument("--chunk_size", type=int, default=0)
-    ap.add_argument("--out_dir", default=None, help="Default: outputs/<exp>/{}".format(GATE_TEMPORAL))
+    ap.add_argument("--out_dir", default=None, help="Default: outputs/{}/<exp>".format(GATE_TEMPORAL))
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     args.out_dir = args.out_dir or default_output_dir(args.ckpt, GATE_TEMPORAL)

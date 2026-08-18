@@ -41,7 +41,7 @@ def parse_args():
     ap = argparse.ArgumentParser(description="Sintel pose + depth benchmark")
     ap.add_argument("--ckpt", type=str, required=True)
     ap.add_argument("--sintel_root", type=str, default=None, help="Auto-detected from repo data/ if omitted")
-    ap.add_argument("--out_dir", type=str, default=None, help=f"Default: outputs/<exp>/{EVAL_SINTEL}")
+    ap.add_argument("--out_dir", type=str, default=None, help=f"Default: outputs/{EVAL_SINTEL}/<exp>")
     ap.add_argument("--seq_list", type=str, nargs="*", default=None)
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--chunk_size", type=int, default=0, help="0 = full sequence; else chunk inference")

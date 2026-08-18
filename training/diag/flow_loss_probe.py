@@ -54,6 +54,7 @@ import torch.nn.functional as F
 from torchvision.models.optical_flow import Raft_Large_Weights, raft_large
 from tqdm import tqdm
 
+from data.paths import data_path
 from eval_utils.gate_common import po_common_conf
 from eval_utils.paths import FLOW_LOSS_PROBE, default_output_dir
 from eval_utils.vggt_infer import load_vggt_for_eval
@@ -422,10 +423,10 @@ def main():
     ap.add_argument("--dataset", default="po",
                     choices=["po", "tartanair", "waymo", "spring", "sintel"],
                     help="the four training sets (in-domain) vs sintel (where ATE is bad)")
-    ap.add_argument("--po_dir", default="/media/cvml-75/ssd2t1/data/point_odyssey")
-    ap.add_argument("--tartanair_dir", default="/media/cvml-75/ssd2t1/data/tartanair")
-    ap.add_argument("--waymo_dir", default="/media/cvml-75/ssd2t1/data/waymo_processed")
-    ap.add_argument("--spring_dir", default="/media/cvml-75/ssd2t1/data/spring")
+    ap.add_argument("--po_dir", default=data_path("train", "point_odyssey"))
+    ap.add_argument("--tartanair_dir", default=data_path("train", "tartanair"))
+    ap.add_argument("--waymo_dir", default=data_path("train", "waymo_processed"))
+    ap.add_argument("--spring_dir", default=data_path("train", "spring"))
     ap.add_argument("--sintel_root", default=None)
     ap.add_argument("--motion_thr", type=float, default=2.0, help="sintel m_geo mask threshold")
     ap.add_argument("--max_depth", type=float, default=80.0, help="sintel GT depth validity cap")

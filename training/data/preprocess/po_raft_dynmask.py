@@ -23,6 +23,7 @@ sys.path.insert(0, osp.dirname(osp.dirname(osp.dirname(osp.abspath(__file__)))))
 import numpy as np, cv2, torch
 from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 from data.motion_mask import compute_ego_flow
+from data.paths import data_path
 
 DEPTH_MAX = 1000.0  # matches PointOdysseyDataset.depth_max
 PROC_W, PROC_H = 480, 272  # RAFT processing res (both divisible by 8); ~half native, gate is patch-level
@@ -106,7 +107,7 @@ def process_seq(seq_dir, model, tf, device, thr, gap=5, save_vis=False):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--po_dir", default="/media/cvml-75/ssd2t1/data/point_odyssey")
+    ap.add_argument("--po_dir", default=data_path("train", "point_odyssey"))
     ap.add_argument("--split", default="train", choices=["train", "test"])
     ap.add_argument("--seqs", nargs="*", default=None, help="subset of seq names; default all")
     ap.add_argument("--thr", type=float, default=2.0, help="flow-residual threshold in NATIVE px")

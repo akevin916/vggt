@@ -46,6 +46,7 @@ import argparse
 import numpy as np
 import torch
 
+from data.paths import data_path
 from loss import compute_ego_flow_loss
 from vggt.utils.pose_enc import extri_intri_to_pose_encoding
 from vggt.utils.rotation import mat_to_quat, quat_to_mat
@@ -269,10 +270,10 @@ def main():
     ap.add_argument("--floor_warn", type=float, default=0.05,
                     help="fail if the [1b] principal-point floor exceeds this")
     # accepted so build_train_dataset/load_train_clip can be reused unchanged
-    ap.add_argument("--po_dir", default="/media/cvml-75/ssd2t1/data/point_odyssey")
-    ap.add_argument("--tartanair_dir", default="/media/cvml-75/ssd2t1/data/tartanair")
-    ap.add_argument("--waymo_dir", default="/media/cvml-75/ssd2t1/data/waymo_processed")
-    ap.add_argument("--spring_dir", default="/media/cvml-75/ssd2t1/data/spring")
+    ap.add_argument("--po_dir", default=data_path("train", "point_odyssey"))
+    ap.add_argument("--tartanair_dir", default=data_path("train", "tartanair"))
+    ap.add_argument("--waymo_dir", default=data_path("train", "waymo_processed"))
+    ap.add_argument("--spring_dir", default=data_path("train", "spring"))
     ap.add_argument("--split", default="train")
     ap.add_argument("--img_size", type=int, default=518)
     ap.add_argument("--patch_size", type=int, default=14)

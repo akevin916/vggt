@@ -39,6 +39,7 @@ import numpy as np
 
 from data.dataset_util import read_image_cv2, threshold_depth_map
 from data.base_dataset import BaseDataset
+from data.paths import data_path
 
 
 def _read_dsp5(path: str) -> np.ndarray:
@@ -57,7 +58,7 @@ class SpringDataset(BaseDataset):
         self,
         common_conf,
         split: str = "train",
-        SPRING_DIR: str = "/media/cvml-75/ssd2t1/data/spring",
+        SPRING_DIR: str = data_path("train", "spring"),
         min_num_images: int = 16,
         len_train: int = 100000,
         depth_max: float = 200.0,

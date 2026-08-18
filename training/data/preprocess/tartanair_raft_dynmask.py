@@ -29,6 +29,7 @@ sys.path.insert(0, osp.dirname(osp.dirname(osp.dirname(osp.abspath(__file__)))))
 import numpy as np, cv2, torch
 from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 from data.motion_mask import compute_ego_flow
+from data.paths import data_path
 from data.datasets.tartanair import TartanAirDataset
 
 DEPTH_MAX = 1000.0  # matches TartanAirDataset.depth_max
@@ -108,7 +109,7 @@ def process_traj(traj_dir, model, tf, device, thr, gap=5, save_vis=False):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tartanair_dir", default="/media/cvml-75/ssd2t1/data/tartanair")
+    ap.add_argument("--tartanair_dir", default=data_path("train", "tartanair"))
     ap.add_argument("--envs", nargs="*", default=None, help="subset of env names; default all")
     ap.add_argument("--thr", type=float, default=2.0, help="flow-residual threshold in NATIVE px")
     ap.add_argument("--gap", type=int, default=5, help="frame gap delta for residual (t -> t+delta)")

@@ -18,7 +18,7 @@ to points as-is.
 
 Three outputs, all optional:
   --port N        interactive viser server with a pred/GT visibility + gizmo toggle
-  --save_views    fixed-viewpoint PNGs under outputs/<exp>/pointcloud_gt/ (never shown)
+  --save_views    fixed-viewpoint PNGs under outputs/pointcloud_gt/<exp>/ (never shown)
   --export_ply    gt.ply + pred.ply in the shared frame, for a local viewer (CloudCompare/
                   MeshLab) -- the offline path when the network makes viser too laggy
 """
@@ -83,7 +83,7 @@ def parse_args():
         "--method",
         default=None,
         help="Method name (e.g. base, inst). When set, export uses the comparison layout "
-        "outputs/point_cloud/<scene>/<method>.ply + gt.ply instead of outputs/<exp>/pointcloud_gt/.",
+        "outputs/point_cloud/<scene>/<method>.ply + gt.ply instead of outputs/pointcloud_gt/<exp>/.",
     )
     ap.add_argument(
         "--per_frame",
@@ -104,7 +104,7 @@ def parse_args():
     ap.add_argument("--export_ply", action="store_true", help="Write gt.ply + pred.ply for a local viewer (CloudCompare/MeshLab)")
     ap.add_argument("--max_plot_points", type=int, default=60000, help="Per-cloud point budget for the PNGs")
     ap.add_argument("--max_viser_points", type=int, default=400000, help="Per-cloud point budget streamed to viser (lag control)")
-    ap.add_argument("--out_dir", default=None, help=f"Default: outputs/<exp>/{POINTCLOUD_GT}")
+    ap.add_argument("--out_dir", default=None, help=f"Default: outputs/{POINTCLOUD_GT}/<exp>")
     args = ap.parse_args()
     args.out_dir = args.out_dir or default_output_dir(args.ckpt, POINTCLOUD_GT)
     return args
