@@ -1,0 +1,226 @@
+# Dyn-VGGT v3 — Stage S1, POST-FIX integrated run (docs/dyn_vggt_method_v3.md §8.3 "run 4").
+#
+# WHAT CHANGED vs config/v3_bug/dyn_vggt_v3_s1_inst_photo_smooth_temporal.yaml
+#   The old sibling in v3_bug/ was trained on the BROKEN frame-interleaved gate forward
+#   (commit e064087 fixed it: `_gated_global_block_forward` was gating only frame 0's camera
+#   token, so pose was effectively `off` for (S-1)/S frames — see method_v3 status banner
+#   2026-07-09). That checkpoint is archived. This config is the same loss/unfreeze combination
+#   re-launched on the CORRECTED forward, so the gate now actually cleans the camera token on
+#   every frame. No YAML change is needed for the fix itself — it is code-level — the deltas here
+#   are only: (1) fresh warm-start from S0 rather than auto-resuming a stale last.pt, (2) doc.
+#
+# INTEGRATED COMBINATION (method_v3 §8.3 run 4 = the two extensions that tested effective, both
+# stacked on the gate→camera base):
+#   base   : gate predictor + global_blocks[8..23] + camera_head unfrozen; losses L_cam + L_gate.
+#   + §7.1 : static_photo loss (GT-depth, pure-pose route B) + L_depth; depth_head unfrozen.
+#   + §7.2 : camera_smooth loss (trajectory 2nd-order smoothness) + temporal_blocks unfrozen.
+# So depth_head AND temporal_blocks are both trainable; every gate-/photo-keyed loss runs on all
+# four datasets (each supplies a GT `motion_mask`, see the data note below).
+#
+# Dynamic-mask (`motion_mask`) source per dataset — this is what gate/static_photo supervise on:
+#   PointOdyssey : dynamic_source=instance → dynmask_inst/ (instance × GT scene-flow, §5.2a) —
+#                  the strong per-pixel training label. RAFT-residual per-frame fallback inside
+#                  the loader for the few degenerate `character*` seqs (see pointodyssey.py).
+#   TartanAir    : camera-only motion → all-static mask (m≡0), baked into the loader. Its RAFT
+#                  residual was computed but judged unreliable, so it is intentionally NOT used;
+#                  TartanAir is the static negative-example set (every pixel GT-static).
+#   Waymo        : dynamic_source=raft → dynmask_raft/ (RAFT flow-residual, §5.2b). Precompute is
+#                  a partial offline job; WaymoDataset ENROLLS ONLY segments whose .done_cam flag
+#                  exists, so uncomputed segments are skipped rather than fed as wrong all-static.
+#                  Masks are healthy (~5% dyn-frac, concentrated on moving vehicles).
+#   Spring       : dynamic_source=raft → dynmask_raft/ (RAFT flow-residual, §5.2b). No instance/
+#                  track GT exists for Spring, so the geometric RAFT label is the only option.
+#                  BUT Spring's RAFT ego-flow blows up under large camera motion — raw masks
+#                  average ~52% dyn-frac with whole-frame false positives. Mitigated by
+#                  dynamic_max_frac=0.5: any frame whose mask covers >50% of pixels is reverted
+#                  to all-static (a real scene is never that dynamic), salvaging the plausible
+#                  frames and discarding the blowouts. The same guard is set on Waymo for
+#                  uniformity but never triggers there.
+#
+# Data mixing ratio follows MonST3R's train recipe (README.md train_dataset):
+#   PointOdyssey 10000 : TartanAir 5000 : Waymo 4000 : Spring 1000  (= 50 / 25 / 20 / 5 %).
+# len_train is each base dataset's __len__ and TupleConcatDataset samples proportionally to it,
+# so these numbers ARE the sampling weights (their absolute scale is irrelevant, only the ratio).
+# Data VOLUME = max_epochs × limit_train_batches, NOT len_train.
+#
+# Hardware: single RTX 5090 (32 GB). Heaviest S1 config (depth_head + static_photo + temporal
+# grad + gate all live). If you OOM, drop max_img_per_gpu to 8 or img_nums to [4, 8] first.
+#
+# WARM-START: from RUN 1 (checkpoints/dyn_vggt_v3_s1_inst.pt) so the §8.3 ablation shares one
+# gate→camera base across runs 2/3/4. All runs carry the same enable_gate + enable_temporal flags,
+# so gate_predictor + temporal_blocks + camera_head weights load cleanly (no missing keys). See the
+# checkpoint: block for the standalone-from-S0 alternative. Inherits everything from default.yaml.
+defaults:
+  - default
+  - _self_
+
+exp_name: dyn_vggt_v3_s1_inst_photo_smooth_temporal
+num_workers: 4
+accum_steps: 1
+max_img_per_gpu: 16
+# Longer schedule than default.yaml (20 x 2000 = 40k steps). 50 x 3000 = 150k optimizer steps.
+# The LR scheduler is driven by where = epoch/max_epochs, so warmup (5% = 2.5 ep) + cosine decay
+# stretch automatically — no scheduler edit needed.
+max_epochs: 50
+limit_train_batches: 3000
+
+
+data:
+  train:
+    common_config:
+      img_nums: [4, 16]
+      # Force cross-frame-consistent color jitter -- see dyn_vggt_v3_s1_inst_photo.yaml for why
+      # (this run also has loss.static_photo on).
+      augs:
+        cojitter_ratio: 0.0
+    dataset:
+      dataset_configs:
+        - _target_: data.datasets.pointodyssey.PointOdysseyDataset
+          split: train
+          PO_DIR: ../data/train/point_odyssey
+          dynamic_source: instance
+          len_train: 10000
+        - _target_: data.datasets.tartanair.TartanAirDataset
+          TARTANAIR_DIR: ../data/train/tartanair
+          len_train: 5000
+        - _target_: data.datasets.waymo.WaymoDataset
+          WAYMO_DIR: ../data/train/waymo_processed
+          dynamic_source: raft
+          dynamic_max_frac: 0.5   # never triggers on Waymo (~5% dyn); kept for uniformity
+          len_train: 4000
+        - _target_: data.datasets.spring.SpringDataset
+          split: train
+          SPRING_DIR: ../data/train/spring
+          dynamic_source: raft
+          dynamic_max_frac: 0.5   # revert >50%-dynamic frames to all-static (RAFT blowout guard)
+          len_train: 1000
+  # No data.val override -> inherits default.yaml's channel A (held-out PO-test, loss-only,
+  # drives best_loss.pt). Cross-domain pose/depth now comes from channel B (pose_eval, full-
+  # sequence Sintel), on by default -- see default.yaml's validation-channel comment block.
+
+
+logging:
+  scalar_keys_to_log:
+    train:
+      keys_to_log:
+        - loss_objective
+        - loss_gate
+        - loss_camera
+        - loss_T
+        - loss_R
+        - loss_reg_depth
+        - loss_static_photo
+        - loss_camera_smooth
+        - loss_smooth_T
+        - loss_smooth_R
+    val:
+      keys_to_log:
+        - loss_objective
+        - loss_gate
+        - loss_camera
+        - loss_reg_depth
+        - loss_static_photo
+        - loss_camera_smooth
+
+
+checkpoint:
+  # last.pt (rolling) + best.pt (best Sintel ATE) every epoch, PLUS a permanent milestone
+  # epoch_{N}.pt every save_freq epochs -> epoch_10/20/30/40/50.pt.
+  save_freq: 10
+  # §8.3 factor-ablation RUN 4 (all factors on): warm-start from RUN 1, not S0, so 4-vs-1 measures
+  # the combined effect over the SAME gate→camera base as 2-vs-1 and 3-vs-1. Copy run 1's
+  # logs/dyn_vggt_v3_s1_inst/ckpts/best.pt to checkpoints/dyn_vggt_v3_s1_inst.pt first.
+  # After epoch 1, flip to null so restarts self-heal from this run's last.pt.
+  # (Standalone use: to run this integrated config WITHOUT the run-1 base, point this back at
+  #  checkpoints/dyn_vggt_v3_s0_inst.pt — it warm-starts fine from S0 too.)
+  resume_checkpoint_path: checkpoints/dyn_vggt_v3_s1_inst.pt
+
+
+loss:
+  # gate + camera + depth + static-region photometric consistency + camera-trajectory smoothness.
+  camera:
+    weight: 5.0
+    loss_type: "l1"
+    gamma: 0.6
+  depth:
+    # depth_head unfrozen below; L_depth anchors the shared trunk so depth cannot drift (§8.1).
+    weight: 1.0
+    gradient_loss_fn: "grad"
+    valid_range: 0.98
+  motion: null
+  flow: null
+  reproj: null
+  tsmooth: null
+  gate:
+    weight: 1.0
+    patch_size: ${patch_size}
+  static_photo:
+    # §7.1 route B: predicted pose warps GT-static/GT-depth points into t+1, must match RGB.
+    # GT depth → gradient only into predicted extrinsics; depth_head untouched by this loss.
+    weight: 1.0
+    huber_delta: 0.1
+    dyn_thresh: 0.5
+  camera_smooth:
+    # §7.2: penalise 2nd-order (acceleration) discontinuity of the predicted pose trajectory.
+    weight: 3.0
+    weight_trans: 1.0
+    weight_rot: 1.0
+    gamma: 0.6
+
+
+optim:
+  optimizer:
+    lr: 3e-5
+  # Union of the two extensions: depth_head AND temporal_blocks are both trainable, so neither is
+  # frozen here. Frozen = early aggregator only (patch_embed + frame_blocks + global 0..7).
+  frozen_module_names:
+      - "*aggregator.patch_embed*"
+      - "*aggregator.frame_blocks*"
+      # global_blocks 0..7 (indices 0-7) are frozen; 8..23 are trainable.
+      # [0-7] is a fnmatch character class matching single digits 0-7.
+      - "*aggregator.global_blocks.[0-7]*"
+      # depth_head trained via L_depth; temporal_blocks trained via camera_smooth → both omitted.
+      # point_head / motion_head / flow_head do not exist in this model config → omit.
+  gradient_clip:
+    configs:
+      - module_name: ["aggregator.gate_predictor", "aggregator.global_blocks", "camera_head"]
+        max_norm: 1.0
+        norm_type: 2
+      # Newly-unfrozen (temporal variant) — own entry so its grad-norm is logged separately.
+      - module_name: ["aggregator.temporal_blocks"]
+        max_norm: 1.0
+        norm_type: 2
+      # Unfrozen for L_depth (photo variant) — own entry for the same reason.
+      - module_name: ["depth_head"]
+        max_norm: 1.0
+        norm_type: 2
+      # Catch-all for aggregator.camera_token / aggregator.register_token which are
+      # nn.Parameters (not modules) and are trainable in S1.
+      - module_name: ["aggregator.camera_token", "aggregator.register_token"]
+        max_norm: 1.0
+        norm_type: 2
+  options:
+    lr:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.CompositeParamScheduler
+          schedulers:
+            - _target_: fvcore.common.param_scheduler.LinearParamScheduler
+              start_value: 1e-8
+              end_value: 3e-5
+            - _target_: fvcore.common.param_scheduler.CosineParamScheduler
+              start_value: 3e-5
+              end_value: 1e-8
+          lengths: [0.05, 0.95]
+          interval_scaling: ['rescaled', 'rescaled']
+
+
+model:
+  enable_temporal: True
+  enable_motion: False
+  enable_flow: False
+  enable_gate: True
+  gate_block_iter: 7
+
+
+distributed:
+  find_unused_parameters: True

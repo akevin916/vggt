@@ -1,0 +1,190 @@
+# Dyn-VGGT v3 — Stage S1, POST-FIX factor-ablation RUN 3 (docs/dyn_vggt_method_v3.md §8.3).
+#
+# base (run 1) + ONE factor: add the static_photo loss (§7.1 "route B"). Measures the MARGINAL
+# contribution of an independent photometric pose signal (real image content, not a GT-pose
+# reparameterization) on top of the gate→camera base. Attribution vs run 1 is valid only because
+# the shared harness (data/schedule/img_nums/val) is identical — see the run-1 config header.
+#
+# GT-DEPTH variant (§8.3 run 3, the default / lower-risk one): compute_static_photo_loss back-
+# projects with GT depth (batch["depths"]) and routes gradient ONLY into the predicted extrinsics
+# via the grid_sample grid (verified in loss.py:488). So depth_head is UNTOUCHED and stays FROZEN,
+# and NO L_depth is needed — this run keeps v3's "don't touch the geometry heads" scope exactly.
+#   → run 3' (predicted-depth pose+depth joint photometric refine) is a DIFFERENT run: it needs a
+#     loss-code change (swap GT depth → predictions["depth"]) plus depth_head unfrozen + L_depth
+#     anchor. Not wired yet; not this config.
+#
+# WARM-START: run 1's best.pt = epoch 15, exported with extract_weights.py to
+# checkpoints/dyn_vggt_v3_run1_ep15.pt. Chaining off run 1 (not S0) isolates the photo factor.
+#   The export filename carries the epoch on purpose. `best.pt` is a MOVING TARGET -- reading it
+#   mid-training gives whatever epoch was best so far, and an eval json recording "ckpt=best.pt"
+#   cannot be reproduced later. That already bit table.md's f12 row (measured on ep7, not ep15).
+#   Do NOT name it dyn_vggt_v3_s1_inst.pt: archive/checkpoints/ has a PRE-FIX (07-05, buggy-gen)
+#   export under exactly that name, and warm-starting off it silently reproduces the abandoned
+#   buggy-init lineage.
+#
+# BUDGET: 20 epochs on top of the ep15 warm-start. The matched control is run 1 continued from that
+# same ep15 to ep35 -- i.e. both arms get +20 epochs from one starting point, differing only in the
+# photo factor. Comparing against run 1's ep15 itself would confound the factor with 20 epochs of
+# extra training (method §8.4 item 1: `best` is a min over N epochs, so N alone buys a lower ATE).
+# Runs 2 and 4 must use this same +20 once it is fixed here.
+#   To continue run 1: resume its ckpts/last.pt (a full trainer checkpoint -- it carries prev_epoch,
+#   so trainer.py:273 restores the epoch counter and the LR schedule picks up where it left off) and
+#   leave run 1's max_epochs at 50, killing it at epoch 35. Lowering run 1's max_epochs to 35 would
+#   jump `where` from 24/50 to 24/35 and drop the LR mid-run.
+# Inherits everything from default.yaml; only the deltas below are specified.
+defaults:
+  - default
+  - _self_
+
+exp_name: dyn_vggt_v3_s1_inst_photo
+num_workers: 0
+accum_steps: 1
+val_epoch_freq: 1
+max_img_per_gpu: 16
+max_epochs: 20
+limit_train_batches: 3000
+
+
+data:
+  train:
+    common_config:
+      img_nums: [4, 16]
+      # Force cross-frame-consistent color jitter (override default_dataset.yaml's 0.3, which
+      # lets ~30% of clips jitter each frame independently). compute_static_photo_loss directly
+      # compares raw pixel content between frame t and t+1 (loss.py:584); independent per-frame
+      # jitter injects an appearance mismatch the loss reads as pose error, corrupting ~30% of
+      # its gradient. No other loss in this run compares cross-frame pixel content, so this is
+      # safe to force here without affecting gate/camera/depth supervision.
+      augs:
+        cojitter_ratio: 0.0
+    dataset:
+      dataset_configs:
+        - _target_: data.datasets.pointodyssey.PointOdysseyDataset
+          split: train
+          PO_DIR: ../data/train/point_odyssey
+          dynamic_source: instance
+          len_train: 10000
+        - _target_: data.datasets.tartanair.TartanAirDataset
+          TARTANAIR_DIR: ../data/train/tartanair
+          len_train: 5000
+        - _target_: data.datasets.waymo.WaymoDataset
+          WAYMO_DIR: ../data/train/waymo_processed
+          dynamic_source: raft
+          dynamic_max_frac: 0.5
+          len_train: 4000
+        - _target_: data.datasets.spring.SpringDataset
+          split: train
+          SPRING_DIR: ../data/train/spring
+          dynamic_source: raft
+          dynamic_max_frac: 0.5
+          len_train: 1000
+  val:
+    common_config:
+      img_nums: [4, 16]
+    dataset:
+      dataset_configs:
+        - _target_: data.datasets.sintel.SintelDataset
+          SINTEL_DIR: ../data/eval/sintel
+          dynamic_source: gt_flow
+
+
+logging:
+  scalar_keys_to_log:
+    train:
+      keys_to_log:
+        - loss_objective
+        - loss_gate
+        - loss_camera
+        - loss_T
+        - loss_R
+        - loss_static_photo
+    val:
+      keys_to_log:
+        - loss_objective
+        - loss_gate
+        - loss_camera
+        - loss_static_photo
+
+
+checkpoint:
+  save_freq: 5
+  # Warm-start from run 1 ep15 (see header). checkpoints/dyn_vggt_v3_run1_ep15.pt referenced
+  # above no longer exists on disk; verified checkpoints/dyn_vggt_v3_s1_inst.pt is byte-identical
+  # to logs/dyn_vggt_v3_s1_inst/ckpts/best.pt's model weights (same run1-ep15 checkpoint), so
+  # it's used here instead. Do NOT confuse with archive/checkpoints/dyn_vggt_v3_s1_inst.pt, the
+  # pre-fix buggy-gen export (see run 3's header warning above).
+  # This is ALWAYS the warm-start weights now -- no need to flip to null after epoch 1 anymore.
+  # launch.py's --resume flag (not this field) controls whether a run continues its own
+  # logs/<exp>/ckpts/last.pt instead; Trainer.__init__ refuses to start if the two disagree
+  # (existing last.pt without --resume, or --resume without an existing last.pt).
+  resume_checkpoint_path: checkpoints/dyn_vggt_v3_s1_inst.pt
+
+
+loss:
+  # RUN 3: gate + camera + static_photo (GT depth). Depth(L_depth)/smooth off. depth_head frozen.
+  camera:
+    weight: 5.0
+    loss_type: "l1"
+    gamma: 0.6
+  depth: null
+  motion: null
+  flow: null
+  reproj: null
+  tsmooth: null
+  gate:
+    weight: 1.0
+    patch_size: ${patch_size}
+  static_photo:
+    # GT-depth back-projection → gradient only into predicted extrinsics; depth_head untouched.
+    weight: 3.0
+    huber_delta: 0.1
+    dyn_thresh: 0.5
+  camera_smooth: null
+
+
+optim:
+  optimizer:
+    lr: 3e-5
+  # Base unfreeze only. depth_head stays FROZEN (static_photo uses GT depth, no L_depth here);
+  # temporal_blocks stays frozen (that's run 2/4's factor).
+  frozen_module_names:
+      - "*aggregator.patch_embed*"
+      - "*aggregator.frame_blocks*"
+      - "*aggregator.temporal_blocks*"
+      # global_blocks 0..7 frozen; 8..23 trainable ([0-7] is an fnmatch class).
+      - "*aggregator.global_blocks.[0-7]*"
+      - "*depth_head*"
+      # point_head / motion_head / flow_head do not exist in this model config → omit.
+  gradient_clip:
+    configs:
+      - module_name: ["aggregator.gate_predictor", "aggregator.global_blocks", "camera_head"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["aggregator.camera_token", "aggregator.register_token"]
+        max_norm: 1.0
+        norm_type: 2
+  options:
+    lr:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.CompositeParamScheduler
+          schedulers:
+            - _target_: fvcore.common.param_scheduler.LinearParamScheduler
+              start_value: 1e-8
+              end_value: 3e-5
+            - _target_: fvcore.common.param_scheduler.CosineParamScheduler
+              start_value: 3e-5
+              end_value: 1e-8
+          lengths: [0.05, 0.95]
+          interval_scaling: ['rescaled', 'rescaled']
+
+
+model:
+  enable_temporal: True
+  enable_motion: False
+  enable_flow: False
+  enable_gate: True
+  gate_block_iter: 7
+
+
+distributed:
+  find_unused_parameters: True

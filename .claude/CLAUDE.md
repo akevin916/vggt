@@ -1,20 +1,47 @@
-# Execution Policy
+# 溝通風格
 
-- Always output the command first.
-- Wait for my confirmation before execution.
-- Do not directly run long-running programs (e.g. full training / long eval). A short smoke test is fine.
+- 回答先給結論或重點，一到兩句話講完「做了什麼／發現了什麼」，
+  細節和推理過程放在結論之後，用條列方式呈現，不要寫成大段落。
+- 避免不必要的鋪陳、重複強調、過度解釋動機——直接講重點。
+- 遇到專有名詞或術語：
+  - 如果是研究/程式領域已有慣用中文譯名，才用中文，否則保留英文原文，
+    不要自己即席直譯造詞（例如不要把 "gate" 翻成自創的中文詞，
+    英文技術詞彙直接用英文：gate、loss、checkpoint、attention 等）。
+  - 不確定中文譯名是否存在或是否常用時，寫英文原文＋簡短中文解釋，
+    不要自創譯名。
+- 如果一個解釋預期會超過一段，先問我要不要看完整版本，
+  還是只要重點摘要。
 
-# Visualization
+# 驗證與結論
 
-- Never use plt.show().
-- Save every generated image inside the repository.
-- Print the saved image path after saving.
+- 想驗證某個假設（跑 diag script、寫 debug 程式碼、查證某個猜測是否成立）之前，先說明：
+  1. 想驗證的假設是什麼
+  2. 為什麼需要驗證
+  3. 打算怎麼驗證（方法／要跑哪支 script）
+  等我同意後才可以實際執行。
+- 分析、診斷、消融實驗跑完後，如果得出結論（例如「gate 有沒有改善 pose」、「某個 loss 組合有效與否」）：
+  1. 先列出結論內容，以及依據是哪個 diag / benchmark 結果
+  2. 等我明確同意
+  3. 未經確認前，不可以把這個結論當作既定事實，用在後續的程式碼或實驗設計決策中
+- 我沒有明確回覆（同意／反對／修正）前，視為尚未確認，不要自行延續。
+- 例外：唯讀、無副作用的查詢（單純看檔案內容、跑不影響專案狀態的指令）不受此限制。
 
-# Output paths
+# 執行政策
 
-Two sinks, split by *who writes it*:
+- 一律先把指令印出來，等我確認後才可以執行。
+- 短的 smoke test 可以跑但是不要直接跑長時間程式（例如完整訓練 / 長時間 eval）。
 
-- `training/logs/<exp>/` —— **訓練產物only**：`ckpts/`、`tensorboard/`、`log.txt`、trainer 自己的 `pose_eval/`。
-- `outputs/<exp>/<tool>/` —— **訓練之後產生的一切**：benchmark 數字、ablation json、診斷、圖。
+# 視覺化
 
-`<exp>` 由 ckpt 推導，一律走 `eval_utils/paths.py`（`default_output_dir(ckpt, TOOL)`，或 `output_dir_for_exp(exp_name, TOOL)` 給沒有 ckpt 的 caller）——**不要自己拼路徑**。`<exp>` 那層讓圖自帶 ckpt 身分，換 ckpt 重跑不會靜默覆蓋，圖和 json 也能用同一把鑰匙對起來。
+- 不要使用 `plt.show()`。
+- 每張產生的圖都要存在 repo 裡面。
+- 存檔後把圖片路徑印出來。
+
+# 輸出路徑
+
+依「誰寫入」分成兩個目的地：
+
+- `training/logs/<exp>/` —— **只放訓練產物**：`ckpts/`、`tensorboard/`、`log.txt`、trainer 自己的 `pose_eval/`。
+- `outputs/<tool>/<exp>/` —— **訓練之後產生的一切**：benchmark 數字、ablation json、診斷、圖。
+
+`<exp>` 由 ckpt 推導，一律走 `eval_utils/paths.py`（`default_output_dir(ckpt, TOOL)`，或給沒有 ckpt 的 caller 用 `output_dir_for_exp(exp_name, TOOL)`）——**不要自己拼路徑**。`<exp>` 這層讓圖自帶 ckpt 身分，換 ckpt 重跑不會靜默覆蓋，圖和 json 也能用同一把鑰匙對起來。

@@ -156,7 +156,6 @@ skyseg.onnx
 training/logs/
 /data
 /reference/
-training/config
 training/benchmark/__pycache__/
 outputs/
 archive/

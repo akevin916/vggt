@@ -1,0 +1,35 @@
+# Smoke test for scared_cam — 20 steps, one epoch. Answers in ~5 minutes what would otherwise
+# cost hours of a real run to find out:
+#   1. does the SCARED loader feed the trainer without shape/unit surprises? (1280x1024 crops
+#      to 518x420, not a square 518x518 — the patch grid is 37x30 = 1110.)
+#   2. does it fit in memory at max_img_per_gpu=16?
+#   3. is loss_camera sane? Depth is millimetres here, but trainer.py normalises each sample
+#      to unit scale before the loss, so loss_camera should land in the same range as the
+#      natural-scene runs. An order-of-magnitude miss means the unit handling is wrong.
+#   4. does the inst_g warm-start load cleanly (gate_predictor keys present, frozen)?
+#   5. does the gate_pose_grad path work end to end -- head reset fires, gate_predictor is
+#      unfrozen and receives gradient, and gate_g_median starts at ~0 rather than ~-5.4?
+#   6. does channel B's SCARED branch run at all? It fires only at the END of an epoch, so
+#      a bug there costs a full epoch (~45 min) to discover in a real run. Here it is cut
+#      down to one keyframe x 8 frames so the whole smoke stays ~5 minutes.
+#
+# SEPARATE exp_name on purpose: the real run's logs/ stays untouched, so no stale last.pt
+# blocks the real launch.
+#
+# Read the result with:  python diag/train_health.py --exp scared_cam_smoke
+defaults:
+  - scared_cam_b16_gg   # the widest code path: gate trainable, leaky bias, head reset
+  - _self_
+
+exp_name: scared_cam_smoke
+
+max_epochs: 1
+limit_train_batches: 20
+limit_val_batches: 4
+checkpoint:
+  save_steps_freq: 0
+
+
+pose_eval:
+  seqs: ["dataset2/keyframe3"]   # one sequence, not all 6
+  n_frames: 8

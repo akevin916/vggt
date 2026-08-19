@@ -1,0 +1,47 @@
+# Dyn-VGGT v3 — S1, ego-flow with GT depth, DYNAMIC MASK OFF.
+#
+# ONE change from dyn_vggt_v3_s1_inst_egoflow_gt: use_dynamic_mask false. That run is the
+# control; everything else (warm start, schedule, weight, thresholds) is inherited.
+#
+# WHY THE MASK IS WRONG IN THIS CONFIGURATION. With use_gt_depth both flows are built from the
+# same GT disparity field, so each is "where this point would land if only the camera moved".
+# A moving object's own motion is in NEITHER flow — it cannot contaminate the residual, which
+# stays pure relative-pose error on dynamic pixels exactly as on static ones. The mask therefore
+# buys no protection here. (It DOES matter with predicted depth, where the extra error enters
+# from the prediction side: measured mask effect 9.1% PO / 49.4% Spring / 53.5% Sintel. Those
+# numbers do not transfer, and conflating the two configurations is the mistake this header
+# exists to prevent.)
+#
+# WHAT IT COSTS. Dynamic pixels are the CLOSE ones, and closeness is exactly what makes
+# translation visible (ego-flow's translation term is disparity * t):
+#     dataset   static median depth   dynamic median depth   ratio   dynamic share
+#     PO              3.716                 2.899            0.78x       13.0%
+#     Spring         14.626                 2.548            0.17x       31.9%
+#     Sintel          3.755                 2.537            0.68x       34.0%
+# So the mask discards 13-34% of pixels, and specifically the highest-disparity, most
+# translation-informative ones. With GT depth the residual it removes is signal, not noise: the
+# remaining mask effect (3.7% PO / 3.2% Spring / 24.8% Sintel, measured with use_gt_depth) is
+# explained by those pixels responding more strongly to the same pose error, not by contamination.
+#
+# WHY THIS IS WORTH A RUN AFTER A NEGATIVE RESULT. The control run came out negative (ATE +6.4%,
+# RPE-r +6.1%, AbsRel +5.9% against run 2 ep30; its RPE-t -4.7% came entirely from cave_2 and
+# temple_3, both of which docs/table.md flags as unreliable). This is not a retry with different
+# hyper-parameters — it fixes a setting that is wrong on its own terms, and it strengthens the
+# one channel where any signal appeared (translation), since near pixels are where translation
+# lives. It may well stay negative.
+#
+# WEIGHT UNCHANGED. Turning the mask off raises the residual, so strictly the weight should drop
+# to keep the same share. Mixed by training sampling ratios (PO 10000 / TartanAir 5000 / Waymo
+# 4000 / Spring 1000; TartanAir's mask is all-zero by construction and Waymo's barely moves the
+# residual) the increase is ~2%, i.e. 0.0215 -> 0.0211. That is far inside the noise of the
+# calibration itself, so it is left alone rather than pretending to a precision we do not have.
+defaults:
+  - dyn_vggt_v3_s1_inst_egoflow_gt
+  - _self_
+
+exp_name: dyn_vggt_v3_s1_inst_egoflow_gt_mask
+
+
+loss:
+  ego_flow:
+    use_dynamic_mask: False

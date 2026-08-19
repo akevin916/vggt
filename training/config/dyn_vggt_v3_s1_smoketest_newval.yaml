@@ -1,0 +1,122 @@
+# SMOKE TEST — new validation harness (channel A = held-out PO-test, channel B = full-seq Sintel).
+# Throwaway config: tiny budget to verify plumbing only (NOT a research run):
+#   - channel A (run_val) now reads PO-test (split=test) -> in-domain overfitting monitor;
+#     its mean camera loss drives best_loss.pt.
+#   - channel B (pose_eval) full-sequence Sintel ATE drives best_ate.pt (report metric).
+#   - both best_ate.pt and best_loss.pt must appear in ckpts/ after epoch 0.
+# Warm-start from run 1's exported weights so the model is real (gate active) and loads fast.
+defaults:
+  - default
+  - _self_
+
+exp_name: dyn_vggt_v3_s1_smoketest_newval
+num_workers: 4
+accum_steps: 1
+val_epoch_freq: 1
+max_img_per_gpu: 16
+max_epochs: 1
+limit_train_batches: 4
+limit_val_batches: 4
+
+
+data:
+  train:
+    common_config:
+      img_nums: [4, 8]
+    dataset:
+      dataset_configs:
+        - _target_: data.datasets.pointodyssey.PointOdysseyDataset
+          split: train
+          PO_DIR: ../data/train/point_odyssey
+          dynamic_source: instance
+          len_train: 10000
+  val:
+    # Channel A: held-out PO-test (disjoint sequences from train), deterministic-ish clip
+    # length (fixed 8 frames -- no random [4,16]) so the camera-loss signal is stable.
+    common_config:
+      img_nums: [8, 8]
+    dataset:
+      dataset_configs:
+        - _target_: data.datasets.pointodyssey.PointOdysseyDataset
+          split: test
+          PO_DIR: ../data/train/point_odyssey
+          dynamic_source: instance
+          len_test: 8
+
+
+logging:
+  scalar_keys_to_log:
+    train:
+      keys_to_log:
+        - loss_objective
+        - loss_gate
+        - loss_camera
+    val:
+      keys_to_log:
+        - loss_objective
+        - loss_gate
+        - loss_camera
+
+
+checkpoint:
+  save_freq: 10
+  # Warm-start from run 1's exported model-only weights (real gate).
+  resume_checkpoint_path: checkpoints/dyn_vggt_v3_s1_inst.pt
+
+
+# Channel B: deterministic full-sequence Sintel pose eval -> best_ate.pt. every_n_epochs: 1
+# per the decision; smoke restricts to a single short sequence so it finishes fast.
+pose_eval:
+  enabled: true
+  every_n_epochs: 1
+  sintel_root: null
+  seq_list: ["alley_2"]   # must be in SINTEL_EVAL_SEQUENCES; alley_1 has a degenerate traj (Umeyama fails)
+  chunk_size: 0
+  max_depth: 80.0
+
+
+loss:
+  camera:
+    weight: 5.0
+    loss_type: "l1"
+    gamma: 0.6
+  depth: null
+  motion: null
+  flow: null
+  reproj: null
+  tsmooth: null
+  gate:
+    weight: 1.0
+    patch_size: ${patch_size}
+  static_photo: null
+  camera_smooth: null
+
+
+optim:
+  optimizer:
+    lr: 3e-5
+  frozen_module_names:
+      - "*aggregator.patch_embed*"
+      - "*aggregator.frame_blocks*"
+      - "*aggregator.global_blocks.[0-7]*"
+      - "*depth_head*"
+  gradient_clip:
+    configs:
+      - module_name: ["aggregator.gate_predictor", "aggregator.global_blocks", "camera_head"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["aggregator.camera_token", "aggregator.register_token"]
+        max_norm: 1.0
+        norm_type: 2
+
+
+model:
+  enable_temporal: False
+  enable_motion: False
+  enable_flow: False
+  enable_gate: True
+  gate_block_iter: 7
+
+
+distributed:
+  find_unused_parameters: True

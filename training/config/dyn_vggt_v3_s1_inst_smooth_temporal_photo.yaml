@@ -1,0 +1,186 @@
+# Dyn-VGGT v3 — Stage S1, marginal static_photo test ON TOP OF THE CONVERGED smooth_temporal run.
+#
+# NOT the §8.3 "run 4" (that would warm-start from run 1 and add all three factors at once — see
+# dyn_vggt_v3_s1_inst_photo_smooth_temporal.yaml, which converged to a NEGATIVE result: ATE
+# plateaus at ~0.21 from epoch 30 on, worse than the run-1 warm-start (0.1533) and worse than
+# smooth_temporal alone (~0.134). Root cause diagnosed from that run's Grad/depth_head logs: its
+# raw grad norm ran 20-40x larger than the gate/camera/temporal groups throughout training (and
+# grew over time, 62->111 in the smoothed average) and shares the aggregator.global_blocks[8:24]
+# trunk with gate/camera -- classic multi-task gradient interference, degrading pose and depth
+# together. That run's data is archived; do not re-derive this diagnosis, read the chat log.
+#
+# This config asks a narrower, cheaper question instead: starting from a network that has ALREADY
+# converged on gate+camera_smooth+temporal (no need to re-learn that from scratch), does ADDING
+# static_photo (GT-depth back-projection, depth_head left FROZEN -- same low-risk route as run 3)
+# help or hurt? Isolates the photo factor's marginal effect on a good baseline instead of
+# re-fighting the ~30-epoch temporal convergence every time.
+#
+# WARM-START: smooth_temporal's epoch_40 (its best/lowest full-seq ATE point, ~0.1340; epoch_30 is
+# ~0.1343, essentially tied). Model-only export (no optimizer/epoch state, so this run starts at
+# its own epoch 0 with a fresh optimizer and schedule) at
+# checkpoints/dyn_vggt_v3_s1_inst_smooth_temporal_ep40.pt, made via:
+#   torch.save(torch.load('logs/dyn_vggt_v3_s1_inst_smooth_temporal/ckpts/epoch_40.pt')['model'],
+#              'checkpoints/dyn_vggt_v3_s1_inst_smooth_temporal_ep40.pt')
+#
+# BUDGET: 20 epochs (matches run 3's original budget). static_photo's effect direction showed up
+# within 10-15 epochs in run 3's own trajectory, and temporal/smooth don't need to re-converge
+# here, so this should be a much cheaper read than the full run-4 attempt.
+#
+# Inherits everything from default.yaml; only the deltas below are specified.
+defaults:
+  - default
+  - _self_
+
+exp_name: dyn_vggt_v3_s1_inst_smooth_temporal_photo
+num_workers: 0
+accum_steps: 1
+val_epoch_freq: 1
+max_img_per_gpu: 16
+max_epochs: 20
+limit_train_batches: 3000
+
+
+data:
+  train:
+    common_config:
+      img_nums: [4, 16]
+      # Force cross-frame-consistent color jitter -- see dyn_vggt_v3_s1_inst_photo.yaml for why
+      # (this run also has loss.static_photo on, which compares raw pixel content across frames).
+      augs:
+        cojitter_ratio: 0.0
+    dataset:
+      dataset_configs:
+        - _target_: data.datasets.pointodyssey.PointOdysseyDataset
+          split: train
+          PO_DIR: ../data/train/point_odyssey
+          dynamic_source: instance
+          len_train: 10000
+        - _target_: data.datasets.tartanair.TartanAirDataset
+          TARTANAIR_DIR: ../data/train/tartanair
+          len_train: 5000
+        - _target_: data.datasets.waymo.WaymoDataset
+          WAYMO_DIR: ../data/train/waymo_processed
+          dynamic_source: raft
+          dynamic_max_frac: 0.5
+          len_train: 4000
+        - _target_: data.datasets.spring.SpringDataset
+          split: train
+          SPRING_DIR: ../data/train/spring
+          dynamic_source: raft
+          dynamic_max_frac: 0.5
+          len_train: 1000
+  val:
+    common_config:
+      img_nums: [4, 16]
+    dataset:
+      dataset_configs:
+        - _target_: data.datasets.sintel.SintelDataset
+          SINTEL_DIR: ../data/eval/sintel
+          dynamic_source: gt_flow
+
+
+logging:
+  scalar_keys_to_log:
+    train:
+      keys_to_log:
+        - loss_objective
+        - loss_gate
+        - loss_camera
+        - loss_T
+        - loss_R
+        - loss_static_photo
+        - loss_camera_smooth
+        - loss_smooth_T
+        - loss_smooth_R
+    val:
+      keys_to_log:
+        - loss_objective
+        - loss_gate
+        - loss_camera
+        - loss_static_photo
+        - loss_camera_smooth
+
+
+checkpoint:
+  save_freq: 5
+  # Always the smooth_temporal-ep40 warm-start weights (see header). launch.py's --resume flag
+  # (not this field) controls whether a launch continues its own logs/<exp>/ckpts/last.pt
+  # instead; Trainer.__init__ refuses to start if the two disagree.
+  resume_checkpoint_path: checkpoints/dyn_vggt_v3_s1_inst_smooth_temporal_ep40.pt
+
+
+loss:
+  # gate + camera + camera_smooth (inherited, already converged) + static_photo (the new factor).
+  # depth_head stays frozen -> no L_depth needed, same low-risk GT-depth route as run 3.
+  camera:
+    weight: 5.0
+    loss_type: "l1"
+    gamma: 0.6
+  depth: null
+  motion: null
+  flow: null
+  reproj: null
+  tsmooth: null
+  gate:
+    weight: 1.0
+    patch_size: ${patch_size}
+  static_photo:
+    weight: 3.0
+    huber_delta: 0.1
+    dyn_thresh: 0.5
+  camera_smooth:
+    weight: 3.0
+    weight_trans: 1.0
+    weight_rot: 1.0
+    gamma: 0.6
+
+
+optim:
+  optimizer:
+    lr: 3e-5
+  # Same unfreeze scope as smooth_temporal: base + temporal_blocks. depth_head stays frozen --
+  # that's exactly the interference source diagnosed out of the full run-4 attempt.
+  frozen_module_names:
+      - "*aggregator.patch_embed*"
+      - "*aggregator.frame_blocks*"
+      # global_blocks 0..7 (indices 0-7) are frozen; 8..23 are trainable.
+      - "*aggregator.global_blocks.[0-7]*"
+      - "*depth_head*"
+      # temporal_blocks intentionally NOT frozen -- inherited trainable from smooth_temporal.
+      # point_head / motion_head / flow_head do not exist in this model config → omit.
+  gradient_clip:
+    configs:
+      - module_name: ["aggregator.gate_predictor", "aggregator.global_blocks", "camera_head"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["aggregator.temporal_blocks"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["aggregator.camera_token", "aggregator.register_token"]
+        max_norm: 1.0
+        norm_type: 2
+  options:
+    lr:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.CompositeParamScheduler
+          schedulers:
+            - _target_: fvcore.common.param_scheduler.LinearParamScheduler
+              start_value: 1e-8
+              end_value: 3e-5
+            - _target_: fvcore.common.param_scheduler.CosineParamScheduler
+              start_value: 3e-5
+              end_value: 1e-8
+          lengths: [0.05, 0.95]
+          interval_scaling: ['rescaled', 'rescaled']
+
+
+model:
+  enable_temporal: True
+  enable_motion: False
+  enable_flow: False
+  enable_gate: True
+  gate_block_iter: 7
+
+
+distributed:
+  find_unused_parameters: True

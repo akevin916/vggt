@@ -1,0 +1,205 @@
+# Dyn-VGGT v3 — Stage S1, ego-flow reprojection run (plan: MonST3R flow-term port).
+#
+# base = run 2 (dyn_vggt_v3_s1_inst_smooth_temporal, the current best lineage) + TWO coupled
+# changes that cannot be separated: (a) L_ego_flow, MonST3R's disparity-form ego-flow geometry
+# scored against the GT-derived ego-flow, and (b) an unfrozen depth_head, because predicted
+# depth is half of that geometry. loss.depth is turned on as the depth anchor.
+#
+# WHAT THIS IS NOT: the target is GT-derived, not RAFT. MonST3R's RAFT target is an observation
+# that does not know the GT — that independence is its entire value under test-time optimization.
+# With a GT target this is a pixel-space, disparity-weighted restatement of pose+depth error.
+# Do not describe this run as a MonST3R flow-loss port (docs/monst3r_loss_diff.md).
+#
+# EVIDENCE STATUS — READ BEFORE QUOTING ANY NUMBER AT THIS RUN:
+# the flow_loss_probe / flow_pose_headroom results (docs/table.md table 5) scored everything
+# against RAFT. They do NOT transfer to a GT-derived target: the RAFT floor (~0.09 px) becomes
+# exactly 0, and the "-5.7% ATE ceiling / minimising the residual worsens ATE" finding described
+# a residual that mixed in RAFT error, which this one does not. Baseline for THIS residual comes
+# from diag/ego_flow_residual.py, which calls the loss itself.
+# What does still hold: the training-noise band is +-0.02 ATE (+-13%, docs/table.md gap #7), so a
+# small ATE move stays uninterpretable; and depth_head has overfit before when unfrozen.
+#   -> read RPE-trans (ours 0.0673 vs MonST3R 0.0440) and depth AbsRel alongside ATE.
+#
+# WARM-START: run 2's epoch_30.pt (the ~0.134 plateau). NOT last.pt — that checkpoint's 0.125
+# was a windowed-eval artifact and is void (see project notes).
+#
+# PAIRED RUN — READ WITH dyn_vggt_v3_s1_inst_depththaw.yaml. That config is identical except
+# `loss.ego_flow: null`, so:
+#     this run - depththaw        = the contribution of L_ego_flow
+#     depththaw - run2 ep30       = the contribution of thawing depth_head + L_depth
+# Neither number exists without the other run. Do not change one config without the other.
+#
+# SCHEDULE — 20 epochs at peak LR 1e-5, deliberately NOT run 2's 50 @ 3e-5. Run 2's shape (ep20
+# 0.180, WORSE than its 0.1533 start, recovering to 0.1343 by ep30) is mostly the LR schedule
+# knocking a warm start off its converged point and annealing back; its LR halves exactly over
+# ep20->ep30. Two reasons not to repeat it: (1) run 2 also had newly-unfrozen temporal_blocks at
+# gamma=0 identity that had to learn a pathway from scratch, whereas this run adds NO new
+# parameters (ego_flow has none, depth_head is pretrained); (2) a lower peak LR keeps the model
+# near the plateau, so the effect of the new term shows as a trend instead of a dip-and-recover.
+# It also directly mitigates the depth_head risk: run 4's failure was gradients of median 50 /
+# max 1561 against a clip of 1.0, i.e. every step pinned at the clip's fixed length — a third of
+# the LR is a third of that step. Cost: the schedule differs from run 2, so `depththaw - run2`
+# carries that difference; `this - depththaw` does not.
+# If the epoch curve is still clearly descending at ep20, RERUN at 40 epochs. Do not resume:
+# max_epochs sets the cosine length, so by ep20 the LR is ~1e-8 and resuming either does nothing
+# or triggers a second warmup that scrambles the trajectory.
+defaults:
+  - dyn_vggt_v3_s1_inst_smooth_temporal
+  - _self_
+
+exp_name: dyn_vggt_v3_s1_inst_egoflow
+max_epochs: 20
+
+
+# Channel B every epoch: 20 points is what makes "trend vs noise" readable at all, given the
+# +-0.02 ATE noise band. This is also the only pose signal aligned with the reported metric.
+pose_eval:
+  enabled: true
+  every_n_epochs: 1
+
+
+logging:
+  scalar_keys_to_log:
+    train:
+      keys_to_log:
+        - loss_objective
+        - loss_gate
+        - loss_camera
+        - loss_T
+        - loss_R
+        - loss_camera_smooth
+        - loss_smooth_T
+        - loss_smooth_R
+        - loss_ego_flow
+        - loss_ego_flow_kept     # per-pixel keep rate; a drop here means outlier rejection is biting
+        - loss_ego_flow_pairs    # usable frame pairs per step; 0 would mean the term is inert
+        - loss_conf_depth
+        - loss_reg_depth
+        - loss_grad_depth
+    val:
+      keys_to_log:
+        - loss_objective
+        - loss_gate
+        - loss_camera
+        - loss_camera_smooth
+        - loss_ego_flow
+        - loss_reg_depth         # depth_head is unfrozen for the first time — watch for overfit
+
+
+checkpoint:
+  save_freq: 5
+  # run 2's epoch_30.pt, WEIGHTS ONLY — produced with
+  #   python extract_weights.py --src checkpoints/dyn_inst_temporal_smooth.pt \
+  #                             --dst checkpoints/dyn_inst_temporal_smooth_weights.pt
+  # (dyn_inst_temporal_smooth.pt is verified byte-identical, md5 67bbebf4..., to
+  # logs/dyn_vggt_v3_s1_inst_smooth_temporal/ckpts/epoch_30.pt — NOT last.pt, a08b5324...)
+  #
+  # The strip is REQUIRED, not hygiene. A full trainer checkpoint carries prev_epoch=29, so
+  # `while self.epoch < self.max_epochs` (trainer.py:495) starts at 30 and a 20-epoch config
+  # exits immediately having trained nothing — silently, with exit code 0. And the LR schedule
+  # is driven by absolute epoch (`where = exact_epoch / max_epochs`, trainer.py:821), so even
+  # with max_epochs raised the cosine would resume 60% through instead of running the fresh
+  # 20-epoch schedule this run is designed around. Stripping also drops run 2's Adam moments,
+  # which were accumulated over a different trainable set and a different objective.
+  # Flip to null after epoch 1 so restarts self-heal from this run's own last.pt.
+  resume_checkpoint_path: checkpoints/dyn_inst_temporal_smooth_weights.pt
+
+
+loss:
+  # Depth supervision ON: it is the anchor that keeps the ego-flow term from buying residual with
+  # depth distortion. Weights are default.yaml's.
+  depth:
+    weight: 1.0
+    gradient_loss_fn: "grad"
+    valid_range: 0.98
+  ego_flow:
+    # Measured on the warm-start ckpt with diag/ego_flow_residual.py (outputs/
+    # dyn_vggt_v3_s1_inst_smooth_temporal/ego_flow_residual/results.json), then mixed by the
+    # sampling ratios of the four training sets (PO 10000 / TartanAir 5000 / Waymo 4000 /
+    # Spring 1000):
+    #   E[loss_ego_flow] = 0.869      E[loss_camera * 5.0] = 11.25
+    #   weight = 0.08 * 11.25 / 0.869 = 1.04   -> this term is ~8% of the objective.
+    # CALIBRATED FROM A REAL TRAINING STEP, not from diag/ego_flow_residual.py. That script's
+    # loss_camera column is invalid as a reference: it scores clips straight from the dataset,
+    # which never pass through trainer._process_batch's scale normalisation, so GT translations
+    # are in metres while the predictions are in VGGT's normalised scale and compute_camera_loss
+    # measures a unit mismatch. Its per-dataset values (PO 5.67 / Waymo 4.70 / TartanAir 29.6 /
+    # Sintel 36.8) sort by scene scale in metres, which is the tell.
+    # Measured over 21 steps of dyn_vggt_v3_s1_inst_egoflow_smoke (weighted contributions):
+    #     loss_camera 0.0087 x5 = 0.0434 (4.2%)      loss_gate 0.1385 (13.5%)
+    #     loss_camera_smooth 0.0039 (0.4%)           loss_depth 0.0502 (4.9%)
+    #     loss_ego_flow 0.7933 x1.0 = 0.7933  -> 77.1% of the objective at weight 1.0
+    # Real loss_camera in this fine-tuning regime is 0.0087, three orders of magnitude below
+    # what the probe reported. Solving w * 0.7933 = (0.08/0.92) * 0.236 gives w = 0.026.
+    weight: 0.03
+    beta: 1.0                # MonST3R's smooth-L1 transition, in pixels
+    # MonST3R's 50 is a no-op here: measured keep rate is 1.000 on every dataset, i.e. nothing is
+    # ever rejected, while the p99 residual reaches 21 px (Waymo). smooth-L1 is LINEAR past 1 px,
+    # so one 21-px outlier weighs as much as twenty 1-px errors and the tail steers the gradient.
+    # 5.0 keeps 0.88-0.98 of pixels — it trims that tail and nothing else.
+    per_pixel_thre: 5.0
+    # Far-pixel cap — OFF, because the hypothesis behind it was falsified by measurement.
+    # The idea was that Waymo's 50%-of-objective share came from distant pixels (no translation
+    # signal, worst predicted depth). The sweep says otherwise: Waymo's share is 51/51/51/52%
+    # at x10/x5/x3/x2 — completely unmoved — while Spring got WORSE (21% -> 33% at x3). The
+    # residual therefore lives in NEAR pixels, which is where large disparity amplifies the
+    # translation term. That is the signal we want, so cutting far pixels only removes good
+    # rotation evidence. Left implemented and switchable; do not enable without new evidence.
+    max_depth_ratio: null
+    # Build the GT ego-flow from a GT that has been round-tripped through the pose encoding.
+    # Without this the term carries a 0.061 px floor it can never reach: the dataset's GT
+    # rotations are off SO(3) by 5e-4 (float32 drift through crop/resize/rotate) and the
+    # model's quaternion cannot represent that. L_cam does not have this problem because it
+    # compares in encoding space; this makes the pixel-space term consistent with it.
+    target_from_pose_encoding: True
+    max_dt: 5                # matches the gap-5 basis of dynmask_inst
+    bidirectional: True
+    # Keep the mask ON. The prediction that a GT-derived target makes it inert is FALSIFIED by
+    # measurement: dropping it raises the residual by 65% on Sintel and 24% on Spring. The reason
+    # is on the prediction side, not the target side — predicted depth is markedly worse on moving
+    # objects, so those pixels inject error regardless of what the target contains.
+    use_dynamic_mask: True
+
+
+optim:
+  # run 2's freeze list MINUS depth_head. Everything else identical so attribution vs run 2 holds
+  # for the (ego_flow + depth) factor as a pair.
+  frozen_module_names:
+      - "*aggregator.patch_embed*"
+      - "*aggregator.frame_blocks*"
+      - "*aggregator.global_blocks.[0-7]*"
+      # depth_head intentionally NOT frozen here — predicted depth is half of the ego-flow.
+  gradient_clip:
+    configs:
+      - module_name: ["aggregator.gate_predictor", "aggregator.global_blocks", "camera_head"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["aggregator.temporal_blocks"]
+        max_norm: 1.0
+        norm_type: 2
+      # Newly unfrozen this run — own entry so its grad-norm is logged separately and can be
+      # tightened without touching the camera path.
+      - module_name: ["depth_head"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["aggregator.camera_token", "aggregator.register_token"]
+        max_norm: 1.0
+        norm_type: 2
+  # Peak LR 1e-5 instead of run 2's 3e-5 — see the SCHEDULE note in the header. Both the
+  # optimizer's base lr and the scheduler endpoints have to move together; the scheduler is what
+  # actually drives the value, the optimizer lr only matters before the first step.
+  optimizer:
+    lr: 1e-5
+  options:
+    lr:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.CompositeParamScheduler
+          schedulers:
+            - _target_: fvcore.common.param_scheduler.LinearParamScheduler
+              start_value: 1e-8
+              end_value: 1e-5
+            - _target_: fvcore.common.param_scheduler.CosineParamScheduler
+              start_value: 1e-5
+              end_value: 1e-8
+          lengths: [0.05, 0.95]
+          interval_scaling: ['rescaled', 'rescaled']
