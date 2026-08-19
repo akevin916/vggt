@@ -47,9 +47,14 @@ python 端走 `training/data/paths.py` 的 `data_path("train", "point_odyssey")`
 
 三個目錄各有明確角色，**新增檔案前先確認放哪**：
 
-- `training/eval_utils/` —— **純 library，不放 argparse 進入點**。`vggt_infer.py`、`paths.py`、`metrics_pose.py`、`metrics_depth.py`、`metrics_val.py`（trainer 直接依賴）、`gate_common.py`、`gate_vis.py`。
-- `training/benchmark/` —— **要寫進論文的數字**。進入點契約要穩定（ckpt 進、json 出、CLI 參數別亂改名）。目前只有 `eval_sintel.py`（Sintel pose+depth 主表）。
-- `training/diag/` —— **中間探索/找問題的工具**，壞掉或砍掉不影響論文：`gate_bias_ablation.py`（`--dataset sintel|po`；Sintel 可加 `--report_dynamic_fraction`）、`gate_quality.py`（gate AUC/F1）、`run.sh`（×3/×10 temperature sweep）。視覺化一律放 `diag/vis/`：`error_growth.py`（per-frame ATE，多 gate-mode 疊圖 —— **chunk_size 必須 ≥ 序列長度**，否則 `infer_sequence_chunked` 會切成獨立 pass 把 error 灌大）、`trajectory.py`、`gate.py`、`gate_temporal.py`、`gate_gif.py`、`train_curves.py`。
+- `training/eval_utils/` —— **純 library，不放 argparse 進入點**。`vggt_infer.py`（含 `infer_sequence_chunked` 與 Sim3 拼接 `infer_sequence_stitched`）、`paths.py`、`metrics_pose.py`（全序列 ATE + AF-SfMLearner snippet ATE）、`metrics_depth.py`、`metrics_val.py`（trainer 直接依賴）、`gate_common.py`、`gate_vis.py`、`warp_psnr.py`、`media_io.py`、`ply_io.py`。
+- `training/benchmark/` —— **要寫進論文的數字**。進入點契約要穩定（ckpt 進、json 出、CLI 參數別亂改名）：`eval_sintel.py`（Sintel pose+depth 主表）、`eval_scared.py`（SCARED，對齊 EndoSfM3D/AF 協定）、`eval_lesion.py` / `eval_gastric.py`（私人資料集）、`eval_monst3r_lesion.py` / `eval_monst3r_gastric.py`（MonST3R 對照）。
+- `training/diag/` —— **中間探索/找問題的工具**，壞掉或砍掉不影響論文。2026-08-19 大整理後只剩 8 支，每支對應一個明確問題：
+  - `gate_eval.py` —— gate 的**唯一**評估入口（合併了舊的 `gate_quality.py` + `gate_bias_ablation.py`）。`--metrics quality`（AUC/F1/calibration，跟 GT mask 比準不准）、`--metrics pose`（`off`/`predicted`/`oracle`/`predicted_xT` 的 ATE，看兌現到相機沒有）、預設兩者都跑並共用同一次 forward。`--dataset sintel|po`，Sintel 可加 `--report_dynamic_fraction`。
+  - `stitch_error.py` —— Sim3 拼接長序列本身貢獻多少 ATE（拼接數字進表前必跑）。
+  - `pnp_pose.py` —— 拿 point head + PnP-RANSAC 算 pose，跟 camera head 比。
+  - 視覺化一律放 `diag/vis/`：`trajectory.py`（GT vs 兩個 ckpt 的軌跡形狀）、`gate_gif.py`（整段序列的 σ(g) 動畫，**絕對 0..1 色階**）、`pair_grid.py`（2×2 影片：原圖 / MonST3R / VGGT-1B / Dyn-VGGT）、`timeline.py`（重建隨時間累積）、`train_curves.py`（讀 `log.txt` 畫 loss/metric 曲線）。
+  - **chunk_size 陷阱**：任何跨幀指標都必須整段一次 forward（`chunk_size=0`）。獨立 chunk 拼接會讓接縫主宰 ATE 且數字不再隨模型變化 —— 權威說明寫在 `eval_utils/vggt_infer.infer_sequence_chunked` 的 docstring。
 
 搬家規則：diag → benchmark 的時機是**你決定那個數字要進論文的那一刻**，不是等它「看起來穩了」。
 

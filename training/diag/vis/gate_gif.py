@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Animated RGB | m_geo_patch | g | overlay GIF, one per Sintel sequence, all frames.
 
-Same panel layout as eval_utils.gate_vis.save_sintel_panel (used by diag/vis/gate.py), but stitched
-into a GIF across the WHOLE sequence instead of a handful of saved PNG frames -- lets you scrub
-through gate behaviour over time and spot exactly which frames correspond to the ATE spikes found
-by vis_error_growth.py (e.g. cave_4's last few frames, temple_3's frame ~30-38).
+Panels are built here from eval_utils.gate_vis.colorize_map and stitched into a GIF across the
+WHOLE sequence, so you can scrub through gate behaviour over time and see which frames the ATE
+spikes sit on (e.g. cave_4's last few frames, temple_3's frame ~30-38). sigma(g) is colorized on
+an ABSOLUTE 0..1 scale, so brightness is comparable across frames, sequences and checkpoints.
 
-Uses a single whole-sequence forward pass (no chunking) for gate_logits, consistent with the
-chunk_size fix from vis_error_growth.py.
+Uses a single whole-sequence forward pass (no chunking) for gate_logits -- see
+eval_utils.vggt_infer.infer_sequence_chunked for why chunking is fatal to anything cross-frame.
 """
 
 from __future__ import annotations

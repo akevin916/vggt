@@ -22,16 +22,10 @@ GATE_BIAS_ABLATION = "gate_bias_ablation"
 GATE_BIAS_ABLATION_PO = "gate_bias_ablation_po"
 GATE_QUALITY = "gate_quality"
 PNP_POSE = "pnp_pose"
-VIS_GATE = "vis_gate"
-ERROR_GROWTH = "error_growth"
 TRAJECTORY = "trajectory"
-GATE_TEMPORAL = "gate_temporal"
 GATE_GIF = "gate_gif"
-POINTCLOUD_GT = "pointcloud_gt"
 POINTCLOUD_EXPORT = "pointcloud_export"
 TRAIN_CURVES = "train_curves"
-FLOW_LOSS_PROBE = "flow_loss_probe"
-EGO_FLOW_RESIDUAL = "ego_flow_residual"
 
 
 def _join_path_parts(parts: list[str]) -> str:

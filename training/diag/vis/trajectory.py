@@ -108,9 +108,13 @@ def main():
     model_a = load_vggt_for_eval(args.ckpt_a, device=args.device)
     model_b = load_vggt_for_eval(args.ckpt_b, device=args.device)
 
-    infer_kw = {"device": args.device}
-    if args.chunk_size > 0:
-        infer_kw["chunk_size"] = args.chunk_size
+    # chunk_size=0 -> one pass over the whole sequence. Must be an explicit
+    # len(rgb_paths): infer_sequence_chunked defaults to 32 and would silently split
+    # longer sequences into unaligned independent passes (see infer_sequence_chunked).
+    infer_kw = {
+        "device": args.device,
+        "chunk_size": args.chunk_size if args.chunk_size > 0 else len(rgb_paths),
+    }
 
     for seq in seqs:
         rgb_paths = load_sintel_rgb_paths(sintel_root, seq)[: args.max_frames]

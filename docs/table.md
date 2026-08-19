@@ -113,7 +113,7 @@ gate 前向 bug 修正 = commit `e064087`（2026-07-09 12:17）。**修正是 co
   **ep30 之後平台化在 0.134~0.136（帶寬 ±0.002）** —— 「晚期單調下降、仍在訓練」的敘述已被否證，**沒有「再訓久一點就追上 MonST3R」的空間**。
 - **ep40 的 ATE（0.1340）與 ep30（0.1343）看似平手，但 ATE(12) 差 19%（0.0597 vs 0.0500）** → ep40 的持平是靠 `cave_2`/`temple_3` 兩個離群序列改善換來的，其餘 12 個序列反而變差。**取 `ep30` 為此 run 的代表 ckpt。**
 - （`best_loss.pt` full-seq ATE 0.1344 ≈ ep30，屬同一平台，非獨立資訊。）
-- ⚠️ **這四列的 checkpoint 選擇要看清楚 —— windowed `best.pt` 不可信**：這些 run `pose_eval.enabled=false`，`best.pt` 由 noisy windowed val ATE（channel A，~0.017 scale）選，與 full-seq 不對齊。`smooth_temp` 的 windowed `best.pt`（ep17）full-seq ATE = **0.1651**，遠差於真正最佳的 `epoch_30`（0.1343，差 23%）。**要用這條線一律取 `epoch_30.pt`，不要用 `best.pt`，也不要用 `last.pt`（=ep50，ATE(12) 較差）。** 全 ckpt 的 full-seq 掃描見 `outputs/<run>/eval_sintel/<ckpt>/results.json`（script `training/run.sh`）。
+- ⚠️ **這四列的 checkpoint 選擇要看清楚 —— windowed `best.pt` 不可信**：這些 run `pose_eval.enabled=false`，`best.pt` 由 noisy windowed val ATE（channel A，~0.017 scale）選，與 full-seq 不對齊。`smooth_temp` 的 windowed `best.pt`（ep17）full-seq ATE = **0.1651**，遠差於真正最佳的 `epoch_30`（0.1343，差 23%）。**要用這條線一律取 `epoch_30.pt`，不要用 `best.pt`，也不要用 `last.pt`（=ep50，ATE(12) 較差）。**
 - **`photo` 越訓越差**：full-seq 最佳 0.1583（=`ep10`）**比它自己的 warm-start 起點 0.1533 還差**，且 ep10→ep20 一路劣化（static-photo loss 傷 pose）。
 - **`photo_smooth_temp` 比 base 還爛**（0.1743，且 ep10 0.199 → last 0.207 單調惡化）→ lineage 不乾淨、確認棄用。
 - ‡ **這四列的 depth 欄（AbsRel…δ3）省略**：`eval_three_runs.sh` 用 `max_depth=70`（eval_sintel 預設），與本表 max80 協定不同（max70 裁掉遠景會使 RMSE/AbsRel 假性變好，不可同欄比）。pose 欄不受 max_depth 影響，可直接比。要補齊 depth 需以 `--max_depth 80` 重評這幾個 ckpt。

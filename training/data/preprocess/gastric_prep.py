@@ -1,7 +1,7 @@
 """Turn the raw gastric clip into sequences a reconstruction model can actually use.
 
-The clip as extracted is not usable frame-by-frame, for three separate reasons found by
-``diag/inspect_private.py``:
+The clip as extracted is not usable frame-by-frame, for three separate reasons, all measured
+on the raw clip by the (since removed) ``diag/inspect_private.py``:
 
 1. **Duplicated frames.** The container runs at 60 fps but the content only updates every
    third frame, so two of every three inputs carry no new information. Feeding them

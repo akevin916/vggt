@@ -179,3 +179,65 @@ SCARED **沒有任何動態標註**，而內視鏡場景確實是動態的（組
 - **不接 gate，只當 depth/pose 監督**（config 不給 motion_mask，`ComposedDataset` 會補零，但明確不拿 SCARED 訓 gate）。
 
 在做出決定之前，loader 可以先支援 `dynamic_source: str = "none"` 並回傳全零，把介面留好。**注意全零不是「沒有標籤」而是「宣稱全部靜態」**，兩者對 `L_gate` 的意義完全不同 —— 如果決定不用 SCARED 訓 gate，正確做法是在 config 裡不啟用 gate loss，而不是餵全零標籤。
+
+---
+
+## 9. gate 在 SCARED 的實測（2026-08-18，三支工具的結論存放處）
+
+> 這三筆是**量到的數字**，來源工具（`diag/vis/gate_logit_dist.py`、`diag/gate_offset_sweep.py`、
+> `diag/scan_foreground.py`）在 2026-08-19 的整理中刪除，原始 json 留在
+> `outputs/gate_logit_dist/`、`outputs/gate_offset_sweep/`、`outputs/scan_foreground/`。
+> 記在這裡是為了不用重跑就知道發生過什麼。**解讀（第 4 點）尚未拍板。**
+
+### 9.1 `inst_g` 的 gate logit 在 SCARED 全部落在梯度死區
+
+ckpt `checkpoints/inst_g.pt`，val split，`n_frames=50`：
+
+| 序列組 | patches | mean | 中位數 | max | `g >= 0` 佔比 |
+|---|---|---|---|---|---|
+| ds2/3/4 kf3（少器械）| 26640 | −6.50 | −6.25 | **−0.98** | **0.0%** |
+| ds5/6/7 kf3（有器械）| 39960 | −5.55 | −5.41 | **−0.17** | **0.0%** |
+
+`frac_dead = 1.0`：**沒有任何一個 patch 的 logit 到得了 clamp 折點（g=0）**。attention bias 是
+`clamp(log2 − softplus(g), max=0)`，所以在這個 domain **bias 恆等於 0 —— gate 在 SCARED 的前向是
+證明性的 no-op**（這是算術，不是推論）。梯度：clamped 版本 `mean|∂bias/∂g| = 0.0`，
+拿掉 clamp 也只有 0.008 / 0.015。
+
+> 這就是 `aggregator.gate_leaky` 與 `trainer._reset_gate_head` 存在的理由 —— 兩者都是為了把 logit
+> 移出這片死區（commit `e61960a`）。
+
+### 9.2 把 logit 整體加常數 b：b≥5 之後 ATE 單調變差
+
+同一 ckpt，val 六條序列，`n_frames=50`（ATE 單位 mm）：
+
+| b | 0 | 3 | 5 | 6 | 7 | 8 | 10 |
+|---|---|---|---|---|---|---|---|
+| ATE | 1.7365 | 1.7348 | 1.7589 | 1.7914 | 1.8305 | 1.8853 | 2.2036 |
+| `frac_active` | 0.0% | 6.0% | 35.4% | 54.2% | 70.8% | 83.1% | 95.7% |
+
+b=3（只有 6% patch 越過折點）與 b=0 沒有差別（−0.1%，遠在噪聲內）；**b=5 起 ATE 隨 b 單調上升，
+b=10 時 +26.9%**。也就是說：把 gate 的排序直接當遮罩用，遮得越多 pose 越差。
+
+### 9.3 SCARED 大部分序列其實**有**器械 —— 與原本的假設相反
+
+`scan_foreground.py` 用「低飽和、非暗」偵測金屬器械，掃過 train/val 全部 35 條序列
+（`sat_thr=60`、`val_thr=40`、blob ≥ 2% 畫面算命中）：
+
+- **23/35 條序列有超過一半的幀命中**，其中 11 條是 100%
+- 最高：`dataset_6/keyframe_3`（blob 最大 54.8%、平均 23.2%）、`dataset_7/keyframe_4`（43.0% / 15.8%）
+- 真正乾淨的只有 `dataset_1/*`、`dataset_3/{1,3,4}`（blob_max ≤ 0.021，命中 0%）
+
+**這推翻了「SCARED 沒有獨立運動前景所以 gate 沒東西可 gate」的原假設。** 注意偵測器是啟發式的，
+反光同樣是低飽和高亮度（腳本用形態學開運算濾小塊），所以這是上界而非精確器械面積。
+
+### 9.4 待拍板的解讀
+
+9.1（gate 前向恆為 no-op）與 9.3（場景其實有器械）合起來，排除了「gate 沒作用是因為沒東西可 gate」。
+剩下兩個競爭解釋，**都還沒驗證**：
+
+1. gate 的**排序**在內視鏡上就是錯的（在 Sintel 上學到的「動態」特徵遷不過來），9.2 的單調變差是直接證據；
+2. 排序是對的但**校準**偏掉，而 9.2 的變差來自「器械其實對 pose 有用」（內視鏡低視差，遮掉任何有紋理
+   的區域都會傷 pose，`docs/table.md` 的光流觀測度那條線）。
+
+要分開這兩個，需要器械的 GT 遮罩（或人工標幾十幀）拿去算 gate 的 AUC —— 也就是 §8 仍未決的
+`motion_mask` 問題。

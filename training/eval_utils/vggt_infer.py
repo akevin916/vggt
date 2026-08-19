@@ -203,7 +203,7 @@ def infer_sequence_chunked(
     32+18 and gave ATE 2.53 instead of 0.057 -- and, because the seam dwarfs everything
     else, the number stopped depending on the model at all. Callers that want whole-
     sequence geometry must pass 0 (or len(image_paths)); leaving it unset silently picks
-    the 32 default. See CLAUDE.md's chunk_size warning for diag/vis/error_growth.py.
+    the 32 default. This docstring is the authoritative statement of that trap.
     """
     if chunk_size <= 0 or len(image_paths) <= chunk_size:
         return infer_sequence(model, image_paths, device=device, gate_logits_override=gate_logits_override)
