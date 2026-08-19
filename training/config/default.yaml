@@ -21,11 +21,20 @@ limit_val_batches: 200
 # See trainer.val_epoch / trainer.run_pose_eval.
 pose_eval:
   enabled: true
+  dataset: sintel     # sintel | scared -- which benchmark channel B scores the live model on
   every_n_epochs: 1
+  # --- dataset: sintel ---
   sintel_root: null   # null -> auto-detect from repo data/ (eval.sintel_io.resolve_sintel_root)
   seq_list: null      # null -> all Sintel eval sequences
   chunk_size: 0       # 0 = full sequence (required: chunking inflates ATE, see CLAUDE.md)
   max_depth: 80.0
+  # --- dataset: scared (benchmark/eval_scared.py; overrides max_depth, which is mm here) ---
+  # scared_root: null # null -> data_path("train", "scared")
+  # split: val        # the SAME split channel A validates on -- SCARED has no separate
+  #                   # eval set, and a loss number and a metric number over identical data
+  #                   # is exactly what makes them comparable here.
+  # n_frames: 50      # frames per keyframe, ONE forward pass (no chunking)
+  # gate_mode: predicted
 
 
 data:

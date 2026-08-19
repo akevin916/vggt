@@ -204,6 +204,10 @@ class Trainer:
             self._load_resuming_checkpoint(get_resume_checkpoint(self.checkpoint_conf.save_dir))
         elif self.checkpoint_conf.resume_checkpoint_path is not None:
             self._load_resuming_checkpoint(self.checkpoint_conf.resume_checkpoint_path)
+            # Warm start ONLY -- never on --resume, where it would wipe the run's own progress
+            # every time it restarts.
+            if getattr(self.checkpoint_conf, "reset_gate_head", False):
+                self._reset_gate_head()
 
         # Wrap the model with DDP
         self._setup_ddp_distributed_training(distributed, device)
@@ -247,6 +251,33 @@ class Trainer:
             timeout=timedelta(minutes=distributed_conf.timeout_mins)
         )
         self.rank = dist.get_rank()
+
+    def _reset_gate_head(self):
+        """Zero the GatePredictor's output layer, sending g back to 0 for every patch.
+
+        Why this is nearly free: on a domain where the warm-started gate already sits far
+        below the clamp kink (SCARED: median logit -5.4, max -0.17), every bias is ALREADY
+        exactly 0, so zeroing the head leaves the forward pass unchanged -- while moving the
+        logits from a region with no usable gradient to the one point where it is largest
+        (d bias/dg = -0.5). Only the 257-number output projection is touched; the 262k-parameter
+        feature layer underneath is kept, so the gate relearns what to suppress, not how to see.
+
+        Pointless without optim.gate_pose_grad: with the bias detached there is no gradient to
+        collect at g=0 either.
+        """
+        agg = self.model.aggregator
+        gp = getattr(agg, "gate_predictor", None)
+        if gp is None:
+            raise ValueError("checkpoint.reset_gate_head set but the model has no gate_predictor")
+        with torch.no_grad():
+            gp.linear2.weight.zero_()
+            gp.linear2.bias.zero_()
+        if not getattr(agg, "gate_pose_grad", False):
+            logging.warning(
+                "reset_gate_head with gate_pose_grad=False: the gate is now a no-op AND still "
+                "has no gradient path, so it can never learn anything back."
+            )
+        logging.info("Reset gate_predictor output layer to zero (g == 0 for every patch).")
 
     def _load_resuming_checkpoint(self, ckpt_path: str):
         """Loads a checkpoint from the given path to resume training."""
@@ -577,18 +608,18 @@ class Trainer:
 
     @torch.no_grad()
     def run_pose_eval(self) -> Optional[float]:
-        """Deterministic full-sequence Sintel pose eval on the live model (MonST3R channel B).
+        """Deterministic full-sequence pose eval on the live model (MonST3R channel B).
 
-        Scores the in-memory model on fixed, full-length Sintel sequences (no random
+        ``pose_eval.dataset`` picks the benchmark: ``sintel`` (default) or ``scared``.
+        Scores the in-memory model on fixed, full-length sequences (no random
         [4,16] windowing, no re-sampling across epochs) so the resulting ATE is a stable
         trend/selection signal. Returns the mean ATE (rank 0 computes; broadcast to all
         ranks so best.pt selection stays consistent). Returns None on failure.
         """
         from types import SimpleNamespace
 
-        from benchmark.eval_sintel import evaluate as eval_sintel_evaluate
-
         cfg = self.pose_eval_conf
+        dataset = str(cfg.get("dataset", "sintel")).lower()
         model = self.model.module if isinstance(
             self.model, torch.nn.parallel.DistributedDataParallel
         ) else self.model
@@ -604,21 +635,47 @@ class Trainer:
                 out_dir = os.path.join(
                     self.logging_conf.log_dir, "pose_eval", f"epoch_{int(self.epoch) + 1}"
                 )
-                args = SimpleNamespace(
-                    ckpt=f"live_epoch_{int(self.epoch) + 1}",
-                    sintel_root=cfg.get("sintel_root", None),
-                    out_dir=out_dir,
-                    seq_list=cfg.get("seq_list", None),
-                    device=self.device if isinstance(self.device, str) else "cuda",
-                    chunk_size=int(cfg.get("chunk_size", 0) or 0),
-                    max_depth=float(cfg.get("max_depth", 80.0)),
-                )
-                results = eval_sintel_evaluate(args, model=model)
+                device = self.device if isinstance(self.device, str) else "cuda"
+                if dataset == "scared":
+                    # SCARED runs have no Sintel-shaped eval: same val split as channel A,
+                    # but scored as full contiguous sequences with sim3-aligned ATE.
+                    from benchmark.eval_scared import evaluate as eval_evaluate
+                    from data.paths import data_path
+
+                    args = SimpleNamespace(
+                        ckpt=f"live_epoch_{int(self.epoch) + 1}",
+                        scared_root=cfg.get("scared_root", None) or data_path("train", "scared"),
+                        split=cfg.get("split", "val"),
+                        # plain list, not OmegaConf's ListConfig: it reaches json.dump
+                        # in eval_scared.evaluate, which cannot serialise it.
+                        seqs=list(cfg["seqs"]) if cfg.get("seqs", None) else None,
+                        n_frames=int(cfg.get("n_frames", 50)),
+                        max_depth=float(cfg.get("max_depth", 200.0)),
+                        no_depth=bool(cfg.get("no_depth", False)),
+                        gate_mode=cfg.get("gate_mode", "predicted"),
+                        img_size=int(cfg.get("img_size", 518)),
+                        out_dir=out_dir,
+                        device=device,
+                    )
+                else:
+                    from benchmark.eval_sintel import evaluate as eval_evaluate
+
+                    args = SimpleNamespace(
+                        ckpt=f"live_epoch_{int(self.epoch) + 1}",
+                        sintel_root=cfg.get("sintel_root", None),
+                        out_dir=out_dir,
+                        seq_list=cfg.get("seq_list", None),
+                        device=device,
+                        chunk_size=int(cfg.get("chunk_size", 0) or 0),
+                        max_depth=float(cfg.get("max_depth", 80.0)),
+                    )
+                results = eval_evaluate(args, model=model)
                 ate = results.get("pose", {}).get("mean", {}).get("ate", None)
                 if ate is not None and ate > 0:
                     ate_val[0] = float(ate)
                 logging.info(
-                    "Pose eval (full-seq Sintel) at epoch %s: ATE=%.4f", self.epoch, ate_val.item()
+                    "Pose eval (full-seq %s) at epoch %s: ATE=%.4f",
+                    dataset, self.epoch, ate_val.item()
                 )
                 # Channel B is now the sole validation signal -> log its full-sequence mean
                 # metrics to TensorBoard under the same validation/{pose,depth}_* tags (drop-in
@@ -1018,6 +1075,18 @@ class Trainer:
         
         # Combine all data for logging
         log_data = {**y_hat, **loss_dict, **batch}
+
+        # Gate telemetry. Kept OUT of loss_dict so it can never reach the backward pass.
+        # Without these two numbers a gate_pose_grad run is unreadable: the ATE curve cannot
+        # distinguish "the gate learned a useful mask" from "the gate switched itself off",
+        # and switching off is the outcome the pose loss is known to prefer here.
+        #   gate_g_median   -- where the logits sit; the clamp kink is at 0
+        #   gate_frac_active-- fraction of patches past that kink, i.e. actually suppressed
+        if "gate_logits" in y_hat and y_hat["gate_logits"] is not None:
+            with torch.no_grad():
+                _g = y_hat["gate_logits"].detach().float()
+                log_data["gate_g_median"] = _g.median()
+                log_data["gate_frac_active"] = (_g > 0).float().mean()
 
         self._update_and_log_scalars(log_data, phase, self.steps[phase], loss_meters)
         self._log_tb_visuals(log_data, phase, self.steps[phase])

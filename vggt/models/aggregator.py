@@ -30,9 +30,14 @@ class GatePredictor(nn.Module):
 
     Takes patch tokens from the middle of the aggregator (~1/3 depth) and
     predicts a per-patch dynamic logit g ∈ ℝ.  Downstream uses:
-      1. Attention bias (detached): bias = −softplus(g) added to camera/register
-         query rows in subsequent global blocks → structural motion gating.
-      2. Loss supervision (not detached): L_gate = BCE(σ(g), m*)  where m* is
+      1. Attention bias: bias = clamp(softplus(0) − softplus(g), max=0) added to
+         camera/register query rows in subsequent global blocks → structural
+         motion gating. DETACHED BY DEFAULT, so the pose loss does not train the
+         gate; Aggregator(gate_pose_grad=True) removes the detach and makes the
+         downstream loss the gate's teacher (for domains with no mask labels).
+         Note the clamp is flat for g < 0, so even then that path carries zero
+         gradient there — see _gated_global_block_forward.
+      2. Loss supervision (never detached): L_gate = BCE(σ(g), m*)  where m* is
          the GT dynamic mask averaged to patch resolution.
 
     Zero-init on the last linear so g≡0 at training step 0, which makes the
@@ -117,6 +122,8 @@ class Aggregator(nn.Module):
         # v3: motion-gated camera aggregation
         enable_gate: bool = False,   # v3 gate predictor + gated global attention
         gate_block_iter: int = 7,    # fire gate after this 0-indexed aa-block iteration (~1/3 of 24)
+        gate_pose_grad: bool = False,  # let the downstream (pose) loss train the gate -- see below
+        gate_leaky: float = 0.0,       # >0 replaces the bias clamp with a leaky one -- see below
     ):
         super().__init__()
 
@@ -212,6 +219,20 @@ class Aggregator(nn.Module):
         # v3: motion gate predictor (§3)
         self.enable_gate = enable_gate
         self.gate_block_iter = gate_block_iter
+        # The attention bias is detached by default, so L_camera CANNOT train the gate and the
+        # only supervision is L_gate's BCE. On a domain with no dynamic annotation (SCARED)
+        # that leaves the gate untrainable, so this flag opens the path: with it, the pose loss
+        # itself is the gate's teacher. Off by default -- flipping it changes what every
+        # existing gate run means, and it is an open question whether the gate converges to
+        # anything meaningful or just degenerates into an attention-temperature knob.
+        self.gate_pose_grad = gate_pose_grad
+        # The bias clamp is flat for g < 0, so under gate_pose_grad the whole static half of
+        # the logit range returns exactly zero gradient and a patch that drifts negative can
+        # never come back. gate_leaky gives that half a slope (LeakyReLU's fix for dying
+        # ReLU), at the cost of letting confident-static patches be boosted by up to
+        # gate_leaky * log2 (0.07 at 0.1) instead of exactly 0. 0.0 keeps the hard clamp and
+        # is byte-for-byte the old behaviour.
+        self.gate_leaky = float(gate_leaky)
         if enable_gate:
             self.gate_predictor = GatePredictor(embed_dim)
         else:
@@ -438,18 +459,23 @@ class Aggregator(nn.Module):
             if gate_logits is not None:
                 # v3: gated attention — split into patch-query path (flash, no bias) and
                 # camera/register-query path (small, with per-patch-key bias).
-                gate_det = gate_logits.detach()   # detach: no gradient from pose back to gate
+                # detach unless gate_pose_grad: see __init__ for why the default is detached
+                gate_bias = gate_logits if self.gate_pose_grad else gate_logits.detach()
                 if self.training:
                     blk = self.global_blocks[global_idx]
                     _B, _S, _psi = B, S, self.patch_start_idx
 
-                    def _gated_fn(t, p):  # noqa: E306
-                        return self._gated_global_block_forward(blk, t, p, gate_det, _B, _S, _psi)
+                    def _gated_fn(t, p, g):  # noqa: E306
+                        return self._gated_global_block_forward(blk, t, p, g, _B, _S, _psi)
 
-                    tokens = checkpoint(_gated_fn, tokens, pos, use_reentrant=self.use_reentrant)
+                    # gate_bias is passed as a checkpoint ARGUMENT, not captured in the closure:
+                    # a closure tensor gets no gradient under reentrant checkpointing, which
+                    # would silently make gate_pose_grad a no-op if use_reentrant ever flips.
+                    tokens = checkpoint(_gated_fn, tokens, pos, gate_bias,
+                                        use_reentrant=self.use_reentrant)
                 else:
                     tokens = self._gated_global_block_forward(
-                        self.global_blocks[global_idx], tokens, pos, gate_det, B, S, self.patch_start_idx
+                        self.global_blocks[global_idx], tokens, pos, gate_bias, B, S, self.patch_start_idx
                     )
             else:
                 if self.training:
@@ -534,13 +560,26 @@ class Aggregator(nn.Module):
         #     confident-static patches (g<0) get bias 0 (full weight), never a positive
         #     boost. Dynamic (g→+∞) → −∞ as before; the static-vs-dynamic ordering is
         #     unchanged.
-        # The clamp has a kink at g=0, but gate_logits_det is DETACHED — no gradient flows
-        # through this bias (the gate is trained only via BCE(σ(g), m*)), so the
-        # non-smoothness is inert. The forward value stays continuous.
+        # The clamp has a kink at g=0. When the bias is detached (the default) no gradient
+        # flows through it at all, so the non-smoothness is inert. Under gate_pose_grad=True
+        # it is NOT inert: d(bias)/dg is −sigmoid(g) for g > 0 but EXACTLY 0 for g < 0, so
+        # the whole static half of the logit range is a gradient dead zone. Any patch the pose
+        # loss pushes below 0 stops receiving a direct gradient from there on, and a global
+        # slide into g < 0 is an absorbing "gate is a no-op" state. Measured, not inferred.
+        # Note the zero-init below only puts a FRESH model on the kink; a run warm-started
+        # from a trained gate (e.g. inst_g.pt, whose linear2 is far from zero) starts with
+        # some unknown fraction of patches already inside the dead zone. The forward value
+        # stays continuous either way.
         bias_key = gate_logits_det.new_zeros(B, S, P)                # [B, S, P]
-        bias_key[:, :, patch_start_idx:] = torch.clamp(
-            math.log(2.0) - F.softplus(gate_logits_det), max=0.0
-        )  # min(0, softplus(0) − softplus(g)); [B, S, P_patch] slot
+        _x = math.log(2.0) - F.softplus(gate_logits_det)
+        if self.gate_leaky > 0.0:
+            # `<=` not `<`: at x == 0 (i.e. g == 0, where a zero-init gate starts) the strict
+            # form would take the leaky branch and cut the gradient there by 1/gate_leaky --
+            # weakening the one point on the curve that was already healthy.
+            _x = torch.where(_x <= 0, _x, self.gate_leaky * _x)
+        else:
+            _x = torch.clamp(_x, max=0.0)
+        bias_key[:, :, patch_start_idx:] = _x   # [B, S, P_patch] slot
         attn_bias = bias_key.reshape(B, 1, 1, N)                     # [B, 1, 1, N]
 
         drop_p = block.attn.attn_drop.p if self.training else 0.0

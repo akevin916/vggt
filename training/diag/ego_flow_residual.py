@@ -128,6 +128,7 @@ def score_clip(model, clip, args) -> Dict:
         out = compute_ego_flow_loss(
             predictions, batch, per_pixel_thre=args.per_pixel_thre, max_dt=args.max_dt,
             dyn_thresh=args.dyn_thresh, use_dynamic_mask=use_mask,
+            use_gt_depth=args.use_gt_depth,
         )
         row[f"loss_{tag}"] = float(out["loss_ego_flow"])
         row[f"kept_{tag}"] = float(out["loss_ego_flow_kept"])
@@ -178,6 +179,13 @@ def main():
     ap.add_argument("--img_per_seq", type=int, default=16)
     ap.add_argument("--max_dt", type=int, default=5)
     ap.add_argument("--dyn_thresh", type=float, default=0.5)
+    # The mask's job depends on which depth the predicted flow uses. With predicted depth the
+    # mask removes pixels where that depth is worst (moving objects). With GT depth on both
+    # sides the object's own motion is in NEITHER flow, so the mask should be inert -- and
+    # dynamic objects are usually close, i.e. the highest-disparity, most translation-informative
+    # pixels in the frame. This flag is what makes that testable.
+    ap.add_argument("--use_gt_depth", action="store_true",
+                    help="match the loss config of dyn_vggt_v3_s1_inst_egoflow_gt")
     # Defaults to the value the training config uses, not MonST3R's 50: at 50 nothing is ever
     # rejected (measured keep rate 1.000 everywhere), so every share reported at 50 includes a
     # tail that training will not actually see.

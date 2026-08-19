@@ -145,8 +145,10 @@ class MultitaskLoss(torch.nn.Module):
         # geometry, scored against the GT-derived ego-flow instead of RAFT. Couples camera head
         # and depth head in pixel space. Needs the depth head (predicted depth is half the
         # geometry) and a depth constraint to anchor it — see compute_ego_flow_loss.
-        if self.ego_flow is not None and "pose_enc_list" in predictions and "depth" in predictions \
-                and "ids" in batch:
+        # "depth" in predictions is only required when the loss actually reads the depth head —
+        # use_gt_depth mode does not, and gating on it there would silently disable the term.
+        if self.ego_flow is not None and "pose_enc_list" in predictions and "ids" in batch \
+                and (self.ego_flow.get("use_gt_depth", False) or "depth" in predictions):
             ego_flow_dict = compute_ego_flow_loss(predictions, batch, **self.ego_flow)
             total_loss = total_loss + ego_flow_dict["loss_ego_flow"] * self.ego_flow.get("weight", 1.0)
             loss_dict.update(ego_flow_dict)
@@ -606,7 +608,8 @@ def compute_static_photo_loss(predictions, batch, huber_delta=0.1, dyn_thresh=0.
 
 def compute_ego_flow_loss(predictions, batch, beta=1.0, per_pixel_thre=50.0, dyn_thresh=0.5,
                           max_dt=5, bidirectional=True, use_dynamic_mask=True, min_valid=100,
-                          max_depth_ratio=None, target_from_pose_encoding=True, **kwargs):
+                          max_depth_ratio=None, target_from_pose_encoding=True,
+                          use_gt_depth=False, **kwargs):
     """Pixel-space ego-flow (reprojection) consistency between predicted and GT geometry.
 
     The geometry is MonST3R's flow term ported verbatim (disparity-form ego-flow, smooth-L1,
@@ -687,6 +690,25 @@ def compute_ego_flow_loss(predictions, batch, beta=1.0, per_pixel_thre=50.0, dyn
             such floor because it encodes the GT and compares in encoding space; this makes
             the pixel-space term consistent with that. Off = compare against the raw GT, i.e.
             penalise the model for not reproducing a camera it cannot represent.
+        use_gt_depth: build the PREDICTED ego-flow from GT depth instead of predicted depth.
+            Both flows then share one disparity field, the depth term cancels in the difference,
+            and the residual reduces to pure relative-pose error weighted by observability:
+
+                flow_pred - flow_gt  ~  [rotation term] + disp_gt * K (t_rel_pred - t_rel_gt)
+
+            Two things this buys. (1) No gradient reaches depth, so the term cannot buy a lower
+            residual by distorting depth to compensate a pose error — and that shortcut is not
+            hypothetical: ego-flow's translation term is `disparity * t`, so a global depth-scale
+            error is EXACTLY cancelled by a translation-scale error, and translation scale is
+            what ATE measures. (2) It needs no depth head, so depth_head stays frozen and L_depth
+            stays off, leaving this loss as the only difference from the baseline run.
+            Freezing depth_head alone would NOT close that path: train_utils/freeze.py sets
+            requires_grad=False, which stops the head's parameters from updating but not gradient
+            from flowing THROUGH it into the unfrozen aggregator trunk.
+            Scale is consistent because trainer._process_batch rescales GT extrinsics and depths
+            in lock-step to unit average distance and the model predicts in that same convention
+            (compute_camera_loss compares them directly). Residual scale error in the prediction
+            is genuine pose error and SHOULD show up here.
     """
     pose_enc = predictions["pose_enc_list"][-1]                 # (B,S,9), final refine stage
     images = batch["images"]
@@ -700,7 +722,9 @@ def compute_ego_flow_loss(predictions, batch, beta=1.0, per_pixel_thre=50.0, dyn
     # precision under bf16, and this loss is measured in pixels.
     with torch.amp.autocast("cuda", enabled=False):
         pr_extri, pr_intri = pose_encoding_to_extri_intri(pose_enc.float(), (H, W), build_intrinsics=True)
-        pr_depth = predictions["depth"][..., 0].float()          # (B,S,H,W)
+        # With use_gt_depth the depth head is not consulted at all, so this must not require it:
+        # the whole point of that mode is to run with depth_head frozen (or absent).
+        pr_depth = None if use_gt_depth else predictions["depth"][..., 0].float()   # (B,S,H,W)
         gt_extri = batch["extrinsics"].float()
         gt_intri = batch["intrinsics"].float()
         if target_from_pose_encoding:
@@ -748,8 +772,9 @@ def compute_ego_flow_loss(predictions, batch, beta=1.0, per_pixel_thre=50.0, dyn
             for off_src, off_tgt in directions:
                 s_idx, t_idx = t + off_src, t + off_tgt
 
-                pr_disp = 1.0 / pr_depth[:, s_idx].clamp(min=eps)
                 gt_disp = 1.0 / gt_depth[:, s_idx].clamp(min=eps)
+                # Same disparity on both sides -> the depth term cancels in the difference.
+                pr_disp = gt_disp if use_gt_depth else 1.0 / pr_depth[:, s_idx].clamp(min=eps)
 
                 R_pr, t_pr = relative_w2c(pr_extri[:, s_idx], pr_extri[:, t_idx])
                 R_gt, t_gt = relative_w2c(gt_extri[:, s_idx], gt_extri[:, t_idx])
@@ -800,15 +825,40 @@ def compute_ego_flow_loss(predictions, batch, beta=1.0, per_pixel_thre=50.0, dyn
     return {"loss_ego_flow": loss, "loss_ego_flow_kept": kept, "loss_ego_flow_pairs": pairs}
 
 
-def compute_camera_smooth_loss(predictions, batch, weight_trans=1.0, weight_rot=1.0, gamma=0.6, **kwargs):
+def compute_camera_smooth_loss(predictions, batch, weight_trans=1.0, weight_rot=1.0, gamma=0.6,
+                               orders=(2,), order_weights=None, **kwargs):
     """
     v3 extension: camera-trajectory smoothness regularizer (conversation notes, not yet folded
-    into dyn_vggt_method_v3.md). Penalises 2nd-order (acceleration) discontinuities in the
-    PREDICTED pose sequence — observed as visible trajectory "jumps" on hard/dynamic Sintel
-    sequences, present in native VGGT-1B too (not a v3-specific regression). Purely
-    self-referential (no GT pose used): a regularizer on the network's own output, analogous to
-    MonST3R's trajectory-smoothness prior but applied as a training loss rather than a
-    test-time optimization term.
+    into dyn_vggt_method_v3.md). Penalises k-th order discontinuities in the PREDICTED pose
+    sequence — observed as visible trajectory "jumps" on hard/dynamic Sintel sequences, present
+    in native VGGT-1B too (not a v3-specific regression). Purely self-referential (no GT pose
+    used): a regularizer on the network's own output, analogous to MonST3R's trajectory-
+    smoothness prior but applied as a training loss rather than a test-time optimization term.
+
+    ORDER (`orders` / `order_weights`). Default (2,) reproduces the original 2nd-order-only
+    behaviour exactly — that is the term that produced the current best checkpoint (run 2,
+    0.1714 -> 0.1343). Order 1 penalises the motion itself ("the camera barely moves", which is
+    MonST3R's relative_pose_loss); order 2 penalises acceleration, so constant velocity is free.
+
+    Why order 1 is worth having despite the obvious objection that it fights legitimate constant
+    motion (Waymo drives forward, TartanAir flies): the TTO line measured that a 1st-order prior
+    is the ONLY thing that substantially rescues badly-initialised sequences —
+        seq        base      2nd order     1st order
+        cave_2     0.8298    0.7483 (-10%) 0.5527 (-33%)   [with flow: 0.4600, -45%]
+        temple_3   0.4505    0.3849 (-15%) 0.1850 (-59%)   [with flow: 0.1770, -61%]
+    and that 2nd order SATURATES: its TTO weight sweep is flat (w10 0.1154 / w30 0.1128 /
+    w100 0.1134 / w300 0.1147), so no amount of 2nd-order weight buys what order 1 buys.
+    Order 1 is aggressive and needs a brake: in TTO that brake is the flow term (without it,
+    1st order blows up well-initialised sequences by up to 8.7x). In training L_cam plays that
+    role and is exact, which is why the training-side behaviour should resemble TTO's
+    "1st order + flow" column rather than its "1st order alone" column.
+    Use it ADDITIVELY (orders=(1, 2)) rather than as a replacement, and read per-sequence
+    results: order 1's value is concentrated in the few worst sequences and a mean can hide it
+    entirely.
+
+    order_weights defaults to 1.0 for every entry of `orders`. Note orders are NOT on a common
+    scale (order 1 is a velocity, order 2 an acceleration), so their weights need separate
+    calibration — measure both from a smoke run rather than assuming parity.
 
     Δt-normalization: training clips (PointOdyssey/TartanAir, get_nearby=True) sample frames
     from a local window with irregular spacing and possible duplicates (replace=True), not a
@@ -836,16 +886,41 @@ def compute_camera_smooth_loss(predictions, batch, weight_trans=1.0, weight_rot=
     ids = batch["ids"]
     B, S = ids.shape
 
-    if S < 3 or valid_frame_mask.sum() == 0:
+    orders = [int(o) for o in orders]
+    if any(o < 1 for o in orders):
+        raise ValueError(f"orders must all be >= 1, got {orders}")
+    w_order = [1.0] * len(orders) if order_weights is None else [float(w) for w in order_weights]
+    if len(w_order) != len(orders):
+        raise ValueError(f"order_weights {w_order} must match orders {orders}")
+    max_order = max(orders)
+
+    # An order-k difference needs k+1 frames (and k+1 chronologically increasing ids).
+    if S < max_order + 1 or valid_frame_mask.sum() == 0:
         zero = (pred_pose_encodings[-1] * 0).mean()
-        return {"loss_camera_smooth": zero, "loss_smooth_T": zero, "loss_smooth_R": zero}
+        out = {"loss_camera_smooth": zero, "loss_smooth_T": zero, "loss_smooth_R": zero}
+        out.update({f"loss_smooth_{c}{o}": zero for o in orders for c in ("T", "R")})
+        return out
 
     ids = ids[valid_frame_mask].float()                    # (B', S)
     dt = ids[:, 1:] - ids[:, :-1]                          # (B', S-1)
     pair_valid = dt > 0
-    accel_valid = pair_valid[:, 1:] & pair_valid[:, :-1]   # (B', S-2)
     safe_dt = dt.clamp(min=1.0).unsqueeze(-1)              # (B', S-1, 1)
 
+    # valid_of_order[k] marks the order-k differences whose k underlying frame pairs are all
+    # real (no duplicate-frame gaps). Order 1 is the pair mask itself; each further difference
+    # consumes one more element and must AND the two it was built from.
+    valid_of_order = {1: pair_valid}
+    for k in range(2, max_order + 1):
+        prev = valid_of_order[k - 1]
+        valid_of_order[k] = prev[:, 1:] & prev[:, :-1]
+
+    def _diff(x, order):
+        """x is the order-1 quantity (velocity); difference it order-1 more times."""
+        for _ in range(order - 1):
+            x = x[:, 1:] - x[:, :-1]
+        return x
+
+    per_order = {o: [0.0, 0.0] for o in orders}            # order -> [T, R] accumulated over stages
     total_smooth_T = total_smooth_R = 0
     for stage_idx in range(n_stages):
         stage_weight = gamma ** (n_stages - stage_idx - 1)
@@ -861,19 +936,25 @@ def compute_camera_smooth_loss(predictions, batch, weight_trans=1.0, weight_rot=
             quat_fixed.append(quat[:, t] * sign)
         quat_fixed = torch.stack(quat_fixed, dim=1)   # (B', S, 4)
 
-        if accel_valid.sum() == 0:
-            loss_T_stage = (T * 0).mean()
-            loss_R_stage = (quat_fixed * 0).mean()
-        else:
-            v_T = (T[:, 1:] - T[:, :-1]) / safe_dt
-            accel_T = v_T[:, 1:] - v_T[:, :-1]             # (B', S-2, 3)
-            v_R = (quat_fixed[:, 1:] - quat_fixed[:, :-1]) / safe_dt
-            accel_R = v_R[:, 1:] - v_R[:, :-1]             # (B', S-2, 4)
+        v_T = (T[:, 1:] - T[:, :-1]) / safe_dt             # (B', S-1, 3) velocity
+        v_R = (quat_fixed[:, 1:] - quat_fixed[:, :-1]) / safe_dt
 
-            mask_T = accel_valid.unsqueeze(-1).expand_as(accel_T).float()
-            mask_R = accel_valid.unsqueeze(-1).expand_as(accel_R).float()
-            loss_T_stage = (accel_T.abs() * mask_T).sum() / mask_T.sum().clamp(min=1)
-            loss_R_stage = (accel_R.abs() * mask_R).sum() / mask_R.sum().clamp(min=1)
+        loss_T_stage = loss_R_stage = 0
+        for o, w in zip(orders, w_order):
+            valid = valid_of_order[o]
+            if valid.sum() == 0:
+                d_T = (T * 0).mean()
+                d_R = (quat_fixed * 0).mean()
+            else:
+                dT, dR = _diff(v_T, o), _diff(v_R, o)
+                mask_T = valid.unsqueeze(-1).expand_as(dT).float()
+                mask_R = valid.unsqueeze(-1).expand_as(dR).float()
+                d_T = (dT.abs() * mask_T).sum() / mask_T.sum().clamp(min=1)
+                d_R = (dR.abs() * mask_R).sum() / mask_R.sum().clamp(min=1)
+            per_order[o][0] = per_order[o][0] + d_T * stage_weight
+            per_order[o][1] = per_order[o][1] + d_R * stage_weight
+            loss_T_stage = loss_T_stage + d_T * w
+            loss_R_stage = loss_R_stage + d_R * w
 
         total_smooth_T += loss_T_stage * stage_weight
         total_smooth_R += loss_R_stage * stage_weight
@@ -883,11 +964,17 @@ def compute_camera_smooth_loss(predictions, batch, weight_trans=1.0, weight_rot=
     loss_camera_smooth = avg_T * weight_trans + avg_R * weight_rot
     loss_camera_smooth = check_and_fix_inf_nan(loss_camera_smooth, "loss_camera_smooth")
 
-    return {
+    out = {
         "loss_camera_smooth": loss_camera_smooth,
         "loss_smooth_T": avg_T,
         "loss_smooth_R": avg_R,
     }
+    # Per-order values are UNWEIGHTED. They exist to calibrate order_weights: a velocity and an
+    # acceleration are not on the same scale, so the two cannot be given the same weight blind.
+    for o in orders:
+        out[f"loss_smooth_T{o}"] = per_order[o][0] / n_stages
+        out[f"loss_smooth_R{o}"] = per_order[o][1] / n_stages
+    return out
 
 
 def compute_tsmooth_loss(predictions, batch, tv_weight=0.1, **kwargs):
