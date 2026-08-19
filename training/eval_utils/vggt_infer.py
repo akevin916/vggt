@@ -195,7 +195,17 @@ def infer_sequence_chunked(
     chunk_size: int = 32,
     gate_logits_override: Optional[torch.Tensor] = None,
 ) -> Dict[str, np.ndarray]:
-    if len(image_paths) <= chunk_size:
+    """Chunked inference. ``chunk_size <= 0`` means one pass over the whole sequence.
+
+    ⚠️ Chunks are inferred INDEPENDENTLY and concatenated without any alignment, so each
+    chunk carries its own arbitrary reference frame. Any pose metric computed across a
+    seam is dominated by that jump: on Sintel f50 the default 32 split temple_2 into
+    32+18 and gave ATE 2.53 instead of 0.057 -- and, because the seam dwarfs everything
+    else, the number stopped depending on the model at all. Callers that want whole-
+    sequence geometry must pass 0 (or len(image_paths)); leaving it unset silently picks
+    the 32 default. See CLAUDE.md's chunk_size warning for diag/vis/error_growth.py.
+    """
+    if chunk_size <= 0 or len(image_paths) <= chunk_size:
         return infer_sequence(model, image_paths, device=device, gate_logits_override=gate_logits_override)
 
     parts = []
@@ -215,3 +225,116 @@ def infer_sequence_chunked(
     if "depth" in parts[0]:
         out["depth"] = np.concatenate([p["depth"] for p in parts], axis=0)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Overlapped, Sim3-stitched inference
+#
+# ``infer_sequence_chunked`` above concatenates chunks blind, which is fatal for any
+# cross-seam pose metric. The SCARED pose trajectories are 411 and 834 frames, far past what
+# one VGGT forward pass fits, so whole-sequence ATE needs the chunks joined properly instead:
+# consecutive chunks share ``overlap`` frames, and each new chunk is mapped into the running
+# trajectory by the similarity transform that best aligns its camera centres on that shared
+# span. This is the standard long-sequence submap stitch, not a shortcut -- but it does add
+# its own error, so measure it (run a sequence short enough for one pass both ways and
+# compare) before putting stitched numbers in a table.
+# ---------------------------------------------------------------------------
+
+
+def umeyama_sim3(src: np.ndarray, dst: np.ndarray):
+    """Least-squares similarity (s, R, t) with ``dst ≈ s * R @ src + t``. Points are (N,3)."""
+    src = np.asarray(src, dtype=np.float64)
+    dst = np.asarray(dst, dtype=np.float64)
+    mu_s, mu_d = src.mean(0), dst.mean(0)
+    Xs, Xd = src - mu_s, dst - mu_d
+    U, D, Vt = np.linalg.svd(Xd.T @ Xs / len(src))
+    S = np.eye(3)
+    if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+        S[-1, -1] = -1.0
+    R = U @ S @ Vt
+    var_s = (Xs ** 2).sum() / len(src)
+    s = float(np.trace(np.diag(D) @ S) / var_s) if var_s > 0 else 1.0
+    return s, R, mu_d - s * R @ mu_s
+
+
+def _extrinsic_to_c2w(E: np.ndarray) -> np.ndarray:
+    bottom = np.tile(np.array([0.0, 0.0, 0.0, 1.0]), (len(E), 1, 1))
+    return np.linalg.inv(np.concatenate([np.asarray(E, dtype=np.float64), bottom], axis=1))
+
+
+def _c2w_to_extrinsic(M: np.ndarray) -> np.ndarray:
+    return np.linalg.inv(M)[:, :3, :]
+
+
+def infer_sequence_stitched(
+    model: VGGT,
+    image_paths: List[str],
+    device: str = "cuda",
+    chunk_size: int = 64,
+    overlap: int = 16,
+    gate_logits_override: Optional[torch.Tensor] = None,
+) -> Dict[str, np.ndarray]:
+    """Whole-sequence poses from overlapping chunks joined by a per-seam Sim3.
+
+    Returns ``extrinsic`` (S,3,4) in one common frame plus ``intrinsic``/``pose_enc`` and
+    ``chunk_seams`` / ``stitch_scales`` for diagnostics. Depth is NOT returned: each chunk
+    carries its own scale, and rescaling depth by the seam factor would quietly mix regimes.
+    """
+    n = len(image_paths)
+    if chunk_size <= 0 or n <= chunk_size:
+        return infer_sequence(model, image_paths, device=device,
+                              gate_logits_override=gate_logits_override)
+    if not 0 < overlap < chunk_size:
+        raise ValueError(f"overlap must be in (0, chunk_size); got {overlap} vs {chunk_size}")
+
+    step = chunk_size - overlap
+    starts = list(range(0, max(n - overlap, 1), step))
+    if starts[-1] + chunk_size < n:
+        starts.append(n - chunk_size)
+
+    c2w_out = np.zeros((n, 4, 4))
+    intr_out = [None] * n
+    penc_out = [None] * n
+    filled = np.zeros(n, dtype=bool)
+    scales, seams = [], []
+
+    for ci, st in enumerate(starts):
+        sl = slice(st, min(st + chunk_size, n))
+        ov = (gate_logits_override[:, sl] if gate_logits_override is not None else None)
+        pred = infer_sequence(model, image_paths[sl], device=device, gate_logits_override=ov)
+        c2w = _extrinsic_to_c2w(pred["extrinsic"])
+
+        if ci > 0:
+            shared = np.arange(sl.start, sl.stop)[filled[sl]]
+            if len(shared) < 3:
+                raise RuntimeError(f"seam {ci}: only {len(shared)} shared frames, need >=3 "
+                                   f"for a Sim3 fit (raise --overlap)")
+            local = shared - sl.start
+            s, R, t = umeyama_sim3(c2w[local, :3, 3], c2w_out[shared, :3, 3])
+            T = np.eye(4)
+            T[:3, :3], T[:3, 3] = R, t
+            c2w[:, :3, 3] = (s * (R @ c2w[:, :3, 3].T)).T + t   # centres: scaled+rotated
+            c2w[:, :3, :3] = R @ c2w[:, :3, :3]                  # orientations: rotated only
+            scales.append(float(s))
+            seams.append(int(sl.start))
+
+        # Keep the earlier chunk's estimate on shared frames: it was fitted, not extrapolated.
+        new = np.arange(sl.start, sl.stop)[~filled[sl]]
+        c2w_out[new] = c2w[new - sl.start]
+        for j in new:
+            intr_out[j] = pred["intrinsic"][j - sl.start]
+            penc_out[j] = pred["pose_enc"][j - sl.start]
+        filled[sl] = True
+
+    if not filled.all():
+        raise RuntimeError(f"{int((~filled).sum())} frames never covered by a chunk")
+
+    return {
+        "extrinsic": _c2w_to_extrinsic(c2w_out).astype(np.float32),
+        "intrinsic": np.stack(intr_out),
+        "pose_enc": np.stack(penc_out),
+        "input_hw": np.array([0, 0], dtype=np.int32),
+        "chunk_starts": np.array(starts, dtype=np.int32),
+        "chunk_seams": np.array(seams, dtype=np.int32),
+        "stitch_scales": np.array(scales, dtype=np.float64),
+    }

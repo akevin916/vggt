@@ -24,6 +24,14 @@ import torch
 METRIC_KEYS = ["abs_rel", "sq_rel", "rmse", "log_rmse", "delta_1", "delta_2", "delta_3"]
 
 
+def _np_median(x: torch.Tensor) -> torch.Tensor:
+    """``np.median`` semantics: on an even-sized input average the two central values.
+    ``torch.median`` returns the lower one instead, which shifts the median scale factor
+    by half a pixel-pair and makes our numbers disagree with the reference implementations
+    (AF-SfMLearner scales with ``np.median``). Used by the 1-DOF median branch only."""
+    return torch.quantile(x.flatten().float(), 0.5)
+
+
 def absolute_value_scaling2(
     predicted_depth: torch.Tensor,
     ground_truth_depth: torch.Tensor,
@@ -63,6 +71,7 @@ def depth_evaluation(
     predicted_depth: np.ndarray,
     ground_truth_depth: np.ndarray,
     max_depth: float = 80.0,
+    min_depth: float = 0.0,
     custom_mask: Optional[np.ndarray] = None,
     align_with_lad2: bool = False,
     post_clip_min: Optional[float] = None,
@@ -84,7 +93,7 @@ def depth_evaluation(
     gt_orig = torch.from_numpy(ground_truth_depth.astype(np.float32)).to(device)
     pred_orig = torch.from_numpy(predicted_depth.astype(np.float32)).to(device)
 
-    mask = (gt_orig > 0) & (gt_orig < max_depth)
+    mask = (gt_orig > min_depth) & (gt_orig < max_depth)
     if custom_mask is not None:
         mask = mask & torch.from_numpy(custom_mask.astype(bool)).to(device)
 
@@ -98,7 +107,7 @@ def depth_evaluation(
         s, t = absolute_value_scaling2(pred, gt, s_init=s_init, t_init=0.0, lr=lr, max_iters=max_iters)
         pred = s * pred + t
     else:
-        scale = torch.median(gt) / torch.median(pred)
+        scale = _np_median(gt) / _np_median(pred)
         pred = pred * scale
 
     if post_clip_min is not None:
@@ -135,25 +144,61 @@ def eval_sequence_depth(
     align_with_lad2: bool = True,
     post_clip_max: Optional[float] = 70.0,
     device: Optional[str] = None,
+    per_frame: bool = False,
+    min_depth: float = 0.0,
+    post_clip_min: Optional[float] = None,
 ) -> Dict[str, float]:
     """MonST3R Sintel depth protocol: one global scale+shift over the whole sequence,
     metrics pooled over all valid pixels. Defaults (max_depth=70, lad2, clip=70) match
     MonST3R's Sintel command. ``pred_depths[i]`` must already be at ``gt_depths[i]``'s
-    resolution (eval_sintel resizes each frame before calling)."""
+    resolution (eval_sintel resizes each frame before calling).
+
+    ``per_frame=True`` switches to the AF-SfMLearner SCARED protocol instead: align and
+    score every frame on its own, then take the UNWEIGHTED mean over frames. Frames with
+    no valid GT pixel are dropped rather than counted as zero."""
+    if per_frame:
+        per = [
+            depth_evaluation(
+                p, g, max_depth=max_depth, min_depth=min_depth,
+                align_with_lad2=False, post_clip_min=post_clip_min,
+                post_clip_max=post_clip_max, device=device,
+            )
+            for p, g in zip(pred_depths, gt_depths)
+        ]
+        per = [m for m in per if m["valid_pixels"] > 0]
+        if not per:
+            return {k: 0.0 for k in METRIC_KEYS} | {"valid_pixels": 0, "num_frames": 0}
+        out = {k: float(np.mean([m[k] for m in per])) for k in METRIC_KEYS}
+        out["valid_pixels"] = int(sum(m["valid_pixels"] for m in per))
+        out["num_frames"] = len(per)
+        return out
+
     pred = np.stack(pred_depths, axis=0)
     gt = np.stack(gt_depths, axis=0)
     out = depth_evaluation(
-        pred, gt, max_depth=max_depth, align_with_lad2=align_with_lad2,
+        pred, gt, max_depth=max_depth, min_depth=min_depth,
+        align_with_lad2=align_with_lad2, post_clip_min=post_clip_min,
         post_clip_max=post_clip_max, device=device,
     )
     out["num_frames"] = len(pred_depths)
     return out
 
 
-def average_depth_results(per_seq: Dict[str, Dict[str, float]]) -> Dict[str, float]:
-    """Average sequences weighted by valid-pixel count (MonST3R aggregation)."""
-    valid = [v for v in per_seq.values() if v.get("valid_pixels", 0) > 0]
+def average_depth_results(per_seq: Dict[str, Dict[str, float]],
+                          weight_key: str = "valid_pixels") -> Dict[str, float]:
+    """Combine per-sequence results into one number.
+
+    ``weight_key="valid_pixels"`` -- MonST3R aggregation, the default: a sequence counts in
+    proportion to how much valid GT it has.
+    ``weight_key="num_frames"`` -- the AF-SfMLearner/SCARED aggregation. AF never groups by
+    sequence at all: it pools all 550 test frames into one list and takes ``errors.mean(0)``.
+    Weighting each sequence's per-frame mean by its frame count is algebraically identical to
+    that pooled mean, so this reproduces it without restructuring the caller. Using the
+    valid-pixel weights instead would silently shift abs_rel away from the published tables,
+    because SCARED's valid fraction swings from 25% to 90% across keyframes.
+    """
+    valid = [v for v in per_seq.values() if v.get(weight_key, 0) > 0]
     if not valid:
         return {k: 0.0 for k in METRIC_KEYS}
-    weights = np.array([v["valid_pixels"] for v in valid], dtype=np.float64)
+    weights = np.array([v[weight_key] for v in valid], dtype=np.float64)
     return {k: float(np.average([v[k] for v in valid], weights=weights)) for k in METRIC_KEYS}
