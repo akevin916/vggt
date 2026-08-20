@@ -93,7 +93,7 @@ class MultitaskLoss(torch.nn.Module):
             total_loss = total_loss + motion_loss_dict["loss_motion"] * self.motion["weight"]
             loss_dict.update(motion_loss_dict)
 
-        # v2: scene-flow supervision on the PARALLEL flow head Δ (docs/dyn_vggt_method_v2.md §4.4).
+        # v2: scene-flow supervision on the PARALLEL flow head Δ (docs/archive/checkpoints.md §2.2).
         #     Two DIRECT signals, no bilinear assembly: (1) static-zero prior (1-M)·‖Δ‖₁ — exact GT
         #     since static world-frame flow is 0, available everywhere; (2) sparse 3D GT (trajs_3d)
         #     where provided. The v1 dense "assembled-point vs world_points" path is removed.
@@ -373,7 +373,8 @@ def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
 
 
 # ----------------------------------------------------------------------------------------------------
-# v1/v2 Dyn-VGGT loss terms (motion / flow / reproj / tsmooth). See docs/archive/dyn_vggt_method_v1.md §6.2.
+# v1/v2 Dyn-VGGT loss terms (motion / flow / reproj / tsmooth). See docs/archive/checkpoints.md §2.1
+# -- the per-section numbering of the old method doc is gone; the summary there is what survives.
 # Superseded by v3 (docs/dyn_vggt_method_v3.md); kept for the archived v1/v2 configs under training/config/v1/.
 # ----------------------------------------------------------------------------------------------------
 
@@ -383,7 +384,7 @@ def compute_motion_loss(predictions, batch, supervise_valid_only=False,
     #      (docs §6.2-1). When no GT mask is available a pseudo-label path would be used instead
     #      (handled by the caller's gating); here GT supervision is assumed present.
     # v2: optional sparsity (α‖M‖₁, prevents "everything-dynamic" collapse) and spatial TV
-    #     (smooth mask) regularizers (docs/dyn_vggt_method_v2.md §3.3/§4). Default 0 → pure BCE.
+    #     (smooth mask) regularizers (docs/archive/checkpoints.md §2.2). Default 0 → pure BCE.
     pred_m = predictions["motion_prob"][..., 0]          # (B, S, H, W), post-sigmoid in [0,1]
     gt_m = batch["motion_mask"].to(pred_m.dtype)         # (B, S, H, W)
     pred_m = pred_m.clamp(1e-6, 1 - 1e-6)
@@ -410,7 +411,7 @@ def compute_motion_loss(predictions, batch, supervise_valid_only=False,
 
 def compute_flow_loss(predictions, batch, sparse_huber_delta=1.0, dyn_thresh=0.5, **kwargs):
     """
-    v2 scene-flow (Δ) supervision (docs/dyn_vggt_method_v2.md §4.4). The flow head is a PARALLEL
+    v2 scene-flow (Δ) supervision (docs/archive/checkpoints.md §2.2). The flow head is a PARALLEL
     output (Δ never enters world_points). Two DIRECT signals — no bilinear assembly:
 
     1. Static-zero prior (dense, free, exact): a static point does not move in the world frame, so

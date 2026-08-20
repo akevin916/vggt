@@ -113,7 +113,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 predictions["world_points"] = pts3d
                 predictions["world_points_conf"] = pts3d_conf
 
-            # Dyn-VGGT v2 (docs/dyn_vggt_method_v2.md): motion-GATED, NOT motion-composed.
+            # Dyn-VGGT v2 (docs/archive/checkpoints.md §2.2): motion-GATED, NOT motion-composed.
             #   motion head → dynamic probability m (M_t): used ONLY as a gate in the loss
             #     (pose static-selection, loss masking); it is NEVER multiplied into the geometry.
             #   flow head → scene flow Δ (Δ_t): a PARALLEL 4D output (per-pixel world-frame

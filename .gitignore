@@ -158,4 +158,4 @@ training/logs/
 /reference/
 training/benchmark/__pycache__/
 outputs/
-archive/
+/archive/

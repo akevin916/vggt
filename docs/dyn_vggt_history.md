@@ -1,10 +1,10 @@
 # Dyn-VGGT：方法沿革（v1 → v2 → v3）
 
-> 一頁式摘要，只留「為什麼改版」的決策脈絡；細節都在被封存的原文件裡。
+> 一頁式摘要，只留「為什麼改版」的決策脈絡；v1/v2 的方法細節與各版本權重的數字見 [archive/checkpoints.md](archive/checkpoints.md)。
 
 ---
 
-## v1：運動解耦雙場表示（[archive/dyn_vggt_method_v1.md](archive/dyn_vggt_method_v1.md)）
+## v1：運動解耦雙場表示（[archive/checkpoints.md §2.1](archive/checkpoints.md)）
 
 把每像素世界點分解成 `X = X^can + m·Δ`（靜態正則點 + 動態概率 × 殘差位移），另加時空聚合器（temporal attention）、動態分割頭、場景流頭、4D 全局對齊。
 
@@ -14,7 +14,7 @@
 
 ---
 
-## v2：診斷、未形成新架構（[archive/dyn_vggt_method_v2.md](archive/dyn_vggt_method_v2.md)）
+## v2：診斷、未形成新架構（[archive/checkpoints.md §2.2](archive/checkpoints.md)）
 
 本質是 v1 失敗診斷的整理版，確認上述雙線性不可辨識性是**架構病態**、且學習式動態 mask 有**跨域崩塌**（PointOdyssey AUC≈0.88 → Sintel≈0.45，與雙場病態是兩個獨立問題）。未提出替代架構，是 v3 的前置診斷。
 
