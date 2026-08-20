@@ -1,6 +1,6 @@
 # Dyn-VGGT v3 — Stage S1, C-1 sanity check: HARD LABEL + boundary ignore-band.
 #
-# Identical to the run-1 base (dyn_vggt_v3_s1_inst) in EVERY respect — same 4-dataset mix,
+# Identical to the run-1 base (inst_g) in EVERY respect — same 4-dataset mix,
 # schedule, unfreeze set, val, warm-start — EXCEPT the gate loss discretises its label:
 #   m*_patch >= hard_hi (0.7) -> 1 ,  <= hard_lo (0.3) -> 0 ,  boundary band (0.3,0.7) IGNORED.
 #
@@ -13,10 +13,10 @@
 # WARM-START: from the SAME clean S0 checkpoint as run 1 (fresh, not off run-1's last.pt), so the
 # only variable vs run 1 is the label discretisation. New exp_name → its own logs/ dir.
 defaults:
-  - dyn_vggt_v3_s1_inst
+  - inst_g
   - _self_
 
-exp_name: dyn_vggt_v3_s1_inst_hard
+exp_name: inst_g_hard
 
 loss:
   gate:
@@ -25,5 +25,5 @@ loss:
 
 checkpoint:
   # fresh warm-start off S0 (run-1's last.pt lives under a different exp_name, so null here
-  # auto-loads logs/dyn_vggt_v3_s1_inst_hard/ckpts/last.pt only after this run's own first save).
-  resume_checkpoint_path: checkpoints/dyn_vggt_v3_s0_inst.pt
+  # auto-loads logs/inst_g_hard/ckpts/last.pt only after this run's own first save).
+  resume_checkpoint_path: checkpoints/inst_gate_init.pt

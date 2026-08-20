@@ -21,14 +21,14 @@
 # temporal_blocks stay γ=0 identity AND frozen (≡ absent), but the checkpoint still CARRIES their
 # weights → runs 2/3/4 warm-start off run 1 with no missing keys.
 #
-# WARM-START: checkpoints/dyn_vggt_v3_s0_inst.pt (same gate+temporal flags → clean key load). The
+# WARM-START: checkpoints/inst_gate_init.pt (same gate+temporal flags → clean key load). The
 # S0 gate is BCE-supervised, independent of the §4 attention bug (§8.1), so it is reused as-is.
 # Inherits everything from default.yaml; only the deltas below are specified.
 defaults:
   - default
   - _self_
 
-exp_name: dyn_vggt_v3_s1_inst
+exp_name: inst_g
 num_workers: 0
 accum_steps: 1
 val_epoch_freq: 1
@@ -107,10 +107,10 @@ checkpoint:
   # full ~7 GB last.pt write (.bak-protected) -> ~every 500 iters ≈ 15-20 min; tune to taste.
   save_steps_freq: 1000
   # RESUME MODE (run was killed externally at epoch 3, 2026-07-10): null → auto-load
-  # logs/dyn_vggt_v3_s1_inst/ckpts/last.pt (full optimizer/epoch/best_ate=0.1594 state) and
+  # logs/inst_g/ckpts/last.pt (full optimizer/epoch/best_ate=0.1594 state) and
   # continue from epoch 3. The 3 completed epochs and the LR-schedule position are preserved.
-  # To start a NEW from-scratch run instead, delete logs/dyn_vggt_v3_s1_inst/ AND set this back
-  # to checkpoints/dyn_vggt_v3_s0_inst.pt (the fresh-from-S0 warm-start).
+  # To start a NEW from-scratch run instead, delete logs/inst_g/ AND set this back
+  # to checkpoints/inst_gate_init.pt (the fresh-from-S0 warm-start).
   resume_checkpoint_path: null
 
 

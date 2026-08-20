@@ -135,7 +135,7 @@ loss:
   track: null
   static_photo: null
   # v3 extension: static-region photometric consistency (predicted pose warps a GT-static,
-  # GT-depth point into frame t+1; must match real pixel content there). See dyn_vggt_v3_s1*.yaml.
+  # GT-depth point into frame t+1; must match real pixel content there). See inst_*.yaml.
   # static_photo:
   #   weight: 1.0
   #   huber_delta: 0.1
@@ -146,7 +146,7 @@ loss:
   # reprojection loss, NOT a port of MonST3R's flow loss (docs/monst3r_loss_diff.md). Requires the
   # depth head to be predicting AND unfrozen for the depth path to matter, plus loss.depth on:
   # flow-driven depth without a depth anchor lowers the residual and worsens ATE (headroom probe).
-  # See dyn_vggt_v3_s1_inst_egoflow.yaml.
+  # See inst_gts_egoflow.yaml.
   # ego_flow:
   #   weight: 1.0
   #   beta: 1.0
@@ -158,7 +158,7 @@ loss:
   # v3 extension: camera-trajectory smoothness regularizer (Δt-normalized 2nd-order term on
   # predicted T/quaternion; addresses observed trajectory "jumps" on hard/dynamic sequences,
   # see conversation notes). Requires img_nums with min >= 4 to avoid wasting batches (needs
-  # S>=3 frames per clip). See dyn_vggt_v3_s1_inst_smooth.yaml.
+  # S>=3 frames per clip). See inst_g_smooth.yaml.
   # camera_smooth:
   #   weight: 0.5
   #   weight_trans: 1.0

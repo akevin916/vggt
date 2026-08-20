@@ -22,7 +22,7 @@
 
 ## 2. 三個 run 與基準
 
-基準：`checkpoints/dyn_inst_temporal_smooth.pt`（= run 2 `dyn_vggt_v3_s1_inst_smooth_temporal` 的 `epoch_30.pt`，md5 `67bbebf4…`）。
+基準：`checkpoints/dyn_inst_temporal_smooth.pt`（= run 2 `inst_gts` 的 `epoch_30.pt`，md5 `67bbebf4…`）。
 所有數字同協定：`benchmark/eval_sintel.py`／trainer channel B，全序列不分塊，`max_depth=80`，14 個 pose 序列。
 
 | run | 配置 | ATE | RPE-t | RPE-rot | AbsRel |
@@ -182,7 +182,7 @@ run 2 完全沒有訓練深度，退化幅度卻與 run 1 相當。原因是解�
 | [`training/diag/ego_flow_selftest.py`](../training/diag/ego_flow_selftest.py) | 恆等 / 擾動 / 重複幀三項檢查 + 地板分解 |
 | [`training/diag/ego_flow_residual.py`](../training/diag/ego_flow_residual.py) | 量這個 loss 真正最小化的殘差（直接呼叫 loss 本身，不重寫幾何） |
 | [`training/diag/train_health.py`](../training/diag/train_health.py) | 訓練健康紅綠燈（四關），只讀 `log.txt` 與 `pose_eval/`，可對執行中的 run 跑 |
-| `config/dyn_vggt_v3_s1_inst_egoflow{,_gt,_gt_mask}.yaml` | 三個 run 的 config，header 記錄各自的證據狀態 |
+| `config/inst_gts_egoflow{,_gt,_gt_mask}.yaml` | 三個 run 的 config，header 記錄各自的證據狀態 |
 
 ### 兩個被實測否證、但程式保留的想法
 

@@ -16,7 +16,7 @@ base model 程式碼（`vggt/`）在所有 `enable_*` flag 關閉時與 pretrain
 ```bash
 cd training && torchrun --nproc_per_node=1 launch.py --config <name>
 ```
-config name = `training/config/` 裡的檔名去掉 `.yaml`（如 `dyn_vggt_v3_s1_inst`）。Hydra 載入後 `launch.py` 建 `Trainer(**cfg)`。
+config name = `training/config/` 裡的檔名去掉 `.yaml`（如 `inst_g`）。Hydra 載入後 `launch.py` 建 `Trainer(**cfg)`。
 
 沒有配置 test suite / linter。改動要驗證就跑 `training/diag/` 或 `training/benchmark/` 下對應的 script（每支都是獨立、帶 argparse 的 `python … .py`）。
 
@@ -34,7 +34,9 @@ gate 是否真的改善 pose 屬**未定論的研究問題**，最新進展與�
 
 ## 訓練階段與動態標籤
 
-config 用檔名編碼 curriculum：**S0**（只訓 `gate_predictor`，其餘凍結）→ **S1**（gate + 後段 global block + camera head）→ **S2**（全網）。檔名 suffix 是命名慣例，標示該 config 用的標籤/loss 組合：`_inst`（instance 標籤）、`_raft`（RAFT 標籤）、`_photo`（加 static-photo loss）、`_smooth`/`_temporal`（額外 loss/aggregator 變體）、`_oracle_camera_only`（oracle-mask 消融）。哪個組合有效屬研究結論，見 project memory。
+config 檔名 = `<標籤>_<成分>[_<變體>]`，**與 `exp_name` 和 `logs/<exp>/` 目錄名三者一致**（2026-08-20 統一，舊的 `dyn_vggt_v3_s{n}_*` 全部退役，對照表見 [docs/archive/checkpoints.md](docs/archive/checkpoints.md)）。標籤 `inst` = instance×scene-flow mask（v3 唯一在用的動態標籤）；成分字母 `g` = gate、`t` = temporal、`s` = camera_smooth，依序疊加。所以 `inst_g` 是 gate+camera、`inst_gts` 再加 temporal 與 smooth，變體另接後綴（`inst_gts_egoflow`、`inst_g_photo`）。SCARED 那組用資料集前綴 `scared_cam_*`。
+
+config 之間用 Hydra `defaults` 串成繼承鏈，**只寫 delta，不整份複製**：`default` → `inst_g` → `inst_gts` → 各變體；`default` → `scared_cam_b16` → `scared_cam_b2` / `scared_cam_b16_gg` → `..._smooth_temporal` → `..._smoke`。⚠️ **Hydra 對 list 是「取代」不是「合併」** —— 覆寫 `frozen_module_names` 或 `gradient_clip.configs` 時要把整份清單重寫（兩者的語意都與順序無關，可安心重排）。
 
 動態 mask **標籤**由 `training/data/preprocess/po_*` script 離線預算：`dynmask_inst/`（instance × GT scene-flow —— PO 訓練標籤）或 `dynmask_raft/`（RAFT flow-residual —— 用於 Sintel/測試 eval）。`training/data/datasets/` 下的 dataset（`pointodyssey.py`、`tartanair.py`、`spring.py`、`waymo.py`、`co3d.py`）透過 `dynamic_source=` 載入。資料集實體在另一顆碟上，一律**透過 repo root 的 `data` symlink** 存取，並依角色分兩個 bucket：
 

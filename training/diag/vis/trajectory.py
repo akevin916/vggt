@@ -44,7 +44,7 @@ from eval_utils.vggt_infer import infer_sequence_chunked, load_vggt_for_eval
 def parse_args():
     ap = argparse.ArgumentParser(description="Overlay GT vs predicted trajectories for two checkpoints")
     ap.add_argument("--ckpt_a", required=True, help="e.g. checkpoints/VGGT-1B.pt")
-    ap.add_argument("--ckpt_b", required=True, help="e.g. checkpoints/dyn_vggt_v3_s1_inst_photo.pt")
+    ap.add_argument("--ckpt_b", required=True, help="e.g. checkpoints/inst_g_photo.pt")
     ap.add_argument("--label_a", default="A")
     ap.add_argument("--label_b", default="B")
     ap.add_argument("--seqs", nargs="*", default=None, help="Default: all SINTEL_EVAL_SEQUENCES")

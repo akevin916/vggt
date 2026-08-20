@@ -1,6 +1,6 @@
 # Dyn-VGGT v3 — S1, ego-flow with GT depth, DYNAMIC MASK OFF.
 #
-# ONE change from dyn_vggt_v3_s1_inst_egoflow_gt: use_dynamic_mask false. That run is the
+# ONE change from inst_gts_egoflow_gt: use_dynamic_mask false. That run is the
 # control; everything else (warm start, schedule, weight, thresholds) is inherited.
 #
 # WHY THE MASK IS WRONG IN THIS CONFIGURATION. With use_gt_depth both flows are built from the
@@ -36,10 +36,10 @@
 # residual) the increase is ~2%, i.e. 0.0215 -> 0.0211. That is far inside the noise of the
 # calibration itself, so it is left alone rather than pretending to a precision we do not have.
 defaults:
-  - dyn_vggt_v3_s1_inst_egoflow_gt
+  - inst_gts_egoflow_gt
   - _self_
 
-exp_name: dyn_vggt_v3_s1_inst_egoflow_gt_mask
+exp_name: inst_gts_egoflow_gt_nomask
 
 
 loss:

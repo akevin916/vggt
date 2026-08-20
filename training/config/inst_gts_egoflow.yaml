@@ -1,6 +1,6 @@
 # Dyn-VGGT v3 — Stage S1, ego-flow reprojection run (plan: MonST3R flow-term port).
 #
-# base = run 2 (dyn_vggt_v3_s1_inst_smooth_temporal, the current best lineage) + TWO coupled
+# base = run 2 (inst_gts, the current best lineage) + TWO coupled
 # changes that cannot be separated: (a) L_ego_flow, MonST3R's disparity-form ego-flow geometry
 # scored against the GT-derived ego-flow, and (b) an unfrozen depth_head, because predicted
 # depth is half of that geometry. loss.depth is turned on as the depth anchor.
@@ -23,7 +23,7 @@
 # WARM-START: run 2's epoch_30.pt (the ~0.134 plateau). NOT last.pt — that checkpoint's 0.125
 # was a windowed-eval artifact and is void (see project notes).
 #
-# PAIRED RUN — READ WITH dyn_vggt_v3_s1_inst_depththaw.yaml. That config is identical except
+# PAIRED RUN — READ WITH inst_gts_depththaw.yaml. That config is identical except
 # `loss.ego_flow: null`, so:
 #     this run - depththaw        = the contribution of L_ego_flow
 #     depththaw - run2 ep30       = the contribution of thawing depth_head + L_depth
@@ -44,10 +44,10 @@
 # max_epochs sets the cosine length, so by ep20 the LR is ~1e-8 and resuming either does nothing
 # or triggers a second warmup that scrambles the trajectory.
 defaults:
-  - dyn_vggt_v3_s1_inst_smooth_temporal
+  - inst_gts
   - _self_
 
-exp_name: dyn_vggt_v3_s1_inst_egoflow
+exp_name: inst_gts_egoflow
 max_epochs: 20
 
 
@@ -90,9 +90,9 @@ checkpoint:
   save_freq: 5
   # run 2's epoch_30.pt, WEIGHTS ONLY — produced with
   #   python extract_weights.py --src checkpoints/dyn_inst_temporal_smooth.pt \
-  #                             --dst checkpoints/dyn_inst_temporal_smooth_weights.pt
+  #                             --dst checkpoints/inst_gts.pt
   # (dyn_inst_temporal_smooth.pt is verified byte-identical, md5 67bbebf4..., to
-  # logs/dyn_vggt_v3_s1_inst_smooth_temporal/ckpts/epoch_30.pt — NOT last.pt, a08b5324...)
+  # logs/inst_gts/ckpts/epoch_30.pt — NOT last.pt, a08b5324...)
   #
   # The strip is REQUIRED, not hygiene. A full trainer checkpoint carries prev_epoch=29, so
   # `while self.epoch < self.max_epochs` (trainer.py:495) starts at 30 and a 20-epoch config
@@ -102,7 +102,7 @@ checkpoint:
   # 20-epoch schedule this run is designed around. Stripping also drops run 2's Adam moments,
   # which were accumulated over a different trainable set and a different objective.
   # Flip to null after epoch 1 so restarts self-heal from this run's own last.pt.
-  resume_checkpoint_path: checkpoints/dyn_inst_temporal_smooth_weights.pt
+  resume_checkpoint_path: checkpoints/inst_gts.pt
 
 
 loss:
@@ -114,7 +114,7 @@ loss:
     valid_range: 0.98
   ego_flow:
     # Measured on the warm-start ckpt with diag/ego_flow_residual.py (outputs/
-    # dyn_vggt_v3_s1_inst_smooth_temporal/ego_flow_residual/results.json), then mixed by the
+    # inst_gts/ego_flow_residual/results.json), then mixed by the
     # sampling ratios of the four training sets (PO 10000 / TartanAir 5000 / Waymo 4000 /
     # Spring 1000):
     #   E[loss_ego_flow] = 0.869      E[loss_camera * 5.0] = 11.25
@@ -125,7 +125,7 @@ loss:
     # are in metres while the predictions are in VGGT's normalised scale and compute_camera_loss
     # measures a unit mismatch. Its per-dataset values (PO 5.67 / Waymo 4.70 / TartanAir 29.6 /
     # Sintel 36.8) sort by scene scale in metres, which is the tell.
-    # Measured over 21 steps of dyn_vggt_v3_s1_inst_egoflow_smoke (weighted contributions):
+    # Measured over 21 steps of inst_gts_egoflow_smoke (weighted contributions):
     #     loss_camera 0.0087 x5 = 0.0434 (4.2%)      loss_gate 0.1385 (13.5%)
     #     loss_camera_smooth 0.0039 (0.4%)           loss_depth 0.0502 (4.9%)
     #     loss_ego_flow 0.7933 x1.0 = 0.7933  -> 77.1% of the objective at weight 1.0

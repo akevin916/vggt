@@ -41,6 +41,10 @@
 在下表，`table.md` 表 1 有對應列可交叉核對；但**權重本身回不來了**——它們在 `logs/` 沒有 ckpts
 目錄，重現要重跑當年的 config。
 
+> **這一節的檔名沒有套用 §1.5 的改名規則**，是刻意的：那套規則是給 config / `exp_name` /
+> `logs/` 目錄用的，`archive/checkpoints/` 的權重是歷史檔案，套下去 `dyn_vggt_v3_s1_inst.pt`
+> 會變成 `inst_g.pt` —— 跟現役那支 v3-clean 的 `inst_g.pt` 撞名，而兩者是**不同世代的不同權重**。
+
 | 權重 | 世代 | 做了什麼 | ATE | ATE(12) | RPE-t | RPE-r | AbsRel | 狀態 |
 |---|---|---|---|---|---|---|---|---|
 | `dyn_vggt_s1b.pt` | v1 | 雙場 `X=X^can+m·Δ`，S1 第二版（表 1 的 `v1 S1b`） | 0.1692 | 0.0680 | 0.0770 | 0.5502 | 0.2790 | 已刪 08-20 |
@@ -68,7 +72,7 @@
 
 | run | 世代 | 做了什麼 | 最佳 | ATE | 現存 | 備註 |
 |---|---|---|---|---|---|---|
-| `dyn_vggt_v3_s1_inst` | v3-clean | §8.3 run 1，gate + camera。24 epoch | ep15 | 0.1533 | best, e10, e20, last | = `inst_g.pt` |
+| `inst_g` | v3-clean | §8.3 run 1，gate + camera。24 epoch | ep15 | 0.1533 | best, e10, e20, last | = `inst_g.pt` |
 | `..._smooth_temporal` | v3-clean | run 1 + temporal + `L_camera_smooth`。50 epoch | ep30 | **0.1343** | best, best_loss, e10–e50 | = `inst_gts.pt`。ep30 後平台化在 0.134–0.136；windowed `best.pt` (ep17) 是 0.1651，**不可用** |
 | `..._photo_smooth_temporal` | v3-**bug-init** | 三因子全開，但 warm-start 自 buggy ckpt → lineage 不乾淨 | ep16 | 0.1534 | best_ate | 全序列 0.1743，**比 base 還差，已確認棄用**。48 epoch 單調惡化到 0.2126 |
 | `..._smooth_temporal_photo` | v3-clean | 在收斂的 smooth_temporal 上加 static-photo | ep3 | 0.1413 | best_ate | 只跑 3 epoch |
@@ -92,7 +96,35 @@
   mean 就足以辨識。
 - `scared_cam_b2` —— 真的訓練過（到 ep3），但當時 `pose_eval` 沒開，**一個 eval 數字都沒有**。
 
-### 1.5 讀權重身分的可用線索
+### 1.5 舊名 → 新名對照（2026-08-20 改名）
+
+config 檔名、`exp_name`、`logs/<exp>/` 目錄名在 2026-08-20 統一成 `<標籤>_<成分>` 規則。
+**`outputs/**/*.json` 裡記錄的 ckpt 路徑刻意沒有跟著改** —— 那些是當時實際跑的路徑，改了就變成
+偽造紀錄。要對照時查這張表。
+
+| 舊名 | 新名 | 備註 |
+|---|---|---|
+| `dyn_vggt_v3_s1_inst` | `inst_g` | §8.3 run 1 |
+| `dyn_vggt_v3_s1_inst_hard` | `inst_g_hard` | logs 已不存在 |
+| `dyn_vggt_v3_s1_inst_photo` | `inst_g_photo` | logs 已不存在 |
+| `dyn_vggt_v3_s1_inst_buggy` | `inst_g_buggy` | 只有 log，無 ckpt |
+| `dyn_vggt_v3_s1_inst_smooth_temporal` | `inst_gts` | 現行最佳 |
+| `dyn_vggt_v3_s1_inst_smooth_temporal_photo` | `inst_gts_photo` | ← 注意這兩個舊名 |
+| `dyn_vggt_v3_s1_inst_photo_smooth_temporal` | `inst_gtsp_buginit` | ← 只差詞序，正是改名的理由 |
+| `dyn_vggt_v3_s1_inst_smooth_o1` | `inst_gts_o1` | |
+| `dyn_vggt_v3_s1_inst_egoflow` | `inst_gts_egoflow` | |
+| `dyn_vggt_v3_s1_inst_egoflow_gt` | `inst_gts_egoflow_gt` | |
+| `dyn_vggt_v3_s1_inst_egoflow_gt_mask` | `inst_gts_egoflow_gt_nomask` | |
+| `checkpoints/dyn_vggt_v3_s0_inst.pt` | `checkpoints/inst_gate_init.pt` | 權重早已改名，config 裡的路徑這次才修 |
+| `scared_cam_*` | 不變 | 資料集前綴已足夠清楚 |
+
+同時刪除 5 個 config：`inst_gts_depththaw`（對照組，**從未跑過**，已被 `egoflow_gt` 的
+`use_gt_depth` 設計取代）、`inst_gts_egoflow_smoke`、`inst_gts_egoflow_gt_smoke`、
+`inst_gts_o1_smoke`、`inst_g_smoketest_newval`（線已收，不會再有正式 run）。
+
+---
+
+### 1.6 讀權重身分的可用線索
 
 檔案裡沒有 metadata，但 `state_dict` 的 key 結構能定架構世代（免跑 eval）：
 

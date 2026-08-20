@@ -1,31 +1,42 @@
-# Dyn-VGGT v3 — Stage S1, POST-FIX factor-ablation RUN 2 (docs/dyn_vggt_method_v3.md §8.3).
+# Dyn-VGGT v3 — Stage S1, marginal static_photo test ON TOP OF THE CONVERGED smooth_temporal run.
 #
-# base (run 1) + ONE factor: unfreeze aggregator.temporal_blocks and add the camera_smooth loss
-# (§7.2). Measures the MARGINAL contribution of "temporal pathway + trajectory-acceleration
-# smoothing" to pose (ATE / trajectory jitter) on top of the gate→camera base. Attribution vs
-# run 1 is only valid because everything else (data/schedule/img_nums/val) is identical — see the
-# run-1 config header for the shared harness.
+# NOT the §8.3 "run 4" (that would warm-start from run 1 and add all three factors at once — see
+# inst_gtsp_buginit.yaml, which converged to a NEGATIVE result: ATE
+# plateaus at ~0.21 from epoch 30 on, worse than the run-1 warm-start (0.1533) and worse than
+# smooth_temporal alone (~0.134). Root cause diagnosed from that run's Grad/depth_head logs: its
+# raw grad norm ran 20-40x larger than the gate/camera/temporal groups throughout training (and
+# grew over time, 62->111 in the smoothed average) and shares the aggregator.global_blocks[8:24]
+# trunk with gate/camera -- classic multi-task gradient interference, degrading pose and depth
+# together. That run's data is archived; do not re-derive this diagnosis, read the chat log.
 #
-# NOTE (§6): camera_smooth is a self-referential prior on the PREDICTED pose (no GT); temporal is
-# the architectural pathway that lets it reach neighbouring frames. If run 2 beats run 1, still
-# disambiguate whether it's the temporal structure or the smooth loss doing the work.
+# This config asks a narrower, cheaper question instead: starting from a network that has ALREADY
+# converged on gate+camera_smooth+temporal (no need to re-learn that from scratch), does ADDING
+# static_photo (GT-depth back-projection, depth_head left FROZEN -- same low-risk route as run 3)
+# help or hurt? Isolates the photo factor's marginal effect on a good baseline instead of
+# re-fighting the ~30-epoch temporal convergence every time.
 #
-# WARM-START: run 1's best.pt. Copy it to checkpoints/dyn_vggt_v3_s1_inst.pt after run 1 finishes
-# (from logs/dyn_vggt_v3_s1_inst/ckpts/best.pt). Chaining off run 1 — NOT off S0 — is the point:
-# run 1 already brought the camera path onto the working gate, so run 2 isolates the temporal
-# factor rather than re-learning gating. temporal_blocks weights are present in run 1's ckpt
-# (γ=0 identity) → clean key load.
+# WARM-START: smooth_temporal's epoch_40 (its best/lowest full-seq ATE point, ~0.1340; epoch_30 is
+# ~0.1343, essentially tied). Model-only export (no optimizer/epoch state, so this run starts at
+# its own epoch 0 with a fresh optimizer and schedule) at
+# logs/inst_gts/ckpts/epoch_40.pt, made via:
+#   torch.save(torch.load('logs/inst_gts/ckpts/epoch_40.pt')['model'],
+#              'logs/inst_gts/ckpts/epoch_40.pt')
+#
+# BUDGET: 20 epochs (matches run 3's original budget). static_photo's effect direction showed up
+# within 10-15 epochs in run 3's own trajectory, and temporal/smooth don't need to re-converge
+# here, so this should be a much cheaper read than the full run-4 attempt.
+#
 # Inherits everything from default.yaml; only the deltas below are specified.
 defaults:
   - default
   - _self_
 
-exp_name: dyn_vggt_v3_s1_inst_smooth_temporal
-num_workers: 4
+exp_name: inst_gts_photo
+num_workers: 0
 accum_steps: 1
 val_epoch_freq: 1
 max_img_per_gpu: 16
-max_epochs: 50
+max_epochs: 20
 limit_train_batches: 3000
 
 
@@ -33,6 +44,10 @@ data:
   train:
     common_config:
       img_nums: [4, 16]
+      # Force cross-frame-consistent color jitter -- see inst_g_photo.yaml for why
+      # (this run also has loss.static_photo on, which compares raw pixel content across frames).
+      augs:
+        cojitter_ratio: 0.0
     dataset:
       dataset_configs:
         - _target_: data.datasets.pointodyssey.PointOdysseyDataset
@@ -73,6 +88,7 @@ logging:
         - loss_camera
         - loss_T
         - loss_R
+        - loss_static_photo
         - loss_camera_smooth
         - loss_smooth_T
         - loss_smooth_R
@@ -81,20 +97,21 @@ logging:
         - loss_objective
         - loss_gate
         - loss_camera
+        - loss_static_photo
         - loss_camera_smooth
 
 
 checkpoint:
   save_freq: 5
-  # Warm-start from run 1. Copy logs/dyn_vggt_v3_s1_inst/ckpts/best.pt here first.
-  # After epoch 1, flip to null so restarts self-heal from this run's last.pt.
-  # Flipped to null (2026-07-26): warm-start already consumed; resume this run's
-  # last.pt (epoch 15) via get_resume_checkpoint instead of restarting from run 1.
-  resume_checkpoint_path: null
+  # Always the smooth_temporal-ep40 warm-start weights (see header). launch.py's --resume flag
+  # (not this field) controls whether a launch continues its own logs/<exp>/ckpts/last.pt
+  # instead; Trainer.__init__ refuses to start if the two disagree.
+  resume_checkpoint_path: logs/inst_gts/ckpts/epoch_40.pt
 
 
 loss:
-  # RUN 2: gate + camera + camera_smooth. Depth/photo off (isolate the temporal+smooth factor).
+  # gate + camera + camera_smooth (inherited, already converged) + static_photo (the new factor).
+  # depth_head stays frozen -> no L_depth needed, same low-risk GT-depth route as run 3.
   camera:
     weight: 5.0
     loss_type: "l1"
@@ -107,7 +124,10 @@ loss:
   gate:
     weight: 1.0
     patch_size: ${patch_size}
-  static_photo: null
+  static_photo:
+    weight: 3.0
+    huber_delta: 0.1
+    dyn_thresh: 0.5
   camera_smooth:
     weight: 3.0
     weight_trans: 1.0
@@ -118,21 +138,21 @@ loss:
 optim:
   optimizer:
     lr: 3e-5
-  # Base unfreeze + temporal_blocks. depth_head still frozen (that's run 3/4's factor).
+  # Same unfreeze scope as smooth_temporal: base + temporal_blocks. depth_head stays frozen --
+  # that's exactly the interference source diagnosed out of the full run-4 attempt.
   frozen_module_names:
       - "*aggregator.patch_embed*"
       - "*aggregator.frame_blocks*"
-      # global_blocks 0..7 frozen; 8..23 trainable ([0-7] is an fnmatch class).
+      # global_blocks 0..7 (indices 0-7) are frozen; 8..23 are trainable.
       - "*aggregator.global_blocks.[0-7]*"
       - "*depth_head*"
-      # temporal_blocks intentionally NOT frozen here — this run's factor.
+      # temporal_blocks intentionally NOT frozen -- inherited trainable from smooth_temporal.
       # point_head / motion_head / flow_head do not exist in this model config → omit.
   gradient_clip:
     configs:
       - module_name: ["aggregator.gate_predictor", "aggregator.global_blocks", "camera_head"]
         max_norm: 1.0
         norm_type: 2
-      # Newly-unfrozen this run — own entry so its grad-norm is logged/tightened separately.
       - module_name: ["aggregator.temporal_blocks"]
         max_norm: 1.0
         norm_type: 2

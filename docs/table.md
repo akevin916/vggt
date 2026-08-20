@@ -9,13 +9,13 @@ gate 前向 bug 修正 = commit `e064087`（2026-07-09 12:17）。**修正是 co
 
 | 位置 | 世代 | 內容 |
 |---|---|---|
-| `training/logs/dyn_vggt_v3_s1_inst/` | ✅ **clean** | run 1，24 epoch。`gate_sweep`/`gate_sweep_scales`/`gate_quality`/`gate_bias_ablation`/`pose_eval` |
-| `training/logs/dyn_vggt_v3_s1_inst_hard/` | ✅ clean | 只有 3 epoch |
-| `training/logs/train/*/` | ✅ clean | 07-13 評測 harness：`VGGT-1B` / `dyn_vggt_v3_s0_inst` / `dyn_vggt_v3_s1_inst` / `s1_buggy` |
-| `training/logs/dyn_vggt_v3_s1_inst_buggy/` | ❌ buggy | 專門保留作對照 |
+| `training/logs/inst_g/` | ✅ **clean** | run 1，24 epoch。`gate_sweep`/`gate_sweep_scales`/`gate_quality`/`gate_bias_ablation`/`pose_eval` |
+| `training/logs/inst_g_hard/` | ✅ clean | 只有 3 epoch |
+| `training/logs/train/*/` | ✅ clean | 07-13 評測 harness：`VGGT-1B` / `dyn_vggt_v3_s0_inst` / `inst_g` / `s1_buggy` |
+| `training/logs/inst_g_buggy/` | ❌ buggy | 專門保留作對照 |
 | `outputs/train/*/` | ❌ **buggy** | photo / smooth_temporal / oracle_cam 的 Sintel 數字全在這 |
 | `archive/logs/v3_bug/` | ❌ buggy | |
-| `training/logs/dyn_vggt_v3_s1_inst_photo_smooth_temporal/` | ❌ buggy-init | lineage 不乾淨，已棄 |
+| `training/logs/inst_gtsp_buginit/` | ❌ buggy-init | lineage 不乾淨，已棄 |
 
 **checkpoint 更名**：`dyn_vggt_v3_s1.pt` == `archive/checkpoints/dyn_vggt_v3_s1_inst.pt`（歸檔時更名）。
 同一模式：`dyn_vggt_v3_oracle.pt` ← `oracle_camera_only` run。
@@ -137,7 +137,7 @@ gate 前向 bug 修正 = commit `e064087`（2026-07-09 12:17）。**修正是 co
 | `motion_thr` | 2.0 px — GT flow-residual oracle mask 閾值 |
 | 序列 | **14 seq** |
 | **Δ% 基準** | **同一列自己的 `off`**（同 ckpt、同 f50、同序列）。例：VGGT-1B oracle `+2.3%` = (0.1752 − 0.1713) / 0.1713。**不同列之間的 Δ% 分母不同，不可相減** |
-| 資料來源 | `training/logs/train/VGGT-1B/`、`training/logs/dyn_vggt_v3_s1_inst/gate_sweep/f50/`、`training/logs/dyn_vggt_v3_s1_inst_buggy/gate_sweep/f50/` |
+| 資料來源 | `training/logs/train/VGGT-1B/`、`training/logs/inst_g/gate_sweep/f50/`、`training/logs/inst_g_buggy/gate_sweep/f50/` |
 
 **模式定義**
 - `off` — gate bias 關閉（`enable_gate` 前向不施加 bias）
@@ -176,7 +176,7 @@ gate 前向 bug 修正 = commit `e064087`（2026-07-09 12:17）。**修正是 co
 | 項目 | 值 |
 |---|---|
 | script | `training/diag/gate_bias_ablation.py --dataset sintel` |
-| ckpt | `training/logs/dyn_vggt_v3_s1_inst/ckpts/best.pt`（= run1 ep15） |
+| ckpt | `training/logs/inst_g/ckpts/best.pt`（= run1 ep15） |
 | `chunk_size` | 0 = 完整序列（`max_frames` 只截斷序列長度，不分塊） |
 | `k` | 30.0 |
 | `motion_thr` | 2.0 px |
@@ -215,8 +215,8 @@ gate 前向 bug 修正 = commit `e064087`（2026-07-09 12:17）。**修正是 co
 |---|---|
 | script | `training/diag/gate_bias_ablation.py --dataset sintel`，取 `off` 模式 |
 | 比較對象 | `off` 模式 = 不施加 gate bias 的裸 pose，用以隔離「架構修復 + 訓練」的收益，排除 gate 本身 |
-| clean ckpt | `dyn_vggt_v3_s1_inst/ckpts/best.pt`（post-`e064087` 重訓，warm from `s0_inst.pt`） |
-| buggy ckpt | `dyn_vggt_v3_s1_inst_buggy`（pre-fix 訓練） |
+| clean ckpt | `inst_g/ckpts/best.pt`（post-`e064087` 重訓，warm from `s0_inst.pt`） |
+| buggy ckpt | `inst_g_buggy`（pre-fix 訓練） |
 | base ckpt | `checkpoints/VGGT-1B.pt` |
 | 序列 | f4~f32 為 13 seq；f50 為 14 seq |
 | **Δ% 基準** | ⚠️ **全檔唯一例外 —— 此表為跨版本比較，分母是被比較的那個版本**：<br>`clean vs buggy` = (clean_off − buggy_off) / **buggy_off**<br>`clean vs base` = (clean_off − base_off) / **base_off**<br>例：f50 `−14.3%` = (0.1537 − 0.1793) / 0.1793 |
@@ -261,9 +261,9 @@ oracle 模式的世代對比（同格子）：
 
 | 項目 | 值 |
 |---|---|
-| 品質來源 | `training/logs/dyn_vggt_v3_s1_inst/gate_quality/quality_f16.json` |
-| pose 來源 | `training/logs/dyn_vggt_v3_s1_inst/gate_sweep_scales/f16/results.json` |
-| ckpt | `dyn_vggt_v3_s1_inst/ckpts/best.pt`（clean run1 ep15） |
+| 品質來源 | `training/logs/inst_g/gate_quality/quality_f16.json` |
+| pose 來源 | `training/logs/inst_g/gate_sweep_scales/f16/results.json` |
+| ckpt | `inst_g/ckpts/best.pt`（clean run1 ep15） |
 | `max_frames` | **16**（兩份對齊） |
 | `motion_thr` | 2.0 px — GT mask 由 flow-residual 導出 |
 | `label_thr` | 0.5 — patch label 二值化閾值（pooled mask > 0.5 → dynamic） |
@@ -346,7 +346,7 @@ micro（132608 patch）：AUC 0.839 / F1 0.289 / p_dyn 0.274 / p_stat 0.065 / dy
 | 項目 | 值 |
 |---|---|
 | script | `training/benchmark/eval_sintel.py`（2026-07-22 改版，對齊 MonST3R depth 協議） |
-| Dyn-VGGT ckpt | `training/logs/dyn_vggt_v3_s1_inst/ckpts/best.pt`（= clean run1 ep15） |
+| Dyn-VGGT ckpt | `training/logs/inst_g/ckpts/best.pt`（= clean run1 ep15） |
 | pose 序列 | **14 seq**（`SINTEL_EVAL_SEQUENCES`） |
 | depth 序列 | **23 seq**（`final/` 全部，MonST3R `--full_seq` 口徑；共 1064 幀） |
 | depth 對齊 | **lad2** = scale+shift，Adam L1，lr=1e-4 / 1000 iters（`absolute_value_scaling2`，自 MonST3R verbatim port） |
@@ -393,14 +393,14 @@ micro（132608 patch）：AUC 0.839 / F1 0.289 / p_dyn 0.274 / p_stat 0.065 / dy
 | 項目 | 值 |
 |---|---|
 | script | `training/diag/flow_loss_probe.py --dataset po` |
-| ckpt | `logs/dyn_vggt_v3_s1_inst_smooth_temporal/ckpts/epoch_40.pt` |
+| ckpt | `logs/inst_gts/ckpts/epoch_40.pt` |
 | 資料 | PointOdyssey **train** split，20 clips × 16 幀，`dynamic_source=instance` |
 | 幀對 | clip 內相鄰對，**Δt ≤ 5**（對齊 `dynmask_inst` 的 gap-5 基準），雙向，n = 388 rows |
 | mask | `dynmask_inst`（靜態）∧ `point_masks`（GT depth 有效）；平均覆蓋 67.3% 像素 |
 | target | RAFT-large（torchvision DEFAULT 權重，20 iters），跑在模型輸入解析度上（518 zero-pad 至 8 的倍數後裁回） |
 | ego-flow | `warp_by_disp` 視差形式，monst3r `goem_opt.py:196` 逐行移植 |
 | loss | `smooth_L1_loss_fn`（beta=1.0, per_pixel_thre=50），monst3r `optimizer.py:18` 逐行移植 |
-| 資料來源 | `outputs/dyn_vggt_v3_s1_inst_smooth_temporal/flow_loss_probe/results_po.json` |
+| 資料來源 | `outputs/inst_gts/flow_loss_probe/results_po.json` |
 
 **變體定義**(ego-flow 用什麼幾何量生成;mask 與 target 三者共用)
 
@@ -498,7 +498,7 @@ NaN 率 0.0%;`per_pixel_thre=50` 的保留率 99.4~99.8%。
 | 項目 | 值 |
 |---|---|
 | script | `training/diag/flow_pose_headroom.py` |
-| ckpt | `logs/dyn_vggt_v3_s1_inst_smooth_temporal/ckpts/epoch_30.pt`(ATE 0.1343) |
+| ckpt | `logs/inst_gts/ckpts/epoch_30.pt`(ATE 0.1343) |
 | 做什麼 | **網路凍結**，只把它輸出的 pose 當變數微調(每幀 6 個數，初值 0)，最小化對 RAFT 的 flow 殘差 |
 | 序列 | Sintel 14 seq，每序列前 50 幀，**Δt=1** |
 | 迭代 | 300 步 Adam，lr 1e-3，每 25 步評一次 ATE |

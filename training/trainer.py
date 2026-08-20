@@ -110,7 +110,7 @@ class Trainer:
             accum_steps: Number of steps to accumulate gradients before an optimizer step.
             oracle_gate: If {"enabled": True, ...}, replaces the model's own gate bias with one
                 built directly from batch["motion_mask"] (GT dynamic mask) on every forward pass
-                (see loss.oracle_gate_logits_from_mask and dyn_vggt_v3_s1_oracle_camera_only.yaml).
+                (see loss.oracle_gate_logits_from_mask and the oracle_camera_only ablation).
                 Used to test the v3 architectural bet in isolation from gate-predictor quality.
             resume: CLI-driven (--resume), not config-driven. False (default): always load
                 checkpoint.resume_checkpoint_path (the experiment's warm-start/base weights);

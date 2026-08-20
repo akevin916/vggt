@@ -1056,7 +1056,7 @@ def compute_gate_loss(predictions, batch, patch_size=14, alpha_m=10.0, beta_m=0.
 
 def oracle_gate_logits_from_mask(motion_mask: torch.Tensor, patch_size: int = 14, k: float = 30.0) -> torch.Tensor:
     """Build a gate_logits_override straight from the GT dynamic mask (m*_inst), for the
-    oracle-gate training ablation (dyn_vggt_v3_s1_oracle_camera_only.yaml): tests whether a
+    oracle-gate training ablation (the oracle_camera_only ablation; that config was never kept on disk): tests whether a
     camera token that structurally only aggregates static patches yields better pose, isolated
     from whether the learned gate predictor is accurate (docs/dyn_vggt_method_v3.md gate
     diagnostics). Same construction as diag/gate_eval.py's oracle mode:

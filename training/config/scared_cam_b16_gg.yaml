@@ -1,21 +1,7 @@
-# SCARED (endoscopy) camera-pose adaptation.
+# SCARED camera-pose adaptation -- the arm where the GATE IS TRAINED.
 #
-# Question: does the v3 lineage adapt to endoscopy at all, and what does adaptation cost on
-# the natural-scene benchmarks? Zero-shot numbers to beat (benchmark/eval_scared.py, val
-# split, 6 keyframes x 50 frames, ATE in mm / as a fraction of the GT trajectory extent):
-#     VGGT-1B 1.818 (4.39%) | inst_gate_init 1.817 | inst_g 1.734 (4.15%) | inst_gts 1.887
-# Note the Sintel-best checkpoint (inst_gts, Sintel ATE 0.1343) is the WORST of the four here.
-#
-# THIS FILE IS ONE HALF OF A PAIR. The two differ ONLY in how many global blocks are
-# unfrozen; everything else is identical so the comparison is clean:
-#     scared_cam_b2.yaml   -- blocks 8,9 trainable  (14 blocks frozen)
-#     scared_cam_b16.yaml  -- blocks 8..23 trainable
-# History: the pair exists because the original single config intended 8..23 but its glob
-# `*aggregator.global_blocks.[0-7]*` also matched 10-23 (wcmatch `[0-7]` eats ONE character,
-# the trailing `*` eats the second digit), so what actually ran was the 2-block variant --
-# and it reached ATE 0.956 mm (-45% vs inst_g) in 3 epochs, which is why it is worth keeping
-# as its own arm rather than discarding. Every pre-2026-08-18 S1 config still carries the
-# same glob bug.
+# INHERITS scared_cam_b16.yaml (read its header first: the question, the zero-shot numbers to
+# beat, and why max_epochs must stay 10). Only the gate-related deltas live here.
 #
 # THE GATE IS TRAINED IN THIS RUN. This is the arm that tests whether it can be -- the b2 and
 # b16 arms leave it inert, and this one does not.
@@ -51,63 +37,11 @@
 # model exactly on the kink, but this run warm-starts from inst_g.pt, whose gate_predictor is
 # trained (linear2 |w| ~ 0.09, not zero), so an UNMEASURED fraction of patches starts already
 # dead. Measure it before trusting this arm. See aggregator._gated_global_block_forward.
-#
-# Channel B now runs on SCARED (`pose_eval.dataset: scared`) instead of Sintel: it scores the
-# live model with benchmark/eval_scared.py on the SAME val split channel A computes loss over,
-# so `best_ate.pt` is selected on the real metric rather than on camera loss alone.
-#
-# max_epochs: 10 -- NOT just "stop earlier". `where = epoch / max_epochs` drives the LR
-# schedule (trainer.py:845), so this number reshapes the whole cosine curve: warmup is 750
-# steps instead of 1500, and by epoch 9 the LR is 8.2e-7 instead of 1.9e-5. Every arm of this
-# comparison must therefore share it -- a 10-epoch run is not the first 10 epochs of a
-# 20-epoch run, and changing it mid-run makes the LR jump discontinuously on resume.
-#
-# Inherits everything from default.yaml; only the deltas below are specified.
 defaults:
-  - default
+  - scared_cam_b16
   - _self_
 
 exp_name: scared_cam_b16_gg
-num_workers: 4
-accum_steps: 1
-val_epoch_freq: 1
-max_img_per_gpu: 16
-max_epochs: 10
-limit_train_batches: 1500
-
-pose_eval:
-  enabled: true
-  dataset: scared
-  every_n_epochs: 1
-  split: val          # same split as channel A, on purpose (SCARED has no separate eval set)
-  n_frames: 50        # 6 keyframes x 50 frames, one forward pass each; ~mins per epoch
-  max_depth: 200.0    # mm (SCARED p99.9 <= 165)
-
-
-data:
-  train:
-    common_config:
-      img_nums: [4, 16]
-    dataset:
-      dataset_configs:
-        - _target_: data.datasets.scared.ScaredDataset
-          split: train
-          SCARED_DIR: ../data/train/scared
-          len_train: 6000
-          # millimetres, unlike every other dataset here (see docs/scared_dataset.md §3).
-          # 655.35 is the conversion ceiling; each keyframe's p99.9 is <= 165 mm.
-          depth_max: 655.35
-          dynamic_source: none
-  val:
-    common_config:
-      img_nums: [4, 16]
-    dataset:
-      dataset_configs:
-        - _target_: data.datasets.scared.ScaredDataset
-          split: val
-          SCARED_DIR: ../data/train/scared
-          dynamic_source: none
-
 
 logging:
   scalar_keys_to_log:
@@ -126,39 +60,14 @@ logging:
         - gate_g_median
         - gate_frac_active
 
-
 checkpoint:
-  save_freq: 5
-  save_steps_freq: 1000
-  resume_checkpoint_path: checkpoints/inst_g.pt
-  # inst_g's gate sits at median logit -5.4 on SCARED, where the gradient is ~0 and 15k steps
-  # of Adam at lr 3e-5 could not walk it back to 0 (that needs ~180k). Zeroing the 257-number
-  # output layer puts it at g=0 -- the forward pass is UNCHANGED (every bias was already 0)
-  # but the gradient goes from 0 to its maximum. Warm start only; --resume never re-triggers it.
+  # Warm start only (never on --resume). Zeroes GatePredictor.linear2 so every logit returns
+  # to g=0, the one point where d(bias)/dg is largest. See trainer._reset_gate_head.
   reset_gate_head: True
 
-
-loss:
-  camera:
-    weight: 5.0
-    loss_type: "l1"
-    gamma: 0.6
-  depth: null
-  motion: null
-  flow: null
-  reproj: null
-  tsmooth: null
-  gate: null
-  static_photo: null
-  camera_smooth: null
-
-
 optim:
-  optimizer:
-    lr: 3e-5
-  # global_blocks 8..23 trainable, plus camera_head + camera/register tokens -- the §8.3
-  # run-1 unfreeze set, gate_predictor INCLUDED. Note the ABSENT trailing `*`: `[0-7]*` would
-  # also match 10-23 (see the header), which is precisely the b2 arm.
+  # Parent's list MINUS gate_predictor -- that is the whole point of this arm.
+  # Hydra REPLACES lists rather than merging them, so the whole list is restated.
   frozen_module_names:
       - "*aggregator.patch_embed*"
       - "*aggregator.frame_blocks*"
@@ -170,32 +79,13 @@ optim:
       - module_name: ["aggregator.global_blocks", "camera_head"]
         max_norm: 1.0
         norm_type: 2
-      - module_name: ["aggregator.gate_predictor"]
-        max_norm: 1.0
-        norm_type: 2
       - module_name: ["aggregator.camera_token", "aggregator.register_token"]
         max_norm: 1.0
         norm_type: 2
-  options:
-    lr:
-      - scheduler:
-          _target_: fvcore.common.param_scheduler.CompositeParamScheduler
-          schedulers:
-            - _target_: fvcore.common.param_scheduler.LinearParamScheduler
-              start_value: 1e-8
-              end_value: 3e-5
-            - _target_: fvcore.common.param_scheduler.CosineParamScheduler
-              start_value: 3e-5
-              end_value: 1e-8
-          lengths: [0.05, 0.95]
-          interval_scaling: ['rescaled', 'rescaled']
-
+      - module_name: ["aggregator.gate_predictor"]   # the only newly-trainable module
+        max_norm: 1.0
+        norm_type: 2
 
 model:
-  enable_temporal: True
-  enable_motion: False
-  enable_flow: False
-  enable_gate: True
-  gate_block_iter: 7
   gate_pose_grad: True
   gate_leaky: 0.1        # clamp -> leaky, so a patch that drifts below g=0 can come back

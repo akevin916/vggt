@@ -1,6 +1,6 @@
 # Dyn-VGGT v3 — S1, 強化的軌跡平滑先驗（一階 + 二階）。
 #
-# 相對 run 2（dyn_vggt_v3_s1_inst_smooth_temporal，目前最佳 lineage）只動 camera_smooth 一項：
+# 相對 run 2（inst_gts，目前最佳 lineage）只動 camera_smooth 一項：
 #   (a) 加入一階（罰運動本身，MonST3R relative_pose_loss 的形式）
 #   (b) 把整個平滑項的權重拉到主導地位（目前只佔目標函數 2.9%）
 # 這兩件事概念上是同一個介入（「強的一階先驗」），分開測要兩輪 26 小時；先合併測，若有效再拆。
@@ -26,10 +26,10 @@
 # 讀結果的方式 —— **必須逐序列，不能只看平均**。一階的價值集中在最爛的少數序列，
 # 平均值會被容易序列的退步抵銷掉。要問的是「cave_2 / temple_3 有沒有被拉回來」。
 defaults:
-  - dyn_vggt_v3_s1_inst_smooth_temporal
+  - inst_gts
   - _self_
 
-exp_name: dyn_vggt_v3_s1_inst_smooth_o1
+exp_name: inst_gts_o1
 max_epochs: 20
 
 
@@ -42,12 +42,12 @@ checkpoint:
   save_freq: 5
   # 純權重。完整 trainer checkpoint 帶 prev_epoch=29，`while self.epoch < self.max_epochs`
   # (trainer.py:495) 會直接不進迴圈 —— 靜默結束、exit code 0、無 traceback。
-  resume_checkpoint_path: checkpoints/dyn_inst_temporal_smooth_weights.pt
+  resume_checkpoint_path: checkpoints/inst_gts.pt
 
 
 loss:
   camera_smooth:
-    # 校準自 dyn_vggt_v3_s1_inst_smooth_o1_smoke（21 步、同 warm start、clip 形狀釘在最壞情況）。
+    # 校準自 inst_gts_o1_smoke（21 步、同 warm start、clip 形狀釘在最壞情況）。
     # 一階是速度、二階是加速度，不同量綱，不能給同一個權重。量到的 per-order（未加權）：
     #     一階 T1 0.00178 + R1 0.00060 = 0.00239
     #     二階 T2 0.00078 + R2 0.00054 = 0.00132        二階/一階 = 0.553

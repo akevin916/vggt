@@ -56,24 +56,31 @@ python benchmark/eval_sintel.py --ckpt checkpoints/dyn_vggt_s0.pt
 # 單 seq smoke 加 --seq_list alley_2
 ```
 
-### Gate 診斷（視覺化為主）
+### Gate 診斷
 
-主入口 `diag/vis/gate.py`：輸出 PO 的 `m_gt | m*_patch | g` 拼圖，或 Sintel 的 `m*_raft_patch`（flow-residual）對照。
+**數字**走 `diag/gate_eval.py`（2026-08-19 合併了舊的 `gate_quality.py` + `gate_bias_ablation.py`，
+兩者共用同一次 forward）；**畫面**走 `diag/vis/gate_gif.py`。舊的 `diag/vis/gate.py` /
+`gate_temporal.py` 已刪除。
 
 ```bash
-# PO in-domain（預設）
-python diag/vis/gate.py --ckpt logs/dyn_vggt_v3_s1/ckpts/checkpoint.pt
+# 預設：quality（AUC/F1/calibration）與 pose（off/predicted/oracle 的 ATE）都跑
+python diag/gate_eval.py --ckpt checkpoints/inst_g.pt --all_seqs
 
-# Sintel cross-domain
-python diag/vis/gate.py --ckpt checkpoints/dyn_vggt_v3_s1.pt --dataset sintel
+# 只看 gate 準不準
+python diag/gate_eval.py --ckpt logs/inst_gts/ckpts/epoch_30.pt --metrics quality --all_seqs
 
-# 兩者都跑，並寫入最小 summary.json
-python diag/vis/gate.py --ckpt checkpoints/dyn_vggt_v3_s1.pt --dataset all --metrics
+# PointOdyssey（只支援 pose）
+python diag/gate_eval.py --ckpt checkpoints/inst_g.pt --dataset po --metrics pose
+
+# 整段序列的 σ(g) 動畫（絕對 0..1 色階）
+python diag/vis/gate_gif.py --ckpt checkpoints/inst_g.pt
 ```
 
-輸出目錄：`logs/<exp>/vis_gate/`（`po/`、`sintel/` 子目錄）。
+輸出：`outputs/gate_quality/<exp>/quality_f<N>.json`、`outputs/gate_bias_ablation[_po]/<exp>/results.json`、
+`outputs/gate_gif/<exp>/`。
 
-終端會印簡短診斷：`σ(g)` 在 dynamic/static patch 的分離度（gap）、acc@0.5。加 `--metrics` 才寫 `summary.json`。
+**判讀 gate 品質一律用 AUC/F1，不要用 BCE** —— BCE 的目標是 average-pool 後的軟標籤，
+boundary patch 有不可約的 floor，val BCE 會看似 overfit 但與高 AUC 並存。
 
 ### 目前結果
 

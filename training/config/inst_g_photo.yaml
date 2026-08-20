@@ -18,7 +18,7 @@
 #   The export filename carries the epoch on purpose. `best.pt` is a MOVING TARGET -- reading it
 #   mid-training gives whatever epoch was best so far, and an eval json recording "ckpt=best.pt"
 #   cannot be reproduced later. That already bit table.md's f12 row (measured on ep7, not ep15).
-#   Do NOT name it dyn_vggt_v3_s1_inst.pt: archive/checkpoints/ has a PRE-FIX (07-05, buggy-gen)
+#   Do NOT name it inst_g.pt: archive/checkpoints/ has a PRE-FIX (07-05, buggy-gen)
 #   export under exactly that name, and warm-starting off it silently reproduces the abandoned
 #   buggy-init lineage.
 #
@@ -36,7 +36,7 @@ defaults:
   - default
   - _self_
 
-exp_name: dyn_vggt_v3_s1_inst_photo
+exp_name: inst_g_photo
 num_workers: 0
 accum_steps: 1
 val_epoch_freq: 1
@@ -109,15 +109,15 @@ logging:
 checkpoint:
   save_freq: 5
   # Warm-start from run 1 ep15 (see header). checkpoints/dyn_vggt_v3_run1_ep15.pt referenced
-  # above no longer exists on disk; verified checkpoints/dyn_vggt_v3_s1_inst.pt is byte-identical
-  # to logs/dyn_vggt_v3_s1_inst/ckpts/best.pt's model weights (same run1-ep15 checkpoint), so
-  # it's used here instead. Do NOT confuse with archive/checkpoints/dyn_vggt_v3_s1_inst.pt, the
+  # above no longer exists on disk; verified checkpoints/inst_g.pt is byte-identical
+  # to logs/inst_g/ckpts/best.pt's model weights (same run1-ep15 checkpoint), so
+  # it's used here instead. Do NOT confuse with archive/checkpoints/inst_g.pt, the
   # pre-fix buggy-gen export (see run 3's header warning above).
   # This is ALWAYS the warm-start weights now -- no need to flip to null after epoch 1 anymore.
   # launch.py's --resume flag (not this field) controls whether a run continues its own
   # logs/<exp>/ckpts/last.pt instead; Trainer.__init__ refuses to start if the two disagree
   # (existing last.pt without --resume, or --resume without an existing last.pt).
-  resume_checkpoint_path: checkpoints/dyn_vggt_v3_s1_inst.pt
+  resume_checkpoint_path: checkpoints/inst_g.pt
 
 
 loss:

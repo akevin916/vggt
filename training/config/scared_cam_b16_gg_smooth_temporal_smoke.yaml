@@ -1,0 +1,18 @@
+# Smoke test for scared_cam_b16_gg_smooth_temporal -- 25 steps, one epoch, no channel B.
+#
+# Answers in minutes what a real run would take hours to reveal: does the config compose, do
+# the newly-trainable temporal_blocks fit in VRAM at img_nums [4,12], and does
+# loss_camera_smooth actually appear in the log (a null loss block logs nothing and looks
+# identical to a working one at a glance).
+#
+# INHERITS the real config, so it can never drift from what it is supposed to be smoking.
+defaults:
+  - scared_cam_b16_gg_smooth_temporal
+  - _self_
+
+exp_name: scared_cam_b16_gg_smooth_temporal_smoke
+max_epochs: 1
+limit_train_batches: 25
+
+pose_eval:
+  enabled: false   # channel B costs minutes per epoch; not what this is testing
