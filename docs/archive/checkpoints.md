@@ -35,41 +35,52 @@
 > **注意 Sintel 與 SCARED 的排序相反**：Sintel 最好的 `inst_gts`（0.1343）在 SCARED 是四支裡**最差**
 > （1.887，比未微調的 VGGT-1B 還差）。跨域不是自動成立的。
 
-### 1.2 已封存 —— `archive/checkpoints/`（10 支，48.6 G，全部是孤本：`logs/` 沒有對應 ckpts 目錄）
+### 1.2 已封存 —— `archive/checkpoints/`（全部是孤本：`logs/` 沒有對應 ckpts 目錄）
+
+原本 10 支 48.6 G，2026-08-20 刪掉 8 支（38.4 G），**現存只剩最後兩列**。刪掉的那 8 支數字全部
+在下表，`table.md` 表 1 有對應列可交叉核對；但**權重本身回不來了**——它們在 `logs/` 沒有 ckpts
+目錄，重現要重跑當年的 config。
 
 | 權重 | 世代 | 做了什麼 | ATE | ATE(12) | RPE-t | RPE-r | AbsRel | 狀態 |
 |---|---|---|---|---|---|---|---|---|
-| `dyn_vggt_s1b.pt` | v1 | 雙場 `X=X^can+m·Δ`，S1 第二版（表 1 的 `v1 S1b`） | 0.1692 | 0.0680 | 0.0770 | 0.5502 | 0.2790 | 待刪 |
-| `dyn_vggt_s1_v2.pt` | v2 | v2 的 S1（架構同 v1，見 §2.2） | 0.1732 | 0.0688 | 0.0685 | 0.4857 | 0.2558 | 待刪 |
-| `dyn_vggt_s2.pt` | v1 | 雙場 S2（全網解凍）。**pose 全面崩壞**，ATE(12) 0.1113 是全表最差 | 0.2035 | 0.1113 | 0.0896 | 0.8909 | 0.2840 | 待刪 |
-| `dyn_vggt_v3_s1_inst.pt` | v3-**bug** | v3 gate 的第一版，在 frame-interleaved attention bug 下訓的 | 0.1790 | 0.0706 | 0.0828 | 0.5200 | 0.2892 | 待刪 |
-| `gate_badmask.pt` | v3-**bug** | **與上一列 byte-identical**（同一份權重存兩個名字） | 0.1790 | 0.0706 | 0.0828 | 0.5200 | 0.2892 | 待刪（重複） |
-| `dyn_vggt_v3_s1_inst_photo.pt` | v3-**bug** | 加 static-photo loss（該 run 的 ep19）。sqRel **6.210** 全場最差（base 2.348）→ 少數像素巨大誤差 | 0.1620 | 0.0666 | 0.0813 | 0.5474 | 0.2732 | 待刪 |
-| `dyn_vggt_v3_s1_smooth_temporal.pt` | v3-**bug** | temporal + camera_smooth。⚠️ **是該 run 的 ep2**（計畫 20 epoch），不是收斂值 | 0.1568 | 0.0535 | 0.0720 | 0.4634 | 0.2458 | 待刪 |
-| `dyn_vggt_v3_oracle.pt` | v3-**bug** | `oracle_camera_only` 消融（ep19）：**只留 camera_head**，用 GT mask 當完美 gate。depth 全面崩潰（AbsRel 0.563、δ1 0.430），pose 數字須在此前提下讀 | 0.1757 | 0.0685 | 0.0649 | 0.4769 | **0.5631** | 待刪 |
+| `dyn_vggt_s1b.pt` | v1 | 雙場 `X=X^can+m·Δ`，S1 第二版（表 1 的 `v1 S1b`） | 0.1692 | 0.0680 | 0.0770 | 0.5502 | 0.2790 | 已刪 08-20 |
+| `dyn_vggt_s1_v2.pt` | v2 | v2 的 S1（架構同 v1，見 §2.2） | 0.1732 | 0.0688 | 0.0685 | 0.4857 | 0.2558 | 已刪 08-20 |
+| `dyn_vggt_s2.pt` | v1 | 雙場 S2（全網解凍）。**pose 全面崩壞**，ATE(12) 0.1113 是全表最差 | 0.2035 | 0.1113 | 0.0896 | 0.8909 | 0.2840 | 已刪 08-20 |
+| `dyn_vggt_v3_s1_inst.pt` | v3-**bug** | v3 gate 的第一版，在 frame-interleaved attention bug 下訓的 | 0.1790 | 0.0706 | 0.0828 | 0.5200 | 0.2892 | 已刪 08-20 |
+| `gate_badmask.pt` | v3-**bug** | **與上一列 byte-identical**（同一份權重存兩個名字） | 0.1790 | 0.0706 | 0.0828 | 0.5200 | 0.2892 | 已刪 08-20（重複） |
+| `dyn_vggt_v3_s1_inst_photo.pt` | v3-**bug** | 加 static-photo loss（該 run 的 ep19）。sqRel **6.210** 全場最差（base 2.348）→ 少數像素巨大誤差 | 0.1620 | 0.0666 | 0.0813 | 0.5474 | 0.2732 | 已刪 08-20 |
+| `dyn_vggt_v3_s1_smooth_temporal.pt` | v3-**bug** | temporal + camera_smooth。⚠️ **是該 run 的 ep2**（計畫 20 epoch），不是收斂值 | 0.1568 | 0.0535 | 0.0720 | 0.4634 | 0.2458 | 已刪 08-20 |
+| `dyn_vggt_v3_oracle.pt` | v3-**bug** | `oracle_camera_only` 消融（ep19）：**只留 camera_head**，用 GT mask 當完美 gate。depth 全面崩潰（AbsRel 0.563、δ1 0.430），pose 數字須在此前提下讀 | 0.1757 | 0.0685 | 0.0649 | 0.4769 | **0.5631** | 已刪 08-20 |
 | `dyn_vggt_s1a.pt` | v1 | 雙場 S1 第一版（推測）。**檔名未出現在 table.md** | | | | | | **保留待驗** |
 | `dyn_vggt_s1_full.pt` | v1 | 雙場，全部 loss 開啟（推測）。**檔名未出現在 table.md** | | | | | | **保留待驗** |
 
 ### 1.3 訓練 run —— `training/logs/<run>/ckpts/`（含 optimizer state，6.5–9.2 G，可 resume）
 
-逐 epoch 的數字在 `logs/<run>/pose_eval/epoch_*/results.json`（全部 2.7 MB，**永遠保留**，
-刪 ckpt 不影響它）。下表只記每個 run 最好的那一點。
+> **2026-08-20 清理**：45 個 checkpoint 共 313 GB 刪除。已判陰性或棄用的線（egoflow ×3、
+> `photo_smooth_temporal`、`smooth_temporal_photo`）**只留 `best_ate.pt`**；4 個 smoke run 的
+> ckpt 全刪；byte-identical 的 `epoch_N` / `last` 對留 `epoch_N`（檔名帶身分，沒有 metadata 時
+> 那是唯一線索），刪 `last` —— 代價是那兩個 run 不能直接 `--resume`，要 resume 得先把
+> `epoch_N.pt` 複製成 `last.pt`。
 
-| run | 世代 | 做了什麼 | 最佳 | ATE | 備註 |
-|---|---|---|---|---|---|
-| `dyn_vggt_v3_s1_inst` | v3-clean | §8.3 run 1，gate + camera。24 epoch | ep15 | 0.1533 | = `inst_g.pt` |
-| `..._smooth_temporal` | v3-clean | run 1 + temporal + `L_camera_smooth`。50 epoch | ep30 | **0.1343** | = `inst_gts.pt`。ep30 後平台化在 0.134–0.136；windowed `best.pt` (ep17) 是 0.1651，**不可用** |
-| `..._photo_smooth_temporal` | v3-**bug-init** | 三因子全開，但 warm-start 自 buggy ckpt → lineage 不乾淨 | ep16 | 0.1534 | 全序列 0.1743，**比 base 還差，已確認棄用**。48 epoch 單調惡化到 0.2126 |
-| `..._smooth_temporal_photo` | v3-clean | 在收斂的 smooth_temporal 上加 static-photo | ep3 | 0.1413 | 只跑 3 epoch |
-| `..._smooth_o1` | v3-clean | `camera_smooth` 改一階（`orders=(1,2)`） | ep4 | 0.1371 | e4 後劣化到 0.1627 |
-| `..._egoflow` | v3-clean | `L_ego_flow` + 解凍 depth_head + 開 `L_depth` | ep4 | 0.1340 | **陰性**：起點就是最好，e20 劣化到 0.1551 |
-| `..._egoflow_gt` | v3-clean | 同上但 `use_gt_depth`（depth_head 保持凍結） | ep4 | 0.1346 | 陰性，→ 0.1429 |
-| `..._egoflow_gt_mask` | v3-clean | 同上 + `use_dynamic_mask: False` | ep4 | 0.1325 | 陰性，→ 0.1388 |
-| `scared_cam_b2` | v3-clean | SCARED 適應，只解凍 global block 8,9 | — | — | **無 eval 數據**（當時 `pose_eval` 未開），跑到 ep3 被 b16 取代 |
-| `scared_cam_b16` | v3-clean | SCARED 適應，解凍 global block 8–23 | ep8 | 0.9814 mm | b2/b16 只差解凍層數，其餘全同 |
-| `scared_cam_b16_gg` | v3-clean | b16 + `gate_pose_grad`（讓 pose loss 教 gate） | ep8 | 0.9464 mm | 中斷於 ep8/10 |
-| `scared_cam_b16_gg_smooth_temporal` | v3-clean | b16_gg + temporal + camera_smooth | ep8 | **0.9108 mm** | **2026-08-20 訓練中**，尚未收斂 |
-| smoke ×4 | — | wiring 驗證用（`egoflow_smoke`、`egoflow_gt_smoke`、`scared_cam_smoke`、`scared_cam_smoke_prev_0800`） | — | — | 目的是「跑不跑得起來」，權重無保留價值 |
+逐 epoch 的數字在 `logs/<run>/pose_eval/epoch_*/results.json`（全部 2.7 MB，**永遠保留**，
+刪 ckpt 不影響它）；`log.txt` 與 `tensorboard/` 同樣全數保留（共 646 MB）。下表只記每個 run
+最好的那一點，「現存」欄是清理後還在磁碟上的 ckpt。
+
+| run | 世代 | 做了什麼 | 最佳 | ATE | 現存 | 備註 |
+|---|---|---|---|---|---|---|
+| `dyn_vggt_v3_s1_inst` | v3-clean | §8.3 run 1，gate + camera。24 epoch | ep15 | 0.1533 | best, e10, e20, last | = `inst_g.pt` |
+| `..._smooth_temporal` | v3-clean | run 1 + temporal + `L_camera_smooth`。50 epoch | ep30 | **0.1343** | best, best_loss, e10–e50 | = `inst_gts.pt`。ep30 後平台化在 0.134–0.136；windowed `best.pt` (ep17) 是 0.1651，**不可用** |
+| `..._photo_smooth_temporal` | v3-**bug-init** | 三因子全開，但 warm-start 自 buggy ckpt → lineage 不乾淨 | ep16 | 0.1534 | best_ate | 全序列 0.1743，**比 base 還差，已確認棄用**。48 epoch 單調惡化到 0.2126 |
+| `..._smooth_temporal_photo` | v3-clean | 在收斂的 smooth_temporal 上加 static-photo | ep3 | 0.1413 | best_ate | 只跑 3 epoch |
+| `..._smooth_o1` | v3-clean | `camera_smooth` 改一階（`orders=(1,2)`） | ep4 | 0.1371 | 全 5 支 | e4 後劣化到 0.1627 |
+| `..._egoflow` | v3-clean | `L_ego_flow` + 解凍 depth_head + 開 `L_depth` | ep4 | 0.1340 | best_ate | **陰性**：起點就是最好，e20 劣化到 0.1551 |
+| `..._egoflow_gt` | v3-clean | 同上但 `use_gt_depth`（depth_head 保持凍結） | ep4 | 0.1346 | best_ate | 陰性，→ 0.1429 |
+| `..._egoflow_gt_mask` | v3-clean | 同上 + `use_dynamic_mask: False` | ep4 | 0.1325 | best_ate | 陰性，→ 0.1388 |
+| `scared_cam_b2` | v3-clean | SCARED 適應，只解凍 global block 8,9 | — | — | best_loss, last | **無 eval 數據**（當時 `pose_eval` 未開），跑到 ep3 被 b16 取代 |
+| `scared_cam_b16` | v3-clean | SCARED 適應，解凍 global block 8–23 | ep8 | 0.9814 mm | best_ate, best_loss, e5, e10 | b2/b16 只差解凍層數，其餘全同 |
+| `scared_cam_b16_gg` | v3-clean | b16 + `gate_pose_grad`（讓 pose loss 教 gate） | ep8 | 0.9464 mm | 全 4 支 | 中斷於 ep8/10 |
+| `scared_cam_b16_gg_smooth_temporal` | v3-clean | b16_gg + temporal + camera_smooth | ep8 | **0.9108 mm** | 全 4 支 | **2026-08-20 訓練中**，尚未收斂 |
+| smoke ×4 | — | wiring 驗證用（`egoflow_smoke`、`egoflow_gt_smoke`、`scared_cam_smoke`、`scared_cam_smoke_prev_0800`） | — | — | **無** | 目的是「跑不跑得起來」，權重無保留價值 |
 
 ### 1.4 為什麼 `s1a` / `s1_full` / `scared_cam_b2` 先不刪
 
