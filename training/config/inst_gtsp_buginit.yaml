@@ -1,4 +1,4 @@
-# Dyn-VGGT v3 — Stage S1, POST-FIX integrated run (docs/dyn_vggt_method_v3.md §8.3 "run 4").
+# Dyn-VGGT v3 — Stage S1, POST-FIX integrated run (docs/method.md §8.3 "run 4").
 #
 # WHAT CHANGED vs config/v3_bug/inst_gtsp_buginit.yaml
 #   The old sibling in v3_bug/ was trained on the BROKEN frame-interleaved gate forward

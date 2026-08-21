@@ -3,7 +3,7 @@
 Shared geometry for the L_ego_flow training loss (`loss.compute_ego_flow_loss`). The
 formulation is MonST3R's `warp_by_disp` (`reference/monst3r/dust3r/utils/goem_opt.py:196`,
 `use_depth=False` branch); what differs downstream is the *target* — see
-`docs/monst3r_loss_diff.md`.
+`docs/monst3r_design.md`.
 
 Why a module rather than an import from `diag/`: `loss.py` is training-layer code and must
 not depend on the diagnostic scripts (CLAUDE.md layering). `diag/flow_loss_probe.py` and

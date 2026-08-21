@@ -29,7 +29,7 @@ class MultitaskLoss(torch.nn.Module):
     #           dict is None the corresponding branch is skipped, so the original VGGT loss is unchanged.
     def __init__(self, camera=None, depth=None, point=None, track=None,
                  motion=None, flow=None, reproj=None, tsmooth=None,
-                 gate=None,    # v3: motion-gate BCE (docs/dyn_vggt_method_v3.md §5/§6)
+                 gate=None,    # v3: motion-gate BCE (docs/method.md §5/§6)
                  static_photo=None,   # v3 extension: static-region photometric consistency ("route B")
                  camera_smooth=None,  # v3 extension: camera-trajectory smoothness regularizer
                  ego_flow=None,       # v3 extension: pixel-space ego-flow reprojection consistency
@@ -375,7 +375,7 @@ def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
 # ----------------------------------------------------------------------------------------------------
 # v1/v2 Dyn-VGGT loss terms (motion / flow / reproj / tsmooth). See docs/archive/checkpoints.md §2.1
 # -- the per-section numbering of the old method doc is gone; the summary there is what survives.
-# Superseded by v3 (docs/dyn_vggt_method_v3.md); kept for the archived v1/v2 configs under training/config/v1/.
+# Superseded by v3 (docs/method.md); kept for the archived v1/v2 configs under training/config/v1/.
 # ----------------------------------------------------------------------------------------------------
 
 def compute_motion_loss(predictions, batch, supervise_valid_only=False,
@@ -504,7 +504,7 @@ def compute_reproj_loss(predictions, batch, huber_delta=0.01, use_dyn=True, norm
 def compute_static_photo_loss(predictions, batch, huber_delta=0.1, dyn_thresh=0.5, min_valid=100, **kwargs):
     """
     v3 extension: static-region cross-frame photometric consistency ("route B" from the
-    dyn_vggt_method_v3.md §5 discussion — not yet folded into the doc). A static GT point,
+    method.md §5 discussion — not yet folded into the doc). A static GT point,
     back-projected with GT depth and warped into frame t+1 with the model's PREDICTED pose,
     must land on a pixel whose appearance matches the source pixel. Restricting to the GT
     static mask (m*_inst) keeps this well-posed (dynamic points would violate the rigid-warp
@@ -620,7 +620,7 @@ def compute_ego_flow_loss(predictions, batch, beta=1.0, per_pixel_thre=50.0, dyn
     an observation that does NOT know the GT, which is what makes it an anchor during
     test-time optimization. With a GT-derived target this is a REPROJECTION LOSS — a
     pixel-space, depth-weighted restatement of the pose error — not a port of MonST3R's
-    flow loss (docs/monst3r_loss_diff.md).
+    flow loss (docs/monst3r_design.md).
 
     What it still buys over L_cam: the error is measured where it is observable (pixels,
     weighted by disparity) and it couples camera and depth heads through a single
@@ -830,7 +830,7 @@ def compute_camera_smooth_loss(predictions, batch, weight_trans=1.0, weight_rot=
                                orders=(2,), order_weights=None, **kwargs):
     """
     v3 extension: camera-trajectory smoothness regularizer (conversation notes, not yet folded
-    into dyn_vggt_method_v3.md). Penalises k-th order discontinuities in the PREDICTED pose
+    into method.md). Penalises k-th order discontinuities in the PREDICTED pose
     sequence — observed as visible trajectory "jumps" on hard/dynamic Sintel sequences, present
     in native VGGT-1B too (not a v3-specific regression). Purely self-referential (no GT pose
     used): a regularizer on the network's own output, analogous to MonST3R's trajectory-
@@ -999,7 +999,7 @@ def compute_tsmooth_loss(predictions, batch, tv_weight=0.1, **kwargs):
 def compute_gate_loss(predictions, batch, patch_size=14, alpha_m=10.0, beta_m=0.1,
                       hard_lo=None, hard_hi=None, **kwargs):
     """
-    v3 gate-predictor loss  L_gate = BCE( σ(g), m*_patch )  (docs/dyn_vggt_method_v3.md §5/§6).
+    v3 gate-predictor loss  L_gate = BCE( σ(g), m*_patch )  (docs/method.md §5/§6).
 
     gate_logits g [B, S, P_patch] are supervised against m*_patch: the GT dynamic
     mask, averaged/pooled to patch resolution.
@@ -1058,7 +1058,7 @@ def oracle_gate_logits_from_mask(motion_mask: torch.Tensor, patch_size: int = 14
     """Build a gate_logits_override straight from the GT dynamic mask (m*_inst), for the
     oracle-gate training ablation (the oracle_camera_only ablation; that config was never kept on disk): tests whether a
     camera token that structurally only aggregates static patches yields better pose, isolated
-    from whether the learned gate predictor is accurate (docs/dyn_vggt_method_v3.md gate
+    from whether the learned gate predictor is accurate (docs/method.md gate
     diagnostics). Same construction as diag/gate_eval.py's oracle mode:
     static patch -> -k, dynamic patch -> +k, saturating softplus so bias is ~0 / ~-k.
 

@@ -1,4 +1,4 @@
-# Dyn-VGGT v3 — Stage S1, POST-FIX factor-ablation RUN 1 / base (docs/dyn_vggt_method_v3.md §8.3).
+# Dyn-VGGT v3 — Stage S1, POST-FIX factor-ablation RUN 1 / base (docs/method.md §8.3).
 #
 # This is the GATE→CAMERA base of the four-run factor ablation. It answers the gating question
 # (§8.3 run 1): under the CORRECTED frame-interleaved gate forward (commit e064087), does the

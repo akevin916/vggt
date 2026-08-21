@@ -8,7 +8,7 @@
 # WHAT THIS IS NOT: the target is GT-derived, not RAFT. MonST3R's RAFT target is an observation
 # that does not know the GT — that independence is its entire value under test-time optimization.
 # With a GT target this is a pixel-space, disparity-weighted restatement of pose+depth error.
-# Do not describe this run as a MonST3R flow-loss port (docs/monst3r_loss_diff.md).
+# Do not describe this run as a MonST3R flow-loss port (docs/monst3r_design.md).
 #
 # EVIDENCE STATUS — READ BEFORE QUOTING ANY NUMBER AT THIS RUN:
 # the flow_loss_probe / flow_pose_headroom results (docs/table.md table 5) scored everything
@@ -97,7 +97,7 @@ checkpoint:
   # The strip is REQUIRED, not hygiene. A full trainer checkpoint carries prev_epoch=29, so
   # `while self.epoch < self.max_epochs` (trainer.py:495) starts at 30 and a 20-epoch config
   # exits immediately having trained nothing — silently, with exit code 0. And the LR schedule
-  # is driven by absolute epoch (`where = exact_epoch / max_epochs`, trainer.py:821), so even
+  # is driven by absolute epoch (`where = exact_epoch / max_epochs`, trainer.py:878), so even
   # with max_epochs raised the cosine would resume 60% through instead of running the fresh
   # 20-epoch schedule this run is designed around. Stripping also drops run 2's Adam moments,
   # which were accumulated over a different trainable set and a different objective.

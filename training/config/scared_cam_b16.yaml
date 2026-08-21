@@ -35,7 +35,7 @@
 # so `best_ate.pt` is selected on the real metric rather than on camera loss alone.
 #
 # max_epochs: 10 -- NOT just "stop earlier". `where = epoch / max_epochs` drives the LR
-# schedule (trainer.py:845), so this number reshapes the whole cosine curve: warmup is 750
+# schedule (trainer.py:878), so this number reshapes the whole cosine curve: warmup is 750
 # steps instead of 1500, and by epoch 9 the LR is 8.2e-7 instead of 1.9e-5. Every arm of this
 # comparison must therefore share it -- a 10-epoch run is not the first 10 epochs of a
 # 20-epoch run, and changing it mid-run makes the LR jump discontinuously on resume.

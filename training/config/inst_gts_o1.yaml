@@ -7,7 +7,7 @@
 # 對照組 = run 2 的 epoch_30（ATE 0.1343 / RPE-t 0.0633 / RPE-rot 0.3943 / AbsRel 0.1842，
 # 以 benchmark/eval_sintel.py --max_depth 80 同協定量得），已存在，不需另跑。
 #
-# 為什麼是一階 —— TTO 線的逐序列證據（docs/ego_flow_result.md §6）：
+# 為什麼是一階 —— TTO 線的逐序列證據（docs/ego_flow.md §6）：
 #     seq        base      二階 w30        一階 w30        一階+flow
 #     cave_2     0.8298    0.7483 (-10%)   0.5527 (-33%)   0.4600 (-45%)
 #     temple_3   0.4505    0.3849 (-15%)   0.1850 (-59%)   0.1770 (-61%)

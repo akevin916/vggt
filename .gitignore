@@ -159,3 +159,7 @@ training/logs/
 training/benchmark/__pycache__/
 outputs/
 /archive/
+
+# 個人工作文件：週計畫、交接、自我驗證題庫 —— 不進版控
+docs/planning/
+docs/reading/

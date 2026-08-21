@@ -26,7 +26,7 @@
 # quietly changing this one.
 #
 # MAX_EPOCHS STAYS 10, matching b16_gg. It is not a "run longer" knob: `where = epoch /
-# max_epochs` drives the LR schedule (trainer.py:845), so raising it reshapes the whole
+# max_epochs` drives the LR schedule (trainer.py:878), so raising it reshapes the whole
 # cosine -- warmup 1500 steps instead of 750, and a slower tail at every epoch. b16_gg's
 # header puts it plainly: "a 10-epoch run is not the first 10 epochs of a 20-epoch run".
 # Keeping 10 costs ~6.4 h here (38 min/epoch at batch 12) and keeps the LR curve out of the

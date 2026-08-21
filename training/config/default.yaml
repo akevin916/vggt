@@ -143,7 +143,7 @@ loss:
   ego_flow: null
   # v3 extension: ego-flow reprojection consistency. MonST3R's disparity-form ego-flow geometry
   # (ego_flow.py) scored against the GT-derived ego-flow rather than RAFT — so it is a pixel-space
-  # reprojection loss, NOT a port of MonST3R's flow loss (docs/monst3r_loss_diff.md). Requires the
+  # reprojection loss, NOT a port of MonST3R's flow loss (docs/monst3r_design.md). Requires the
   # depth head to be predicting AND unfrozen for the depth path to matter, plus loss.depth on:
   # flow-driven depth without a depth anchor lowers the residual and worsens ATE (headroom probe).
   # See inst_gts_egoflow.yaml.

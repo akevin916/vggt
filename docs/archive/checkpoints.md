@@ -142,8 +142,8 @@ config 檔名、`exp_name`、`logs/<exp>/` 目錄名在 2026-08-20 統一成 `<�
 
 > 原本的三份長文件（`dyn_vggt_method_v1.md` 270 行、`dyn_vggt_method_v2.md` 39 行、
 > `dyn_vggt_implementation.md` 230 行）於 2026-08-20 刪除，內容壓縮成本節。
-> 一頁式沿革見 [../dyn_vggt_history.md](../dyn_vggt_history.md)，現行方法見
-> [../dyn_vggt_method_v3.md](../dyn_vggt_method_v3.md)。
+> 現行方法見
+> [../method.md](../method.md)。
 
 ### 2.1 v1 —— 運動解耦的雙場表示
 

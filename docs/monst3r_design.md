@@ -195,4 +195,4 @@ L_gate   = Σ(BCE ⊙ keep) / Σ(keep)
 ## 相關
 
 - 實驗數字與探針結果：[table.md](table.md) 表 5
-- v3 方法本體：[dyn_vggt_method_v3.md](dyn_vggt_method_v3.md)
+- v3 方法本體：[method.md](method.md)

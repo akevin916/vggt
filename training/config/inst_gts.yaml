@@ -1,4 +1,4 @@
-# Dyn-VGGT v3 — Stage S1, POST-FIX factor-ablation RUN 2 (docs/dyn_vggt_method_v3.md §8.3).
+# Dyn-VGGT v3 — Stage S1, POST-FIX factor-ablation RUN 2 (docs/method.md §8.3).
 #
 # base (run 1) + ONE factor: unfreeze aggregator.temporal_blocks and add the camera_smooth loss
 # (§7.2). Measures the MARGINAL contribution of "temporal pathway + trajectory-acceleration

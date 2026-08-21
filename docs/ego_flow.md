@@ -3,13 +3,13 @@
 > **狀態：陰性，2026-08-08 收束。** 三個訓練 run 一致顯示這一項讓 Sintel 的相機位姿變差。
 > 本檔記錄數字、機制、以及過程中量到的幾個比陰性結果更有價值的東西。
 >
-> 設計與公式對照在 [monst3r_loss_diff.md](monst3r_loss_diff.md)；後處理（TTO）那條線見第 6 節。
+> 設計與公式對照在 [monst3r_design.md](monst3r_design.md)；後處理（TTO）那條線見第 6 節。
 
 ---
 
 ## 1. 這條線做了什麼
 
-[monst3r_loss_diff.md](monst3r_loss_diff.md) 記錄了前兩次移植 MonST3R 的失敗（`static_photo` 完全無效、`camera_smooth` 有效但不足）。這是第三次，也是唯一一次把**幾何式子逐行搬對**的：MonST3R 的視差形式 ego-flow（[ego_flow.py](../training/ego_flow.py)）、smooth-L1、逐像素離群丟棄。
+[monst3r_design.md](monst3r_design.md) 記錄了前兩次移植 MonST3R 的失敗（`static_photo` 完全無效、`camera_smooth` 有效但不足）。這是第三次，也是唯一一次把**幾何式子逐行搬對**的：MonST3R 的視差形式 ego-flow（[ego_flow.py](../training/ego_flow.py)）、smooth-L1、逐像素離群丟棄。
 
 **但 target 換成 GT 導出的 ego-flow，不是 RAFT。** 這個替換不是細節：MonST3R 的 RAFT target 有價值正是因為它**不知道 GT**，那是無標註優化下唯一的外部錨。換成 GT 導出之後，這是一個**像素空間、按視差加權的 reprojection loss**，不是 MonST3R flow loss 的移植——論文不得如此宣稱。
 
@@ -166,7 +166,7 @@ run 2 完全沒有訓練深度，退化幅度卻與 run 1 相當。原因是解�
 | 1 | **基準取錯列** | table.md 第 368 列是 `s1_inst/best`（run 1），不是 run 2 ep30。用它當基準會讓 RPE-rot 的 +6% 退步看起來像 −15% 改善。**同協定重量一次基準只要 10 分鐘**，做了兩輪分析才發現。 |
 | 2 | **診斷腳本的 `loss_camera` 無效** | `diag/ego_flow_residual.py` 早期版本用它當權重校準的分母，但 clip 未過 `trainer._process_batch` 的尺度正規化 → GT 平移是公尺、預測是正規化尺度，量到的是單位不符（5.67~36.8 vs 真值 0.0087，差三個數量級）。分母排序等於**場景公尺尺度**排序，就是那個 tell。該功能已移除。 |
 | 3 | **warm start 不剝檔案 → 靜默空轉** | 完整 trainer checkpoint 帶 `prev_epoch=29`，`while self.epoch < self.max_epochs`（trainer.py:495）直接不進迴圈，**exit code 0、無 traceback、log 看起來正常結束**。用 `extract_weights.py` 剝成純權重。 |
-| 4 | **`max_epochs` 定義排程長度** | LR 由 `where = exact_epoch / max_epochs` 驅動（trainer.py:821）。「先跑 20 再延長」不成立——跑完 LR 已是 1e-8，續訓等於不動，重開排程會再 warmup 一次把軌跡打散。**排程長度必須一開始就決定。** |
+| 4 | **`max_epochs` 定義排程長度** | LR 由 `where = exact_epoch / max_epochs` 驅動（trainer.py:878）。「先跑 20 再延長」不成立——跑完 LR 已是 1e-8，續訓等於不動，重開排程會再 warmup 一次把軌跡打散。**排程長度必須一開始就決定。** |
 | 5 | **凍結不擋梯度穿透** | `freeze.py:88` 只設 `requires_grad=False`，梯度照樣穿過該模組流進上游解凍的層。要真正切斷深度路徑必須用 GT 深度或 `detach()`。 |
 | 6 | **煙霧測試不釘 clip 形狀量不到峰值記憶體** | `DynamicBatchSampler` 從 `img_nums` 均勻抽長度、`batch = floor(16/S)`，影像數固定但 global attention 是 `B·(S·P)²` —— S=16 是 S=4 的 4 倍。20 步隨機抽很可能抽不到 16。要釘 `img_nums: [16,16]` + `aspects: [1.0,1.0]`。 |
 | 7 | **depth 協定不一致（未解）** | 同一個 ckpt、兩邊都宣稱 `max_depth=80`：`benchmark/eval_sintel.py` 給 AbsRel **0.1842**、TTO 線的 `eval_model_depth_on_sintel` 給 **0.2209**，δ1 卻幾乎一樣（0.7188 vs 0.7151）。兩份文件的數字若要並列必須先查清楚。 |

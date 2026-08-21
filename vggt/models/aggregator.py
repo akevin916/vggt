@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# v3: Motion-Gated Camera Aggregation (docs/dyn_vggt_method_v3.md §3)
+# v3: Motion-Gated Camera Aggregation (docs/method.md §3)
 # ---------------------------------------------------------------------------
 
 class GatePredictor(nn.Module):
@@ -309,7 +309,7 @@ class Aggregator(nn.Module):
             gate_logits_override: [B, S, P_patch] optional, eval-only. When given, these
                 logits (not the model's own GatePredictor output) are used to build the
                 camera/register attention bias in every gated global block — for oracle-mask
-                ablations (docs/dyn_vggt_method_v3.md gate diagnostics). The model's own
+                ablations (docs/method.md gate diagnostics). The model's own
                 gate_logits are still computed and returned unaffected, for logging.
 
         Returns:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Precompute PointOdyssey DYNAMIC MASKS (m*_inst, dyn_vggt_method_v3 §5.3b) via instance x
+"""Precompute PointOdyssey DYNAMIC MASKS (m*_inst, docs/method.md §5.3b) via instance x
 GT-scene-flow (the 'refined' method).
 
 Definition (motion-defined, robust; no RAFT / no ego / no depth):

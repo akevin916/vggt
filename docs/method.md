@@ -2,7 +2,7 @@
 
 > Feed-Forward Camera Pose in Dynamic Scenes —— 從**前向**、**監督**、**時序**三個軸解耦 pose 與物體運動
 >
-> 本文件是 [dyn_vggt_method_v2.md](archive/dyn_vggt_method_v2.md) 診斷後的**架構重設計**。
+> 本文件是 v2 診斷（[archive/checkpoints.md §2.2](archive/checkpoints.md)）後的**架構重設計**。
 > v2 確認 v1 的雙場 `X = X^can + m·Δ` 存在**雙線性不可辨識性**與**動態區偷懶捷徑**，且學習式 mask **跨域崩塌**（PO AUC 0.88 → Sintel 0.45）。
 > v3 **放棄一切幾何重表示**，把火力集中在 VGGT 唯一被實測落後的指標——**動態場景的相機 pose**。
 
@@ -24,18 +24,29 @@
 
 ---
 
-## ⚠️ 狀態更新（最後更新 2026-07-17）
+## 進度與下一步（最後更新 2026-07-27）
 
-> **① Gate**：機制成立但**尚未兌現**。
-> - **2026-07-06 的「連 oracle 都救不回」結論已作廢** —— 那是在有 bug 的門控前向上量的（詳見 §3.4 的 frame-interleaved 修正）。
-> - 修正後（commit `e064087`）乾淨重訓：**oracle 在短序列有效**（f12 −15.0%、f32 −11.0%），但**在完整序列歸零**（f50 +0.7%）。
-> - **`predicted` 在所有長度都 ≈ `off`（−0.3 ~ −1.5%）** —— gate 學到了排序（AUC 0.883）卻沒兌現到 pose。
-> - **欠自信已由校準曲線確認**（`signed_err = +0.095`）：gate 說 0.35 的 patch 實際有 56% 在動。**但 C-1（hard label + ignore band）只把它降到 +0.089、pose 無變化（Welch t=0.79）→ BCE boundary floor 不是病因。**
-> - 詳見 §3.6。
->
-> **② Motion Loss / ③ Temporal**：**乾淨世代零證據。** 現有數字全來自 bug 世代且已知不可信（見 §4.3 / §5.4）。§7.3 的 run 2/3/4 是兌現它們的唯一路徑。
->
-> **完整數據表**：[table.md](table.md)（含世代地圖、Δ% 基準、評測協定缺口）。
+> 這是全文唯一的「現在信什麼」來源。下面各章節（§3.6 / §4.3 / §5.4 / §8）只放診斷細節與逐序列數字，
+> 結論一律回來看這裡，不在該章重複下結論。完整數字見 [table.md](table.md)（含世代地圖、Δ% 基準、評測協定缺口）。
+
+### 時間軸
+
+| 日期 | 貢獻 | 動作 | 結果 | 下一步 |
+|---|---|---|---|---|
+| 2026-07-27 | ③ Temporal + Camera-Smooth | clean 世代重跑（`inst_gts`，同預算 warm from run1），**仍在訓練** | **目前 clean 家族 pose 最好**：`last.pt`（≈ep30+）ATE **0.1253**、ATE(12) **0.0470**、RPE-r **0.3867**，三項全表最低（除 MonST3R 外）；且單調下降未收斂（ep20 0.180 → ep30 0.134 → last 0.125）。⚠️ windowed `best.pt`（ep17）ATE 0.1651，比 `last` 差 24% —— **這條線只能用 `last.pt`，不可用 `best.pt`** | 等訓練收斂、用最終 ckpt 定論；**因子仍混淆**（temporal 解凍 + `camera_smooth` loss 疊在一起）——必須拆 temporal-only / smooth-only 才能歸因到哪一半在起作用 |
+| 2026-07-24 | ② Motion (Static-Photo) | clean 世代重跑（`inst_g_photo`，同預算 warm from run1） | **負結果**：full-seq 最佳 ep10 = 0.1583，**比自己的 warm-start 起點（0.1533）還差**，且 ep10→ep20 單調惡化 | 此路線**暫緩**，不建議疊進全開組合；若要救回需重新檢討 loss 設計（§4.2 的 GT-depth 假設或權重），非本次重跑範圍 |
+| 2026-07-10 | ①+②+③ 全開 | `inst_gtsp_buginit` | **lineage 不乾淨**（warm-start 自 buggy-init 而非 run1）→ ATE 0.1743，**比 base 還差**，已確認棄用 | 真正的「§7.3 run4」（乾淨 lineage、從 run1 warm-start 的全開組合）**尚未跑過** —— 待 ③ 定論後才值得跑，否則又要再棄一次 |
+| 2026-07-09 | ① Gate | 修正 frame-interleaved attention bug（commit `e064087`），使 2026-07-06 的「連 oracle 都救不回」舊結論作廢 | oracle 在短序列有效（f12 −15.0%、f32 −11.0%），**完整序列歸零**（f50 +0.7%）；`predicted` 在所有長度都 ≈ `off`（−0.3~−1.5%）——gate 學到排序（AUC 0.883）但沒兌現；欠自信已確認（`signed_err +0.095`），但 C-1（hard label）證偽「BCE boundary floor 是病因」，砍 floor 只降 signed_err 6%、pose 無變化 | **主瓶頸**：`predicted` 不兌現的病因未知。下一假說是 class imbalance（`dyn_frac=0.202`，正例只有負例 1/4）→ 需試 `pos_weight≈4` re-weight，**未驗證** |
+
+### 現在最值得做的三件事（依優先序）
+
+1. **等 ③ smooth_temporal 收斂並拆解**——目前唯一的正結果還混著兩個因子（temporal 結構 vs camera_smooth loss），不拆就不知道賣點在哪。
+2. **驗證 gate 欠自信的 class-imbalance 假說**（`pos_weight` re-weight）——這是①的唯一主瓶頸，且 BCE-floor 假說已被 C-1 排除，需要下一個候選解釋。
+3. **確認 ③ 有效後才重跑乾淨 lineage 的全開組合**（真正的 run4）——現有的全開數字是 lineage 汙染的負結果，不能當「全開沒用」的證據。
+
+> ② Motion 路線暫時擱置（clean 重跑是負結果），不在上述優先序中。
+
+> ⚠️ 讀以上任何 Δ 之前，先看 §8 的評測協定警告：單次比較 2σ 雜訊門檻 **16.9%**，且沒有 held-out 資料——上面 ③ 的 −18%（相對 warm-start 起點）與 −27%（相對 base）尚未過雜訊帶檢驗，屬於「很有希望但還不能拍板」的狀態。
 
 ---
 
@@ -133,11 +144,13 @@ v2 的現況是「motion 只當 **loss 端**的 gate」——這**改不了已�
            └── L_camera_smooth  (③ §5.3)
 ```
 
-| # | 貢獻 | 解決的根因 | 核心機制 | 開關 |
-|---|---|---|---|---|
-| **①** | **Gate Mechanism** | §1.3 前向耦合 | 中段 MLP 出 `g` → global attention 的 camera/register query 對動態 patch key 加 `−softplus(g)` bias；用運動定義的幾何標籤 `m*` 監督 | `enable_gate` + `loss.gate` |
-| **②** | **Motion Loss** | §1.3 監督不足 | 靜態區跨幀光度一致：GT 靜態點以**預測 pose** warp 到鄰幀，RGB 必須匹配 | `loss.static_photo` |
-| **③** | **Temporal Attention** | §1.3 時序未用 | 純時間軸 attention（每個空間位置 attend 自己的 S 幀）+ 軌跡平滑正則 | `enable_temporal` + `loss.camera_smooth` |
+根因對照見 §1.3；下表只列核心機制與開關：
+
+| # | 貢獻 | 核心機制 | 開關 |
+|---|---|---|---|
+| **①** | **Gate Mechanism** | 中段 MLP 出 `g` → global attention 的 camera/register query 對動態 patch key 加 `−softplus(g)` bias；用運動定義的幾何標籤 `m*` 監督 | `enable_gate` + `loss.gate` |
+| **②** | **Motion Loss** | 靜態區跨幀光度一致：GT 靜態點以**預測 pose** warp 到鄰幀，RGB 必須匹配 | `loss.static_photo` |
+| **③** | **Temporal Attention** | 純時間軸 attention（每個空間位置 attend 自己的 S 幀）+ 軌跡平滑正則 | `enable_temporal` + `loss.camera_smooth` |
 
 ---
 
@@ -201,7 +214,7 @@ bias[其他所有位置]                = 0                                     
 
 ### 3.3 全動態幀的欠定問題（潛在，尚未驗證）
 
-> **注意**：這個問題是在 §3.4 門控 bug **修正前**提出的，當時被誤判為「即使 oracle 也救不回 → 真正瓶頸」。bug 修正後 oracle 在短序列已明確有效（見頁首 banner），所以此處**只作為一個尚待驗證的潛在風險記錄**。
+> **注意**：此問題最初在 §3.4 bug 修正前被誤判為「真正瓶頸」；修正後已知不成立（見頁首「進度與下一步」），此處僅保留作潛在風險記錄。
 
 理論上若某幀幾乎全動態，門控排除絕大多數 patch → camera token 無料可聚合 → pose 可能**欠定**（資訊不足，非監督不足）。預留對策：
 1. **soft bias（`−softplus` 而非 `−∞`）**：全動態時仍保留微弱全局信號（現行 bias 已是 soft）。
@@ -236,7 +249,7 @@ L_gate = BCE( σ(g), m*_patch )      # gate_logits 不 detach → 梯度回流 p
 - **`m*_patch`**：pixel 級硬 0/1 動態 mask **average-pool 到 patch 格**的軟機率（`training/loss.py` 的 `m_star_patch`）。
 - gate predictor 的**輸入只有 patch token**（見 §3.1），**尚未**接入 §3.7 的殘差輸入通道。
 - **品質判斷用 AUC/F1，不看 BCE**：pool 後的軟標籤在 boundary patch 有不可約 floor，val BCE 會看似 overfit 卻與高 AUC 並存。
-- **C-1 變體（hard label + ignore band）**：`m*_patch ≥ hard_hi(0.7) → 1`、`≤ hard_lo(0.3) → 0`、中間 band **不算 loss**，用意是砍掉 boundary floor。實作在 `compute_gate_loss`，config `dyn_vggt_v3_s1_inst_hard`。**結果見 §3.6 —— 是 null result。**
+- **C-1 變體（hard label + ignore band）**：`m*_patch ≥ hard_hi(0.7) → 1`、`≤ hard_lo(0.3) → 0`、中間 band **不算 loss**，用意是砍掉 boundary floor。實作在 `compute_gate_loss`，config `inst_g_hard`。**結果見 §3.6 —— 是 null result。**
 
 #### 3.5.2 動態標籤 `m*` 的產生（現行）
 
@@ -256,7 +269,7 @@ instance 標籤讓 Sintel AUC **+0.183**，PO 只掉 0.058。**這是本貢獻�
 
 ### 3.6 診斷現況與已知限制
 
-> 完整表格見 [table.md](table.md)。以下為 clean 世代（post-`e064087`）的 run 1（`dyn_vggt_v3_s1_inst`）。
+> 完整表格見 [table.md](table.md)。以下為 clean 世代（post-`e064087`）的 run 1（`inst_g`）。
 
 **(a) oracle 頭空只存在於短序列** —— gate 是結構性的短序列工具：
 
@@ -340,22 +353,25 @@ GT 靜態點 —(GT depth 反投影)→ 相機系 —(模型『預測』相對 p
 
 ### 4.3 診斷現況與已知限制
 
-> ⚠️ **本貢獻在 clean 世代（post-`e064087`）零證據。**
+> 結論見頁首「進度與下一步」（2026-07-24 一列）：**clean 世代重跑已完成，是負結果。**
 
-現有唯一數字來自 **bug 世代**的 `dyn_vggt_v3_s1_inst_photo`（Sintel 完整序列，14 seq）：
+**clean 世代**（`inst_g_photo`，warm from run1、同預算）：
 
-| | ATE (14 seq) | vs base | **ATE (12 seq, 去 cave_2/temple_3)** | vs base |
+| | ATE (14 seq) | ATE(12) | RPE-t | RPE-r |
 |---|---|---|---|---|
-| VGGT-1B base | 0.1714 | — | 0.0618 | — |
-| v3bug photo | 0.1620 | −5.5% | 0.0666 | **+7.7%（更差）** |
+| warm-start 起點（run1 ep15） | 0.1533 | 0.0517 | 0.0671 | 0.4923 |
+| **photo，full-seq 最佳（ep10）** | **0.1583（比起點更差）** | 0.0496 | 0.0569 | 0.4562 |
 
-**那個 −5.5% 是離群值撐出來的** —— 整個 gain 來自把 `temple_3` 從 0.6049 拉到 0.4346；在 12 個正常序列上它**比 base 差**。且它的 `sqRel = 6.210` 是全場最差（base 2.348），代表少數 pixel 有巨大誤差。
+ep10 已是全程最佳——ep10→ep20 單調惡化（見 [table.md](table.md) 表1）。static-photo loss 沒有把 pose 往好的方向拉，反而略微傷害。
 
 **已知結構性問題**：
 1. 本節目前**只有一個 loss**。`loss.py` 裡其餘的 `motion`/`flow`/`reproj`/`tsmooth` 都是 v1/v2 遺留、v3 未開。一個 loss 撐一個等價貢獻偏薄 —— **待補**。
 2. `m*` 的幾何推導論述目前放在 §3.5.2（歸貢獻①），但它同時是本貢獻的立論基礎。歸屬待定。
+3. **負結果的原因尚未排查**：可能是 loss 權重、GT-depth 反投影的 scale 對齊、或遮擋防護不足，尚未逐一消融。
 
-**兌現路徑**：§7.3 的 run 3（乾淨世代、同預算、warm from run 1）。
+**歷史記錄（僅存檔，已知不可信）**：bug 世代的 `inst_g_photo` 曾顯示 ATE 0.1620（vs base −5.5%），但那是離群值撐出來的——整個 gain 來自把 `temple_3` 從 0.6049 拉到 0.4346，12 個正常序列上其實比 base 差（ATE(12) +7.7%），且 `sqRel 6.210` 全場最差。**方向與 clean 世代的負結果一致**，只是當時被離群值蓋過去。
+
+**兌現路徑**：§7.3 的 run 3 已完成，結果為負。**不建議繼續投入**，除非重新設計 loss（見上方結構性問題）。
 
 ---
 
@@ -392,16 +408,25 @@ VGGT 原生 aggregator 只有兩種 attention：**frame**（逐幀、單張影�
 
 ### 5.4 診斷現況與已知限制
 
-> ⚠️ **本貢獻從未被單獨隔離過。clean 世代零證據。**
+> 結論見頁首「進度與下一步」（2026-07-27 一列）：**clean 世代重跑已在進行，目前是全 clean 家族 pose 最好的結果，但仍在訓練、且因子未拆解。**
 
-- 唯一相關的 run 是 bug 世代的 `dyn_vggt_v3_s1_inst_smooth_temporal`，且：
-  - **被評測的 checkpoint 是 epoch 2**（`best.pt`，train steps 6003），config 預算是 20 epoch → **跑了 10%**；
-  - 它**同時**開了 temporal 解凍**和** `camera_smooth` loss → 兩個因子混在一起，無法歸因；
-  - 同組的 `s1_inst_smooth`（ep0 step36）與 `_v2`（ep0）死得更早。
-- **smooth/temporal 這條線至今沒有任何跑完的 run，也沒有任何 checkpoint 超過 epoch 4。**
-- 它在 bug 世代的數字（ATE 0.1568）**已被 clean 世代的 run 1（0.1533，沒有 temporal、沒有 smooth）超越** → 那個 0.1568 反映的可能只是 bug fix 的缺席。
+**clean 世代**（`inst_gts`，warm from run1、同預算）：
 
-**兌現路徑**：§7.3 的 run 2（乾淨世代、同預算）；若有效，需再拆 temporal-only vs smooth-only。
+| ckpt | ATE (14 seq) | ATE(12) | RPE-t | RPE-r |
+|---|---|---|---|---|
+| warm-start 起點（run1 ep15） | 0.1533 | 0.0517 | 0.0671 | 0.4923 |
+| windowed `best.pt`（ep17，⚠️不可信） | 0.1651 | — | — | — |
+| `epoch_30` | 0.1343 | 0.0500 | 0.0633 | 0.3943 |
+| **`last.pt`（≈ep30+，仍在訓練）** | **0.1253** | **0.0470** | 0.0596 | **0.3867** |
+
+- **單調下降未收斂**：ep20 0.180 → ep30 0.134 → `last` 0.125。還沒到可以定論的收斂點。
+- **windowed `best.pt` 選點不可信**：`best.pt`（ep17）比 `last` 差 24%（0.1651 vs 0.1253）——這條線**一律取 `last.pt`**，不要用 `best.pt`（見 [table.md](table.md) 表1附註）。
+- **因子仍混淆**：這個 run **同時**開了 temporal 解凍**和** `camera_smooth` loss，無法歸因是哪一半在起作用——§7.3 早已預告這個混淆，尚未拆解。
+- **尚未過雜訊帶檢驗**：相對 warm-start 起點 −18%、相對 base −27%，皆大於單次比較但小於 §8.3 的 2σ=16.9% 門檻的 1~1.6 倍——方向樂觀但按協定還不能拍板，須等收斂 + 用非報告指標驗證。
+
+**已棄用的舊數字**：bug 世代的同名 run（`best.pt`=epoch 2，config 預算 20 epoch，只跑了 10%）ATE 0.1568，且同時混了兩個因子；已被 clean 世代的 run1（0.1533，無 temporal、無 smooth）超越，說明那個數字反映的只是 bug fix 的缺席，無分析價值。
+
+**兌現路徑**：§7.3 的 run 2 已在跑（見上）；等收斂後，**下一步是拆 temporal-only vs smooth-only** 才能歸因到哪一半在起作用（見頁首優先序第 1 項）。
 
 ---
 
@@ -420,7 +445,7 @@ L = L_cam + L_depth + λ_g · L_gate  [+ λ_p · L_static_photo]  [+ λ_s · L_c
 - **`L_camera_smooth`（③）**：§5.3。
 - **中括號兩項由 yaml 開關**：`MultitaskLoss.forward` 只在對應 config block 存在時才加該項。兩者梯度**都只進預測 pose**，不碰幾何頭。
 
-**gate 品質一律用 AUC/F1 判斷，不看 BCE**：`m*_patch` 是 average-pool 的 soft 標籤，boundary patch 有不可約 floor，val BCE 會看似 overfit 卻與高 AUC 並存。
+**gate 品質判斷準則見 §3.5.1**（一律用 AUC/F1，不看 BCE）。
 
 **`valid_frame` 建議維持原本寬鬆的「有效點數 > 100」**，不要改成嚴格的「靜態點數 > 100」：後者會在多動態場景造成幀數不足，而 pose 監督是直接的、得不到對等好處。
 
@@ -470,13 +495,13 @@ VGGT 是強預訓練 baseline，**絕不從頭訓**。三階段漸進解凍。
 
 **統一架構（四個 run 共用，關鍵）**：所有 run 都建成 `enable_gate=True + enable_temporal=True`。run 1 裡 temporal 仍 γ=0 身分、且凍住（等於沒有），但 checkpoint 帶著這些權重 → run 2/3/4 能直接載 run 1、不會 missing key。
 
-| run | 貢獻 | base 上額外**解凍** | 額外 **loss** | warm-start | 測什麼 |
-|---|---|---|---|---|---|
-| **1（base）** | ① | —（gate_predictor + global 8–23 + camera_head）| —（`L_cam + L_gate`）| `s0_inst` | gate 對 pose 的效果（`predicted`→`oracle`？）|
-| **2** | ③ | temporal_blocks | `camera_smooth` | run 1 | temporal + 平滑的邊際貢獻 |
-| **3** | ② | depth_head*（可凍）| `static_photo`（**GT depth**）| run 1 | 獨立光度信號的邊際貢獻（守 depth）|
-| **3'** | ② 變體 | **depth_head** | `static_photo`（**預測深度**）+ `L_depth` 錨 | run 1 | pose+depth 聯合光度精修（帶耦合風險）|
-| **4** | ①+②+③ | temporal + depth_head | `camera_smooth` + `static_photo` + `L_depth` | run 1 | 全開的組合效果 |
+| run | 貢獻 | base 上額外**解凍** | 額外 **loss** | warm-start | 測什麼 | 現況 |
+|---|---|---|---|---|---|---|
+| **1（base）** | ① | —（gate_predictor + global 8–23 + camera_head）| —（`L_cam + L_gate`）| `s0_inst` | gate 對 pose 的效果（`predicted`→`oracle`？）| ✅ 完成（clean run1，best ep15，ATE 0.1533） |
+| **2** | ③ | temporal_blocks | `camera_smooth` | run 1 | temporal + 平滑的邊際貢獻 | 🔵 **進行中**（`smooth_temporal`；§5.4——目前全 clean 家族最佳，但未收斂、因子未拆） |
+| **3** | ② | depth_head*（可凍）| `static_photo`（**GT depth**）| run 1 | 獨立光度信號的邊際貢獻（守 depth）| ✅ 完成，**負結果**（`photo`；§4.3） |
+| **3'** | ② 變體 | **depth_head** | `static_photo`（**預測深度**）+ `L_depth` 錨 | run 1 | pose+depth 聯合光度精修（帶耦合風險）| ⬜ 未跑 |
+| **4** | ①+②+③ | temporal + depth_head | `camera_smooth` + `static_photo` + `L_depth` | run 1 | 全開的組合效果 | ⚠️ 曾跑一版但 lineage 汙染（`photo_smooth_temporal`，見頁首 2026-07-10）；**乾淨版未跑**，待 run 2 收斂+拆解後才值得跑 |
 
 \* run 3 用 GT depth 時 static_photo 梯度只進 pose，depth_head 可凍；run 3'（預測深度）**必須**解凍 depth_head 且開 `L_depth` 當錨（§4.2 變體）。
 

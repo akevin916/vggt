@@ -48,7 +48,7 @@ checkpoint:
   # Weights only. A full trainer checkpoint carries prev_epoch=29, so `while self.epoch <
   # self.max_epochs` (trainer.py:495) starts at 30 and a 20-epoch config exits immediately having
   # trained nothing — silently, exit code 0. The LR schedule is driven by absolute epoch
-  # (trainer.py:821) for the same reason. Produced with extract_weights.py from
+  # (trainer.py:878) for the same reason. Produced with extract_weights.py from
   # checkpoints/dyn_inst_temporal_smooth.pt (= run 2's epoch_30.pt, md5 67bbebf4...).
   resume_checkpoint_path: checkpoints/inst_gts.pt
 
