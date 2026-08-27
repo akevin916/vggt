@@ -1,0 +1,110 @@
+# C3VD, v3 machinery: gate + temporal + camera_smooth, warm-started from the inst lineage.
+#
+# This is the C3VD transcription of the best SCARED arm to date,
+# scared_cam_b16_gg_smooth_temporal_wide (val ATE 0.8150 vs the stock-VGGT baseline 0.9705).
+# That arm is four stacked deltas; rather than rebuild the chain, this file applies all four
+# on top of c3vd_cam_vanilla, which already carries the C3VD data block. Read it against
+# scared_cam_b16_gg{,_smooth_temporal{,_wide}}.yaml -- the four deltas are:
+#
+#   b16 -> gg              : gate machinery ON and gate_predictor TRAINABLE; gate_pose_grad,
+#                            gate_leaky 0.1, reset_gate_head on warm start.
+#   gg  -> smooth_temporal : temporal_blocks TRAINABLE, + L_camera_smooth (weight 3.0).
+#   ... -> wide            : nearby_expand_range 120. ALREADY IN c3vd_cam_vanilla -- on C3VD
+#                            the wide window is not an arm, it is the measured default (see
+#                            that file's header: +-24 gives 7% baseline/depth, +-120 gives 37%).
+#   warm start             : checkpoints/inst_g.pt instead of stock VGGT-1B.
+#
+# ⚠️ WHAT THE GATE IS AND IS NOT DOING HERE. C3VD is a RIGID silicone phantom filmed by a
+# moving camera. There is no independently moving object anywhere in the dataset, and
+# C3vdDataset hard-errors on any dynamic_source but "none". `loss.gate` is therefore null and
+# the predictor is trained ONLY through the pose gradient (gate_pose_grad: True). So this is
+# NOT dynamic-object suppression; it is a free-form per-patch attention reweighting on the
+# camera/register query rows, which happens to be the same thing that helped on SCARED. Do
+# not describe it as motion gating in the report, and do not read gate_frac_active as a
+# dynamics measurement -- on this dataset the "correct" answer is that nothing is dynamic.
+#
+# WARM START CHOICE, stated because it is arguable. inst_g.pt is used for PARITY with the
+# SCARED arm this transcribes (that arm inherits it through scared_cam_b16), so the two
+# datasets' results can be read side by side. inst_gts.pt is the lineage-matched alternative
+# -- it already carries trained temporal blocks for the recipe this file actually runs -- and
+# is a one-line change. Neither is obviously right; parity was chosen over lineage match.
+#
+# ⚠️ VRAM IS THE OPEN RISK. The SCARED arm peaked at 25.0/32.6 GiB. C3VD frames are SQUARE
+# (518x518 = 1369 patches) where SCARED's are 518x420 = 1110, so attention costs ~23% more per
+# frame, and c3vd_cam_vanilla -- which has NO temporal blocks and no gate -- already peaked at
+# 25 GB. Adding 8 temporal blocks plus their Adam state on top may not fit at img_nums [4,12].
+# RUN c3vd_cam_gts_smoke FIRST. If it OOMs, drop img_nums' upper bound (that is the real knob,
+# not max_img_per_gpu) rather than reaching for gradient checkpointing.
+defaults:
+  - c3vd_cam_vanilla
+  - _self_
+
+exp_name: c3vd_cam_gts
+
+logging:
+  scalar_keys_to_log:
+    train:
+      keys_to_log:
+        - loss_objective
+        - loss_camera
+        - loss_T
+        - loss_R
+        - loss_camera_smooth
+        - loss_smooth_T
+        - loss_smooth_R
+        - gate_g_median      # where the logits sit (clamp kink = 0)
+        - gate_frac_active   # fraction of patches actually suppressed
+    val:
+      keys_to_log:
+        - loss_objective
+        - loss_camera
+        - loss_camera_smooth
+        - gate_g_median
+        - gate_frac_active
+
+checkpoint:
+  # Warm start from the PointOdyssey gate lineage, not stock VGGT-1B (see header).
+  resume_checkpoint_path: checkpoints/inst_g.pt
+  # Warm start only (never on --resume). Zeroes GatePredictor.linear2 so every logit returns
+  # to g=0, the one point where d(bias)/dg is largest. See trainer._reset_gate_head.
+  reset_gate_head: True
+
+loss:
+  # `orders` left at its default (2,), matching the SCARED arm.
+  camera_smooth:
+    weight: 3.0
+    weight_trans: 1.0
+    weight_rot: 1.0
+    gamma: 0.6
+
+optim:
+  # gate_predictor and temporal_blocks are both trainable here, so neither is listed.
+  # Hydra REPLACES lists rather than merging them, so the whole list is restated.
+  frozen_module_names:
+      - "*aggregator.patch_embed*"
+      - "*aggregator.frame_blocks*"
+      - "*aggregator.global_blocks.[0-7]"
+      - "*depth_head*"
+  gradient_clip:
+    configs:
+      - module_name: ["aggregator.global_blocks", "camera_head"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["aggregator.camera_token", "aggregator.register_token"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["aggregator.gate_predictor"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["aggregator.temporal_blocks"]
+        max_norm: 1.0
+        norm_type: 2
+
+model:
+  enable_temporal: True
+  enable_gate: True
+  enable_motion: False
+  enable_flow: False
+  gate_block_iter: 7
+  gate_pose_grad: True
+  gate_leaky: 0.1        # clamp -> leaky, so a patch that drifts below g=0 can come back

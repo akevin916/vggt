@@ -610,7 +610,9 @@ class Trainer:
     def run_pose_eval(self) -> Optional[float]:
         """Deterministic full-sequence pose eval on the live model (MonST3R channel B).
 
-        ``pose_eval.dataset`` picks the benchmark: ``sintel`` (default) or ``scared``.
+        ``pose_eval.dataset`` picks the benchmark: ``sintel`` (default), ``scared`` or
+        ``c3vd``. The latter two share benchmark/eval_scared.py's scoring machinery -- C3VD
+        is converted into the same on-disk layout on purpose (see benchmark/eval_c3vd.py).
         Scores the in-memory model on fixed, full-length sequences (no random
         [4,16] windowing, no re-sampling across epochs) so the resulting ATE is a stable
         trend/selection signal. Returns the mean ATE (rank 0 computes; broadcast to all
@@ -651,6 +653,29 @@ class Trainer:
                         seqs=list(cfg["seqs"]) if cfg.get("seqs", None) else None,
                         n_frames=int(cfg.get("n_frames", 50)),
                         max_depth=float(cfg.get("max_depth", 200.0)),
+                        no_depth=bool(cfg.get("no_depth", False)),
+                        gate_mode=cfg.get("gate_mode", "predicted"),
+                        img_size=int(cfg.get("img_size", 518)),
+                        out_dir=out_dir,
+                        device=device,
+                    )
+                elif dataset == "c3vd":
+                    # Same converted layout and the same scorer as SCARED; only the root,
+                    # the split and the depth ceiling differ. max_depth is millimetres and
+                    # 100 is the C3VD release's own clamp -- a higher cap cannot admit any
+                    # real surface, it would only widen the range the metrics normalise over.
+                    from benchmark.eval_c3vd import evaluate as eval_evaluate
+                    from data.paths import data_path
+
+                    args = SimpleNamespace(
+                        ckpt=f"live_epoch_{int(self.epoch) + 1}",
+                        c3vd_root=cfg.get("c3vd_root", None) or data_path("train", "c3vd"),
+                        # val by default, so channel B scores the same data channel A does;
+                        # the held-out test split belongs to benchmark/eval_c3vd.py's CLI.
+                        split=cfg.get("split", "val"),
+                        seqs=list(cfg["seqs"]) if cfg.get("seqs", None) else None,
+                        n_frames=int(cfg.get("n_frames", 50)),
+                        max_depth=float(cfg.get("max_depth", 100.0)),
                         no_depth=bool(cfg.get("no_depth", False)),
                         gate_mode=cfg.get("gate_mode", "predicted"),
                         img_size=int(cfg.get("img_size", 518)),

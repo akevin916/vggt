@@ -21,7 +21,7 @@ limit_val_batches: 200
 # See trainer.val_epoch / trainer.run_pose_eval.
 pose_eval:
   enabled: true
-  dataset: sintel     # sintel | scared -- which benchmark channel B scores the live model on
+  dataset: sintel     # sintel | scared | c3vd -- which benchmark channel B scores on
   every_n_epochs: 1
   # --- dataset: sintel ---
   sintel_root: null   # null -> auto-detect from repo data/ (eval.sintel_io.resolve_sintel_root)

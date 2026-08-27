@@ -114,10 +114,18 @@ def save_cloud(out_stem, depth, intrinsic, extrinsic, images, max_points, depth_
     return write_ply(out_stem + ".ply", pts, cols)
 
 
-def dump_arrays(path, pred):
+def dump_arrays(path, pred, images=None):
+    """Everything the polished renderer needs, in one file beside cloud.npz.
+
+    ``images`` is the preprocessed tensor the model actually saw, stored as uint8 so
+    diag/vis/cloud_polish.py (and timeline.py --blend) can colour a blended cloud without
+    re-deriving the crop. eval_lesion.py stores the same key for the same reason.
+    """
     payload = {k: v for k, v in pred.items() if isinstance(v, np.ndarray)}
     if "depth" in payload:
         payload["depth"] = payload["depth"].astype(np.float16)
+    if images is not None:
+        payload["images"] = (np.clip(images, 0, 1) * 255).astype(np.uint8)
     np.savez_compressed(path, **payload)
 
 
@@ -144,7 +152,7 @@ def run_segment(model, seg_dir, out_dir, args):
     imgs = preprocessed(paths)
 
     os.makedirs(out_dir, exist_ok=True)
-    dump_arrays(os.path.join(out_dir, "seq.npz"), pred)
+    dump_arrays(os.path.join(out_dir, "seq.npz"), pred, images=imgs)
     write_video(os.path.join(out_dir, "input.mp4"), imgs, fps=args.fps)
 
     info = dict(

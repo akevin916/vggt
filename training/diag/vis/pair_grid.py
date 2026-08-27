@@ -49,7 +49,12 @@ def look_at(eye, target, up=(0.0, -1.0, 0.0)):
         up = np.array([0.0, 0.0, 1.0])
     r = np.cross(f, up); r /= np.linalg.norm(r) + 1e-12
     u = np.cross(r, f)
-    R = np.stack([r, u, f])
+    # -u, not u. ``up`` is the world's UP direction (-Y under the Y-down convention these
+    # clouds live in), but the camera's y row must point the way image v grows, i.e. DOWN.
+    # Stacking [r, u, f] made det(R) = -1 -- a reflection, not a rotation -- so every render
+    # came out vertically flipped (a point above the centre projected below it). Verified
+    # numerically: for f=+Z, up=-Y, the point (0,-1,5) gave cam_y=+1 before and -1 after.
+    R = np.stack([r, -u, f])
     return np.hstack([R, (-R @ np.asarray(eye, float))[:, None]])
 
 
