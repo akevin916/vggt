@@ -163,3 +163,10 @@ outputs/
 # 個人工作文件：週計畫、交接、自我驗證題庫 —— 不進版控
 docs/planning/
 docs/reading/
+
+# Dyn-VGGT: 實驗 config 與一次性診斷不進版控（檔案留在磁碟上）
+training/config/
+training/diag/*
+!training/diag/gate_eval.py
+!training/diag/stitch_error.py
+!training/diag/pnp_pose.py
