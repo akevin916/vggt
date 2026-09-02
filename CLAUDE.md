@@ -2,7 +2,9 @@
 
 ## 這個 repo 是什麼
 
-這是 **VGGT**（Visual Geometry Grounded Transformer）的 fork，承載 **Dyn-VGGT** 研究線：讓 VGGT 的相機 **pose** 在動態場景更 robust。上游 VGGT 是 feed-forward transformer，從 N 個 view 預測相機參數、depth、point map、track。fork 目前的主線是 **v3 = motion-gated camera aggregation**（見 [docs/method.md](docs/method.md)；v1/v2 已封存/放棄）。
+這是 **VGGT**（Visual Geometry Grounded Transformer）的 fork，承載 **Dyn-VGGT** 研究線：讓 VGGT 的相機 **pose** 在動態場景更 robust。上游 VGGT 是 feed-forward transformer，從 N 個 view 預測相機參數、depth、point map、track。fork 目前的主線是 **motion-gated camera aggregation**（舊文件稱 v3；見 [docs/method.md](docs/method.md)，v1/v2 已封存/放棄）。
+
+**文件從 [docs/README.md](docs/README.md) 進**：結論看 `docs/status.md`、機制看 `docs/method.md`、某個 run 的下場看 `docs/experiments.md`、某支權重看 `docs/checkpoints.md`、數字看 `docs/results/`。
 
 base model 程式碼（`vggt/`）在所有 `enable_*` flag 關閉時與 pretrained `VGGT-1B` 權重**保持 byte-for-byte 相容** —— 新行為都藏在 flag 後面，checkpoint 才載得進來。
 
@@ -28,13 +30,13 @@ config name = `training/config/` 裡的檔名去掉 `.yaml`（如 `inst_g`）。
 - **`vggt/models/vggt.py`** —— 把 `enable_gate`/`gate_block_iter` 串進去，在 `predictions` 曝出 `gate_logits`（帶 gradient）供監督，`σ(g)` 同時當免費的 dynamic mask。所有額外 head/行為都在 `enable_temporal/motion/flow/gate` flag 後面。
 - **`training/loss.py`** —— `compute_gate_loss` = `BCE(σ(g), m*_patch)`，GT pixel mask 用 `adaptive_avg_pool2d` pool 到 patch grid。此處 `gate_logits` **不** detach（gradient 流回 predictor）。`oracle_gate_logits_from_mask` 直接從 GT mask 造 override。dispatcher `MultitaskLoss.forward` 只在某 loss 的 config block 存在時才加該項 → loss 純靠 yaml 開關。
 
-gate 是否真的改善 pose 屬**未定論的研究問題**，最新進展與消融結論見 project memory 與 [docs/method.md](docs/method.md) 的狀態 banner（CLAUDE.md 不在此下結論）。
+gate 是否真的改善 pose 屬**未定論的研究問題**，最新進展與消融結論見 project memory 與 [docs/status.md](docs/status.md)（**全 repo 唯一的結論來源**；`method.md` 只寫機制、不下結論，CLAUDE.md 也不在此下結論）。
 
 **操作提醒**：判斷 gate 品質一律用 **AUC/F1，不要用 BCE** —— `loss_gate`（BCE）用 soft average-pooled label，boundary patch 有不可約的 floor，val BCE 會看似 overfit 但其實與高 AUC 並存。
 
 ## 訓練階段與動態標籤
 
-config 檔名 = `<標籤>_<成分>[_<變體>]`，**與 `exp_name` 和 `logs/<exp>/` 目錄名三者一致**（2026-08-20 統一，舊的 `dyn_vggt_v3_s{n}_*` 全部退役，對照表見 [docs/archive/checkpoints.md](docs/archive/checkpoints.md)）。標籤 `inst` = instance×scene-flow mask（v3 唯一在用的動態標籤）；成分字母 `g` = gate、`t` = temporal、`s` = camera_smooth，依序疊加。所以 `inst_g` 是 gate+camera、`inst_gts` 再加 temporal 與 smooth，變體另接後綴（`inst_gts_egoflow`、`inst_g_photo`）。SCARED 那組用資料集前綴 `scared_cam_*`。
+config 檔名 = `<標籤>_<成分>[_<變體>]`，**與 `exp_name` 和 `logs/<exp>/` 目錄名三者一致**（2026-08-20 統一，舊的 `dyn_vggt_v3_s{n}_*` 全部退役，對照表見 [docs/checkpoints.md](docs/checkpoints.md)）。標籤 `inst` = instance×scene-flow mask（唯一在用的動態標籤）；成分字母 `g` = gate、`t` = temporal、`s` = camera_smooth，依序疊加。所以 `inst_g` 是 gate+camera、`inst_gts` 再加 temporal 與 smooth，變體另接後綴（`inst_gts_egoflow`、`inst_g_photo`）。SCARED 那組用資料集前綴 `scared_cam_*`。
 
 config 之間用 Hydra `defaults` 串成繼承鏈，**只寫 delta，不整份複製**：`default` → `inst_g` → `inst_gts` → 各變體；`default` → `scared_cam_b16` → `scared_cam_b2` / `scared_cam_b16_gg` → `..._smooth_temporal` → `..._smoke`。⚠️ **Hydra 對 list 是「取代」不是「合併」** —— 覆寫 `frozen_module_names` 或 `gradient_clip.configs` 時要把整份清單重寫（兩者的語意都與順序無關，可安心重排）。
 

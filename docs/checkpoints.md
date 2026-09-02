@@ -8,11 +8,11 @@
 ## 判讀規則
 
 - **Sintel 欄**一律是 `benchmark/eval_sintel.py`、14 序列、`chunk_size=0`（完整序列，平均 45.9 幀）、
-  `max_depth=80`。數字全部搬自 [../table.md](../table.md) 表 1，該表是唯一權威來源。
+  `max_depth=80`。數字全部搬自 [../results_natural.md](results/natural.md) 表 1，該表是唯一權威來源。
   ATE(12) = 去掉 `cave_2`/`temple_3` 兩個離群序列後的平均。
 - **SCARED 欄**是 `benchmark/eval_scared.py`、val split、6 keyframe × 50 幀、單位 **mm**，
   括號是佔 GT 軌跡尺度的比例。
-- ⚠️ **雜訊帶 ±0.02 ATE（±13%）**（table.md 缺口 #7）—— 兩支權重差距小於此就不能說誰比較好。
+- ⚠️ **雜訊帶 ±0.02 ATE（±13%）**（results/natural.md 缺口 #7）—— 兩支權重差距小於此就不能說誰比較好。
 - **世代**：`v3-bug` 指 gate 前向 bug 修正（commit `e064087`, 2026-07-09）之前啟動的 run，
   數字不可信、只能當歷史紀錄；`v3-clean` 是修正後。
 
@@ -29,7 +29,7 @@
 | `inst_g.pt` | v3-clean | gate + 後段 global block + camera head（§8.3 run 1，ep15）。**Sintel depth 七項全贏 base** | **0.1533** | **0.0517** | 0.0671 | 0.4923 | **0.2136** | **1.734 (4.15%)** |
 | `inst_gts.pt` | v3-clean | run 1 再加 temporal 解凍 + `L_camera_smooth`（`smooth_temporal` ep30）。**Sintel pose 最好** | **0.1343** | **0.0500** | 0.0633 | **0.3943** | ‡ | 1.887 |
 
-† `inst_gate_init` 的 0.1715 來自 ckpt 命名整理的紀錄，**未在 table.md 立表**，屬單一來源。
+† `inst_gate_init` 的 0.1715 來自 ckpt 命名整理的紀錄，**未在 results/natural.md 立表**，屬單一來源。
 ‡ `inst_gts` 的 depth 欄用的是 `max_depth=70` 協定，與本表 max80 不同欄，不可同欄比。
 
 > **注意 Sintel 與 SCARED 的排序相反**：Sintel 最好的 `inst_gts`（0.1343）在 SCARED 是四支裡**最差**
@@ -38,7 +38,7 @@
 ### 1.2 已封存 —— `archive/checkpoints/`（全部是孤本：`logs/` 沒有對應 ckpts 目錄）
 
 原本 10 支 48.6 G，2026-08-20 刪掉 8 支（38.4 G），**現存只剩最後兩列**。刪掉的那 8 支數字全部
-在下表，`table.md` 表 1 有對應列可交叉核對；但**權重本身回不來了**——它們在 `logs/` 沒有 ckpts
+在下表，`results/natural.md` 表 1 有對應列可交叉核對；但**權重本身回不來了**——它們在 `logs/` 沒有 ckpts
 目錄，重現要重跑當年的 config。
 
 > **這一節的檔名沒有套用 §1.5 的改名規則**，是刻意的：那套規則是給 config / `exp_name` /
@@ -55,8 +55,14 @@
 | `dyn_vggt_v3_s1_inst_photo.pt` | v3-**bug** | 加 static-photo loss（該 run 的 ep19）。sqRel **6.210** 全場最差（base 2.348）→ 少數像素巨大誤差 | 0.1620 | 0.0666 | 0.0813 | 0.5474 | 0.2732 | 已刪 08-20 |
 | `dyn_vggt_v3_s1_smooth_temporal.pt` | v3-**bug** | temporal + camera_smooth。⚠️ **是該 run 的 ep2**（計畫 20 epoch），不是收斂值 | 0.1568 | 0.0535 | 0.0720 | 0.4634 | 0.2458 | 已刪 08-20 |
 | `dyn_vggt_v3_oracle.pt` | v3-**bug** | `oracle_camera_only` 消融（ep19）：**只留 camera_head**，用 GT mask 當完美 gate。depth 全面崩潰（AbsRel 0.563、δ1 0.430），pose 數字須在此前提下讀 | 0.1757 | 0.0685 | 0.0649 | 0.4769 | **0.5631** | 已刪 08-20 |
-| `dyn_vggt_s1a.pt` | v1 | 雙場 S1 第一版（推測）。**檔名未出現在 table.md** | | | | | | **保留待驗** |
-| `dyn_vggt_s1_full.pt` | v1 | 雙場，全部 loss 開啟（推測）。**檔名未出現在 table.md** | | | | | | **保留待驗** |
+| `dyn_vggt_s1a.pt` | v1 | 雙場 S1 第一版（推測）。**檔名未出現在 results/natural.md** | | | | | | **保留待驗** |
+| `dyn_vggt_s1_full.pt` | v1 | 雙場，全部 loss 開啟（推測）。**檔名未出現在 results/natural.md** | | | | | | **保留待驗** |
+
+> ⚠️ **這兩支 v1 權重與 2026-08-31 的模型瘦身**：`vggt.py` 的 `motion_head` / `flow_head` 已隨
+> v1/v2 loss 一併移除。兩支 ckpt 仍各帶 124 個那兩顆 head 的 key，但 eval 走 `strict=False`，
+> **實測 `missing=0`、124 個 key 全部落在 unexpected 被忽略** —— trunk、camera、depth、point
+> 照常載入，pose/depth 評測不受影響。真正失去的只有 v1 的 scene-flow / motion 輸出本身，
+> 而那正是被診斷否決的部分。要拿回來需 `git revert` 那次 commit。
 
 ### 1.3 訓練 run —— `training/logs/<run>/ckpts/`（含 optimizer state，6.5–9.2 G，可 resume）
 
@@ -88,7 +94,7 @@
 
 ### 1.4 為什麼 `s1a` / `s1_full` / `scared_cam_b2` 先不刪
 
-- `dyn_vggt_s1a.pt`、`dyn_vggt_s1_full.pt` —— table.md 表 1 有 `v1 S1`(0.1710) 這一列，但**沒有任何東西
+- `dyn_vggt_s1a.pt`、`dyn_vggt_s1_full.pt` —— results/natural.md 表 1 有 `v1 S1`(0.1710) 這一列，但**沒有任何東西
   把它綁到某個檔名**；`s1_full` 更是完全沒有對應列。檔案內部無 metadata，權重 key 只能告訴你
   「這是 v1 架構」（有 `motion_head` + `flow_head`），分不出是哪一次 run。
   **要定案**：跑 `benchmark/eval_sintel.py` 拿 mean ATE 去比對
@@ -143,7 +149,7 @@ config 檔名、`exp_name`、`logs/<exp>/` 目錄名在 2026-08-20 統一成 `<�
 > 原本的三份長文件（`dyn_vggt_method_v1.md` 270 行、`dyn_vggt_method_v2.md` 39 行、
 > `dyn_vggt_implementation.md` 230 行）於 2026-08-20 刪除，內容壓縮成本節。
 > 現行方法見
-> [../method.md](../method.md)。
+> [../method.md](method.md)。
 
 ### 2.1 v1 —— 運動解耦的雙場表示
 

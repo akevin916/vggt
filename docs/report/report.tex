@@ -1,0 +1,372 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{makecell}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{caption}
+\usepackage[numbers,sort&compress]{natbib}
+
+\begin{document}
+
+% Reference numbering is fixed by this list, not by where each work is first cited:
+% 1-6 are the framing works and the metric definitions, 7 onwards follow the rows of
+% Table~\ref{tab:scared_sota} from top to bottom. Remove this block to fall back to
+% IEEE's default order-of-first-citation numbering.
+\nocite{stoyanov2012surgical}
+\nocite{allan2021scared}
+\nocite{wang2025vggt}
+\nocite{zhang2025monst3r}
+\nocite{eigen2014depth}
+\nocite{sturm2012benchmark}
+\nocite{fang2020goodpractice}
+\nocite{godard2019monodepth2}
+\nocite{ozyoruk2021endosfm}
+\nocite{shao2022afsfmlearner}
+\nocite{zeinoddin2024dares}
+\nocite{cui2024endodac}
+\nocite{zeinoddin2025endofast3r}
+\nocite{zhang2026endosfm3d}
+\nocite{chang2026esrt}
+\nocite{wang2024dust3r}
+
+
+\section*{Training Losses}
+
+We fine-tune the model with a multi-task loss that keeps VGGT's~\cite{wang2025vggt} original
+supervision and adds
+two terms specific to our method:
+\begin{equation}
+  \mathcal{L} = \lambda_{\text{cam}} \mathcal{L}_{\text{camera}}
+              + \lambda_{\text{depth}} \mathcal{L}_{\text{depth}}
+              + \lambda_{\text{smooth}} \mathcal{L}_{\text{smooth}},
+  \qquad
+  \lambda_{\text{cam}} = 5,\quad
+  \lambda_{\text{depth}} = 1,\quad
+  \lambda_{\text{smooth}} = 3 .
+\end{equation}
+Unlike the original formulation, the three terms are not on comparable scales here: the
+camera term is up-weighted because pose is the target of this work, and the smoothness term
+is a regulariser whose magnitude is a velocity rather than an error. The point-map and
+tracking losses are not used, as the corresponding heads stay frozen.
+
+\paragraph{Camera loss.}
+The camera loss supervises the predicted cameras $\hat{g}_i$ against the ground truth $g_i$.
+Each camera is encoded as $g_i = [\mathbf{t}_i, \mathbf{q}_i, f_i]$ --- translation,
+rotation quaternion and (scalar) field of view --- and the three components are weighted
+separately:
+\begin{equation}
+  \mathcal{L}_{\text{camera}}
+  = \frac{1}{N} \sum_{i=1}^{N}
+    \Big( w_{t}\big\|\hat{\mathbf{t}}_i - \mathbf{t}_i\big\|_{1}
+        + w_{r}\big\|\hat{\mathbf{q}}_i - \mathbf{q}_i\big\|_{1}
+        + w_{f}\big|\hat{f}_i - f_i\big| \Big),
+  \qquad w_t = w_r = 1,\; w_f = 0.5 .
+\end{equation}
+Following the public VGGT implementation we use an $\ell_1$ loss here rather than the Huber
+loss stated in the paper, as it was found to be more stable. The camera head refines its
+prediction over several stages and every stage is supervised, with an exponentially decaying
+weight $\gamma^{K-k}$, $\gamma = 0.6$, so that the final stage dominates. The translation term
+is clamped at $100$, and frames whose ground-truth depth is empty are excluded from the sum,
+since their pose is not observable.
+
+\paragraph{Depth loss.}
+The depth loss follows VGGT and implements the aleatoric-uncertainty loss: the per-pixel
+discrepancy between the predicted depth $\hat{D}_i$ and the ground-truth depth $D_i$ is
+weighted by a predicted \emph{confidence} map $C_i$, the depth head's second output channel,
+which holds one strictly positive scalar per pixel and plays the role of an inverse
+uncertainty. Let $\mathcal{V}_i$ be the pixels of frame $i$ with valid ground truth and
+$\operatorname{mean}_{\mathcal{V}_i}$ the average over them; all operations below are
+element-wise, so the pixel index can be dropped:
+\begin{equation}
+  \mathcal{L}_{\text{depth}}
+  = \sum_{i=1}^{N} \operatorname*{mean}_{\mathcal{V}_i}
+    \Big(
+      C_i \big| \hat{D}_i - D_i \big|
+      \;-\; \alpha \log C_i
+      \;+\; \big\| \nabla \hat{D}_i - \nabla D_i \big\|_{1}
+    \Big) ,
+  \qquad \alpha = 0.2 ,
+\end{equation}
+where $|\cdot|$ is the absolute value of a scalar and $\nabla$ the spatial gradient in the image
+plane. The first term makes the model confident where it is accurate, and $-\alpha \log C_i$
+keeps the confidence from collapsing to zero; the two balance at
+$C_i \propto 1 / \big| \hat{D}_i - D_i \big|$. The third term compares
+the depth gradients rather than the depth values, which stops the model from buying a comparable
+$\ell_1$ score with an over-smoothed prediction that erases tissue boundaries; it is evaluated at
+four scales, obtained by subsampling the maps by a factor of $2^{s}$, $s = 0,\dots,3$, and
+averaged over them, so that both fine edges and large-scale surface curvature are supervised.
+Unlike the regression term it is deliberately not weighted by $C_i$, so the model cannot bypass
+the structural constraint by lowering its confidence. Restricting the sums to $\mathcal{V}_i$
+matters because endoscopic depth is sparse; the per-pixel terms are additionally trimmed at the
+$0.98$ quantile to reject outliers.
+
+\paragraph{Motion gate.}
+The gate is not supervised by a loss of its own. A gate predictor placed midway through the
+aggregator emits a per-patch logit $g_j$ for every patch token $j$, which enters the
+subsequent global-attention layers as an additive bias $B$ on the attention logits:
+\begin{equation}
+  A = \operatorname{softmax}\!\Big( \frac{QK^{\top}}{\sqrt{d}} + B \Big),
+  \qquad
+  B_{ij} =
+  \begin{cases}
+    \phi(g_j), & i \in \text{CameraTokens},\; j \in \text{PatchTokens} \\[2pt]
+    0,         & \text{otherwise,}
+  \end{cases}
+\end{equation}
+where $\phi$ turns the logit into a suppression strength,
+\begin{equation}
+  \phi(g) =
+  \begin{cases}
+    x,          & x \le 0 \\
+    \lambda x,  & x > 0
+  \end{cases}
+  \qquad
+  x = \operatorname{softplus}(0) - \operatorname{softplus}(g),
+  \quad \lambda = 0.1 .
+\end{equation}
+Only the rows of the camera token carry the bias, so a patch judged dynamic is suppressed
+exactly where the pose is read out, while patch-to-patch attention --- and with it the depth
+and point predictions --- is left untouched. The construction has two properties we rely on:
+$\phi(0) = 0$, so a freshly initialised gate reproduces the pretrained model exactly, and
+$\phi \le 0$ up to the small leak $\lambda$, so the gate can only down-weight a patch, never
+boost one. The leak keeps a gradient alive for patches that have drifted to the confident-static
+side, which would otherwise never come back. Because $B$ sits inside the attention,
+$\mathcal{L}_{\text{camera}}$ back-propagates into $g_j$: the pose error is the gate's only
+teacher. This is what makes the method applicable to endoscopy, where no ground-truth dynamic
+mask exists, and $\sigma(g_j)$ can be read out as a dynamic mask at no extra cost.
+
+\paragraph{Trajectory smoothness.}
+The last term is a regulariser on the predicted trajectory alone and uses no ground truth.
+Let $\Delta t_i$ be the number of frames that separate $I_i$ and $I_{i+1}$ in the original
+video: the frames of a training clip are not sampled at a fixed stride, so this gap varies and
+has to be divided out. The predicted camera velocities are then the first differences of the
+same quantities the camera loss supervises, per unit time:
+\begin{equation}
+  v^{T}_i = \frac{\hat{\mathbf{t}}_{i+1} - \hat{\mathbf{t}}_i}{\Delta t_i},
+  \qquad
+  v^{R}_i = \frac{\hat{\mathbf{q}}_{i+1} - \hat{\mathbf{q}}_i}{\Delta t_i} .
+\end{equation}
+Penalising these velocities directly would amount to asking the camera not to move, so we
+penalise their change instead --- the camera acceleration,
+\begin{equation}
+  \Delta v^{T}_i = v^{T}_{i+1} - v^{T}_i,
+  \qquad
+  \Delta v^{R}_i = v^{R}_{i+1} - v^{R}_i ,
+\end{equation}
+averaged over the $N-2$ second differences a clip of $N$ frames admits:
+\begin{equation}
+  \mathcal{L}_{\text{smooth}}
+  = \frac{1}{N-2} \sum_{i=1}^{N-2}
+    \Big( \big\| \Delta v^{T}_i \big\|_{1} + \big\| \Delta v^{R}_i \big\|_{1} \Big) .
+\end{equation}
+A constant camera motion is therefore free of penalty and only jerky pose sequences are
+suppressed. This matters for endoscopy, where the model already under-predicts the amount of
+camera motion, so a term penalising the motion itself would push in the wrong direction. As
+with the camera loss, every refinement stage is supervised with the same $\gamma^{K-k}$
+weighting. Pairs with $\Delta t_i = 0$, which arise when the sampler draws the same frame twice, are
+dropped, as are the differences built on them. Quaternions are hemisphere-aligned before
+differencing, since $q$ and $-q$ denote the same rotation, and the field of view is left
+unsmoothed.
+
+\section*{Evaluation Metrics}
+
+Both depth and pose are only recoverable up to an unknown scale, so every metric below is
+computed after an explicit alignment step; without it the numbers would measure the missing
+scale rather than the geometry.
+
+\paragraph{Depth.}
+We follow the evaluation protocol of AF-SfMLearner~\cite{shao2022afsfmlearner} and
+EndoSfM3D~\cite{zhang2026endosfm3d} on SCARED~\cite{allan2021scared} so that the numbers
+are directly comparable to the published tables. Each frame is aligned on its own by the ratio
+of medians,
+\begin{equation}
+  s_i = \frac{\operatorname{median}_{\mathcal{V}_i} D_i}{\operatorname{median}_{\mathcal{V}_i} \hat{D}_i},
+  \qquad
+  \tilde{D}_i = \operatorname{clip}\big( s_i \hat{D}_i,\; d_{\min},\; d_{\max} \big),
+\end{equation}
+where $\mathcal{V}_i$ collects the pixels of frame $i$ whose ground truth falls inside the valid
+range $(d_{\min}, d_{\max}) = (0.01, 150)$\,mm and both medians are taken over that set. Dropping
+the frame index and writing $\operatorname{mean}_{\mathcal{V}}$ for the average over the valid
+pixels, we report the four standard measures of~\cite{eigen2014depth} --- the absolute
+relative error (AbsRel), the squared relative error (SqRel), the root mean squared error (RMSE)
+and the root mean squared logarithmic error ($\text{RMSE}_{\log}$):
+\begin{align}
+  \text{AbsRel}
+    &= \operatorname*{mean}_{\mathcal{V}}
+       \frac{\big| \tilde{D} - D \big|}{D},
+  &\text{SqRel}
+    &= \operatorname*{mean}_{\mathcal{V}}
+       \frac{\big( \tilde{D} - D \big)^{2}}{D}, \\[4pt]
+  \text{RMSE}
+    &= \sqrt{ \operatorname*{mean}_{\mathcal{V}}
+       \big( \tilde{D} - D \big)^{2} },
+  &\text{RMSE}_{\log}
+    &= \sqrt{ \operatorname*{mean}_{\mathcal{V}}
+       \big( \log \tilde{D} - \log D \big)^{2} } .
+\end{align}
+The four emphasise different failure modes. AbsRel is a relative error and is therefore
+insensitive to how far away the surface is, which makes it the primary quantity for comparing
+across sequences; SqRel squares the numerator and so responds much more strongly to outlier
+predictions; RMSE is an absolute error in millimetres and reports the physical accuracy of the
+reconstruction; and $\text{RMSE}_{\log}$ is computed in log space, which up-weights the relative
+error at short range --- exactly the regime an endoscope operates in. Every test frame is scored
+on its own and the per-frame values are averaged without weighting, as in the reference protocol.
+
+\paragraph{Pose.}
+Camera trajectories are scored by the absolute trajectory error (ATE)~\cite{sturm2012benchmark},
+in millimetres. The predicted world-to-camera extrinsics are inverted and their translation part
+taken as the camera centre of each frame. A monocular trajectory carries no absolute scale, so
+the two trajectories are brought onto a common scale before the error is measured. For a segment
+of $n$ frames, let $\hat{\mathbf{p}}_j$ and $\mathbf{p}_j$ be the predicted and ground-truth
+camera centres, both expressed in the coordinate frame of that segment's first camera; the scale
+factor is the least-squares fit
+\begin{equation}
+  s = \arg\min_{s} \sum_{j=1}^{n} \big\| s\hat{\mathbf{p}}_j - \mathbf{p}_j \big\|_{2}^{2}
+    = \frac{\sum_{j} \langle \mathbf{p}_j, \hat{\mathbf{p}}_j \rangle}
+           {\sum_{j} \langle \hat{\mathbf{p}}_j, \hat{\mathbf{p}}_j \rangle} ,
+\end{equation}
+and the ATE of the segment is the residual of that fit,
+\begin{equation}
+  \text{ATE} = \frac{1}{n} \sqrt{ \sum_{j=1}^{n}
+    \big\| s\hat{\mathbf{p}}_j - \mathbf{p}_j \big\|_{2}^{2} } .
+\end{equation}
+ATE answers a single question: once the unrecoverable scale is taken out, how far does the
+estimated camera path stray from the true one? Because it is reported in millimetres it reads as
+a physical distance rather than a relative score, and because it is a translational measure a
+rotation error enters only through the displacement it induces --- which, over a short window, is
+exactly the displacement a surgeon would see as the view drifting off target.
+
+This is evaluated on sliding windows of $n = 5$ frames and averaged over every window of the
+sequence, the protocol of AF-SfMLearner~\cite{shao2022afsfmlearner}, under which the published
+endoscopic pose tables are computed. Two details of that protocol are worth stating: only the scale is fitted --- the
+rotation is not aligned, so an error in the predicted rotation shows up directly in the position
+residual --- and the residual is divided by $n$ rather than $\sqrt{n}$. Both follow the reference
+implementation, and reproducing them exactly is what makes the number comparable to the published
+tables. Scoring short windows keeps the metric sensitive to local tracking quality and prevents a
+single early error from dominating the whole sequence; the price is that it does not measure
+long-range drift, since every window is re-anchored.
+
+\section*{Results}
+
+Table~\ref{tab:scared_pose_depth} isolates the contribution of each component. Adding the gate
+predictor to the fine-tuned VGGT baseline lowers the mean ATE from $0.076$ to $0.070$, and adding
+the temporal attention together with the smoothness regulariser brings it to $0.060$, a $21\%$
+reduction over the baseline. The depth columns move in the same direction --- AbsRel from $0.045$
+to $0.043$, RMSE from $4.254$ to $4.090$ --- even though neither component is supervised by a
+depth signal, which suggests that a camera token that reads out of the static part of the scene
+also stabilises the geometry the depth head sees.
+
+Table~\ref{tab:scared_sota} places the model against published methods on SCARED. Our model
+reports the lowest error on all four depth metrics; on pose it is second to
+Endo-FASt3r~\cite{zeinoddin2025endofast3r} on both sequences. The comparison is not like for like
+and the G.T.\ column says why: every self-supervised entry trains without ground-truth depth or
+pose, whereas our model and the two feed-forward baselines are fine-tuned with both. The input
+regime differs as well --- the published methods predict depth from a single image, while our
+model consumes the sequence.
+
+Table~\ref{tab:runtime} reports the inference cost. Both feed-forward models run at roughly
+$8.8$ frames per second on one 64-frame sequence, against $0.14$ for
+MonST3R~\cite{zhang2025monst3r}, and the gate predictor and temporal blocks are not measurable
+against the VGGT baseline.
+
+\begin{table}[htbp]
+  \centering
+  \setlength{\tabcolsep}{6pt}
+  \renewcommand{\arraystretch}{1.3}
+  \resizebox{\textwidth}{!}{%
+  \begin{tabular}{l cccc @{\hspace{2.5em}} ccc}
+    \toprule
+    \multirow{2}{*}{Method}
+      & \multicolumn{4}{c}{Depth}
+      & \multicolumn{3}{c}{Camera Pose} \\
+    \cmidrule(lr){2-5} \cmidrule(lr){6-8}
+    & AbsRel$\downarrow$ & SqRel$\downarrow$ & RMSE$\downarrow$ & RMSELog$\downarrow$
+      & ATE$\downarrow$ (Seq.\ 1) & ATE$\downarrow$ (Seq.\ 2) & Mean$\downarrow$ \\
+    \midrule
+    VGGT~\cite{wang2025vggt} & 0.045 & 0.331 & 4.254 & 0.068 & 0.090 & 0.063 & 0.076 \\
+    + Gate predictor & 0.045 & 0.318 & 4.226 & 0.066 & 0.083 & 0.057 & 0.070 \\
+    \makecell[l]{+ Temporal attention\\and Smoothness loss}
+      & \textbf{0.043} & \textbf{0.309} & \textbf{4.090} & \textbf{0.065}
+      & \textbf{0.072} & \textbf{0.048} & \textbf{0.060} \\
+    \bottomrule
+  \end{tabular}%
+  }
+  \caption{Ablation of the proposed components, all fine-tuned on SCARED. The left half
+  reports depth errors, the right half ATE.}
+  \label{tab:scared_pose_depth}
+\end{table}
+
+\begin{table}[htbp]
+  \centering
+  \setlength{\tabcolsep}{6pt}
+  \renewcommand{\arraystretch}{1.2}
+  \resizebox{\textwidth}{!}{%
+  \begin{tabular}{l l c cccc @{\hspace{2.5em}} cc}
+    \toprule
+    \multirow{2}{*}{Method} & \multirow{2}{*}{Venue} & \multirow{2}{*}{G.T.}
+      & \multicolumn{4}{c}{Depth}
+      & \multicolumn{2}{c}{Camera Pose} \\
+    \cmidrule(lr){4-7} \cmidrule(lr){8-9}
+    & & & AbsRel$\downarrow$ & SqRel$\downarrow$ & RMSE$\downarrow$ & RMSELog$\downarrow$
+      & ATE$\downarrow$ (Seq.\ 1) & ATE$\downarrow$ (Seq.\ 2) \\
+    \midrule
+    Fang et al.~\cite{fang2020goodpractice} & WACV'20    & $\times$     & 0.078 & 0.794 & 6.794 & 0.109 & ---   & ---   \\
+    Monodepth2~\cite{godard2019monodepth2} & ICCV'19    & $\times$     & 0.069 & 0.577 & 5.546 & 0.094 & 0.077 & 0.055 \\
+    Endo-SfM~\cite{ozyoruk2021endosfm} & MIA'21     & $\times$     & 0.062 & 0.606 & 5.726 & 0.093 & 0.076 & 0.050 \\
+    AF-SfMLearner~\cite{shao2022afsfmlearner} & MIA'22     & $\times$     & 0.059 & 0.435 & 4.925 & 0.082 & 0.074 & 0.048 \\
+    DARES~\cite{zeinoddin2024dares} & ECCVW'24   & $\times$     & 0.052 & 0.356 & 4.483 & 0.073 & ---   & ---   \\
+    EndoDAC~\cite{cui2024endodac} & MICCAI'24  & $\times$     & 0.052 & 0.362 & 4.464 & 0.073 & ---   & ---   \\
+    Endo-FASt3r~\cite{zeinoddin2025endofast3r} & MICCAI'25  & $\times$     & 0.051 & 0.354 & 4.480 & ---   & \textbf{0.070} & \textbf{0.044} \\
+    EndoSfM3D~\cite{zhang2026endosfm3d} & MICCAIW'25 & $\times$     & 0.050 & 0.389 & 4.749 & 0.070 & 0.079 & 0.053 \\
+    ESRT-Full~\cite{chang2026esrt} & MICCAI'26  & $\times$     & 0.053 & 0.454 & 4.791 & 0.076 & ---   & ---   \\
+    ESRT-Row~\cite{chang2026esrt} & MICCAI'26  & $\times$     & 0.048 & 0.372 & 4.242 & 0.069 & ---   & ---   \\
+    DUSt3R~\cite{wang2024dust3r} & CVPR'24    & $\checkmark$ & 0.059 & 0.516 & 4.947 & 0.080 & ---   & ---   \\
+    \midrule
+    VGGT~\cite{wang2025vggt} & --- & $\checkmark$ & 0.045 & 0.331 & 4.254 & 0.068 & 0.090 & 0.063 \\
+    Ours & --- & $\checkmark$ & \textbf{0.043} & \textbf{0.309} & \textbf{4.090} & \textbf{0.065} & 0.072 & 0.048 \\
+    \bottomrule
+  \end{tabular}%
+  }
+  \caption{Comparison against published methods on SCARED. Depth follows the
+  AF-SfMLearner~\cite{shao2022afsfmlearner} protocol; pose is the 5-frame snippet ATE, with Seq.~1 = \texttt{dataset5/keyframe4}
+  (411 frames) and Seq.~2 = \texttt{dataset3/keyframe4} (834 frames). A dash marks a metric the
+  corresponding paper does not report; the G.T.\ column marks whether the method is
+  trained with ground-truth depth and pose ($\checkmark$) or self-supervised ($\times$). Published methods take a single image (DUSt3R and ESRT a
+  pair); our baseline and our model take the full sequence for depth and a 64-frame context for
+  pose.}
+  \label{tab:scared_sota}
+\end{table}
+
+\begin{table}[htbp]
+  \centering
+  \setlength{\tabcolsep}{8pt}
+  \renewcommand{\arraystretch}{1.2}
+  \begin{tabular}{l c r r}
+    \toprule
+    Method & Inference & Throughput (FPS)$\uparrow$ & Time per frame (ms)$\downarrow$ \\
+    \midrule
+    MonST3R~\cite{zhang2025monst3r} & \makecell{optical flow +\\global alignment} &   0.14 & 7250.2 \\
+    VGGT~\cite{wang2025vggt} & feed-forward &   8.71 &  114.8 \\
+    Ours    & feed-forward &   8.81 &  113.5 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Inference cost on one 64-frame sequence (\texttt{dataset2/keyframe3}), measured on a
+  single RTX 5090 under identical conditions: image loading and preprocessing are included,
+  model construction and any writing of results are not. MonST3R~\cite{zhang2025monst3r} is two
+  orders of magnitude
+  slower because it precomputes RAFT optical flow and then runs 300 iterations of global
+  alignment per sequence, whereas both feed-forward models produce the whole sequence in one
+  pass. The gate predictor and the temporal blocks add no measurable cost over the VGGT
+  baseline. These are throughput figures, not streaming latency: all three methods consume the
+  sequence as a whole, so no frame is available before the sequence finishes.}
+  \label{tab:runtime}
+\end{table}
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}

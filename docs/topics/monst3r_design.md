@@ -22,7 +22,7 @@
 MonST3R 的深度是每像素自由變數才需要拉回初值。兩者皆不列入。
 
 本檔只比對**目標函數本身**（公式、變數、梯度流向），不討論 TTO 與監督訓練的差異，也不放實驗數字
-（那些在 [table.md](table.md)）。每一項附 `file:line`，可自行核對。
+（那些在 [results/natural.md](../results/natural.md)）。每一項附 `file:line`，可自行核對。
 
 > **通則：這三項對得上名字，對不上作用。**
 
@@ -31,9 +31,9 @@ MonST3R 的深度是每像素自由變數才需要拉回初值。兩者皆不列
 ## 1. flow / photometric —— 影像觀測項
 
 ### MonST3R `flow_loss`
-[optimizer.py:780-802](../reference/monst3r/dust3r/cloud_opt/optimizer.py#L780-L802)、
-[smooth_L1_loss_fn:18-24](../reference/monst3r/dust3r/cloud_opt/optimizer.py#L18-L24)、
-[warp_by_disp](../reference/monst3r/dust3r/utils/goem_opt.py#L196-L237)
+[optimizer.py:780-802](../../reference/monst3r/dust3r/cloud_opt/optimizer.py#L780-L802)、
+[smooth_L1_loss_fn:18-24](../../reference/monst3r/dust3r/cloud_opt/optimizer.py#L18-L24)、
+[warp_by_disp](../../reference/monst3r/dust3r/utils/goem_opt.py#L196-L237)
 
 ```
 ego_flow = normalize( K'R_rel K⁻¹·ũ  +  d·(K'·t_rel) ) − ũ   d = 1/depth（視差形式）
@@ -51,7 +51,7 @@ if L_flow > flow_loss_thre:  L_flow = 0                      ← 太大就整段
 - 第 10% iteration 之後才啟用（`flow_loss_start_epoch=0.1`）
 - ⚠️ **超參要看 argparse，不是 class 簽名**。兩邊不一樣，實際生效的是 argparse 那組：
 
-  | | class 簽名 `optimizer.py:37-38` | 實際跑的 [training.py:108-114](../reference/monst3r/dust3r/training.py#L108-L114) |
+  | | class 簽名 `optimizer.py:37-38` | 實際跑的 [training.py:108-114](../../reference/monst3r/dust3r/training.py#L108-L114) |
   |---|---|---|
   | `flow_loss_thre`（整段不用的門檻） | 50 | **20** |
   | `flow_loss_start_epoch` | 0.15 | **0.1** |
@@ -63,7 +63,7 @@ if L_flow > flow_loss_thre:  L_flow = 0                      ← 太大就整段
 - ⚠️ 「整段不用」是 Python `>` 比較，而 `nan > thre` 為 False → **NaN 擋不住**（分母為 0 時可達）
 
 ### Dyn-VGGT `compute_static_photo_loss`
-[loss.py:488-591](../training/loss.py#L488-L591)
+[loss.py:488-591](../../training/loss.py#L488-L591)
 
 ```
 X_t     = K_gt⁻¹·ũ · D_gt                                    ← GT 深度反投影（相機 t 座標系）
@@ -72,7 +72,7 @@ u'      = π( R_rel·X_t + t_rel )                             ← 預測相對�
 L       = Huber( I_{t+1}(u') − I_t(u) , δ=0.1 )              ← RGB 強度差
 ```
 
-程式碼分成 cam_t → world → cam_{t+1} 兩步走（[loss.py:555-556](../training/loss.py#L555-L556)），
+程式碼分成 cam_t → world → cam_{t+1} 兩步走（[loss.py:555-556](../../training/loss.py#L555-L556)），
 和上式等價。**真正影響 loss 的只有相對位姿** —— 整段軌跡一起平移旋轉，這個 loss 不會變。
 
 - 幾何量：**只有 pose 是預測的**，depth / K / 影像皆為常數
@@ -99,7 +99,7 @@ L       = Huber( I_{t+1}(u') − I_t(u) , δ=0.1 )              ← RGB 強度�
 ## 2. 平滑先驗
 
 ### MonST3R `relative_pose_loss`
-[optimizer.py:1014-1027](../reference/monst3r/dust3r/cloud_opt/optimizer.py#L1014-L1027)
+[optimizer.py:1014-1027](../../reference/monst3r/dust3r/cloud_opt/optimizer.py#L1014-L1027)
 
 ```
 RT_rel = RT_t⁻¹ · RT_{t+1}
@@ -110,7 +110,7 @@ L_temp = Σ_t [ ‖R_rel − I‖_F  +  w_t·‖t_rel‖₂ ]              w_t =
 **一階** —— 懲罰相鄰幀的**運動本身**，隱含先驗是「相機幾乎不動」，等速運動亦受罰。
 
 ### Dyn-VGGT `compute_camera_smooth_loss`
-[loss.py:594-681](../training/loss.py#L594-L681)
+[loss.py:594-681](../../training/loss.py#L594-L681)
 
 ```
 v    = (T_{t+1} − T_t) / Δt                     Δt 由 batch["ids"] 給（真實幀號差）
@@ -141,7 +141,7 @@ L    = Σ_stages γ^(n−1−s) [ mean|a_T|·w_T + mean|a_R|·w_R ] / n
 ## 3. 動態遮罩
 
 ### MonST3R —— 推導出來的副產品，**沒有 loss**
-[get_motion_mask_from_pairs:294-366](../reference/monst3r/dust3r/cloud_opt/optimizer.py#L294-L366)
+[get_motion_mask_from_pairs:294-366](../../reference/monst3r/dust3r/cloud_opt/optimizer.py#L294-L366)
 
 ```
 err  = ‖ego_flow(粗估 pose/depth) − flow_RAFT‖₂              (H,W)
@@ -155,13 +155,13 @@ mask = mask ∨ SAM2_mask                                      ← 預設開啟�
 - 唯一用途：當 flow loss 的像素權重
 - ⚠️ **SAM2 預設是開的**（`sam2_mask_refine=True`），而且做的是取聯集、不是修正：
   `dynamic_masks[i] |= sam2_dynamic_masks[i]`
-  （[optimizer.py:443](../reference/monst3r/dust3r/cloud_opt/optimizer.py#L443)）。
+  （[optimizer.py:443](../../reference/monst3r/dust3r/cloud_opt/optimizer.py#L443)）。
   也就是說預設跑出來的遮罩 = **幾何殘差 ∪ SAM2 分割**。說 MonST3R 的遮罩「只是幾何副產品」時要留意這點。
 - ⚠️ min-max 正規化讓**每個 pair 一定有像素等於 1.0**。單 pair 的幀因此必定被標出動態區；
   多 pair 平均後才有機會全部低於 0.35。全靜態場景還是容易憑空生出動態區。
 
 ### Dyn-VGGT `compute_gate_loss` —— 可學模組，且回饋進架構
-[loss.py:702-757](../training/loss.py#L702-L757)
+[loss.py:702-757](../../training/loss.py#L702-L757)
 
 ```
 m*_patch = adaptive_avg_pool2d( motion_mask , patch grid )
@@ -194,5 +194,5 @@ L_gate   = Σ(BCE ⊙ keep) / Σ(keep)
 
 ## 相關
 
-- 實驗數字與探針結果：[table.md](table.md) 表 5
-- v3 方法本體：[method.md](method.md)
+- 實驗數字與探針結果：[results/natural.md](../results/natural.md) 表 5
+- v3 方法本體：[method.md](../method.md)

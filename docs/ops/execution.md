@@ -1,8 +1,8 @@
 # Dyn-VGGT：執行手冊
 
 > 所有指令在 `training/` 下執行，conda env `vggt-dyn`。
-> 方法設計見 [method.md](method.md)；所有評測數字見 [table.md](table.md)；
-> 每支 checkpoint 的身分見 [archive/checkpoints.md](archive/checkpoints.md)。
+> 方法設計見 [method.md](../method.md)；所有評測數字見 [results/natural.md](../results/natural.md)；
+> 每支 checkpoint 的身分見 [archive/checkpoints.md](../checkpoints.md)。
 >
 > 這份是 `CLAUDE.md` 的展開版：CLAUDE.md 只放 AI 每次都要知道的最小集合，完整指令與坑在這裡。
 
@@ -122,7 +122,7 @@ python diag/vis/train_curves.py --log logs/<exp>/log.txt
 | `accum_steps > 1` 空 chunk crash | 設 `accum_steps: 1` |
 | `F.binary_cross_entropy` 不允許 AMP | 已改手寫 BCE（`loss.py`） |
 | TartanAir 沒有 `loss_motion` | 預期行為（純靜態集無 `motion_mask`） |
-| SCARED 空深度幀 | 會靜默吃掉 camera loss，取樣時要避開當 anchor（[scared_dataset.md](scared_dataset.md) §5） |
+| SCARED 空深度幀 | 會靜默吃掉 camera loss，取樣時要避開當 anchor（[scared_dataset.md](../topics/scared_dataset.md) §5） |
 | 主機隨機崩潰 | **未解**，跟本專案程式無關。症狀辨識與崩潰後清理見 [machine_error.md](machine_error.md) |
 
 長時間訓練建議 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。

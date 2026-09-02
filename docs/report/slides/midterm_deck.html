@@ -1,0 +1,1053 @@
+<title>Dyn-VGGT 期中報告</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700&family=Noto+Sans+TC:wght@400;500;700&family=Noto+Serif:ital@0;1&family=IBM+Plex+Mono:wght@400;500&display=swap">
+
+<style>
+:root{
+  --bg:#EDF1F0; --surface:#FFFFFF; --sunk:#E3E9E8;
+  --ink:#0E1A1C; --muted:#5B6B6C; --line:#CDD7D6;
+  --accent:#0E7C86; --accent-soft:#D9EBED; --accent-ink:#0A5A62;
+  --warn:#AE5019; --warn-soft:#F5E4D8;
+  --display:"Archivo","Noto Sans TC","PingFang TC","Microsoft JhengHei",sans-serif;
+  --body:"Noto Sans TC","PingFang TC","Microsoft JhengHei",system-ui,sans-serif;
+  --mono:"IBM Plex Mono","SFMono-Regular",Consolas,monospace;
+  --math:"Noto Serif",Cambria,Georgia,serif;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --bg:#0A1214; --surface:#111D1F; --sunk:#0E191B;
+    --ink:#E3EBEA; --muted:#92A4A5; --line:#223335;
+    --accent:#4CBCC6; --accent-soft:#10353A; --accent-ink:#7FD4DC;
+    --warn:#DE9257; --warn-soft:#33210F;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0A1214; --surface:#111D1F; --sunk:#0E191B;
+  --ink:#E3EBEA; --muted:#92A4A5; --line:#223335;
+  --accent:#4CBCC6; --accent-soft:#10353A; --accent-ink:#7FD4DC;
+  --warn:#DE9257; --warn-soft:#33210F;
+}
+
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--body);
+  -webkit-font-smoothing:antialiased}
+
+/* ---------- deck shell ---------- */
+.shell{min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:0}
+.stage{width:min(100vw,177.78vh);container-type:inline-size;position:relative}
+.slide{display:none;width:100%;aspect-ratio:16/9;background:var(--surface);
+  font-size:1.42cqw;padding:4.2cqw 5cqw 3.4cqw;position:relative;overflow:hidden;
+  border:1px solid var(--line)}
+.slide.on{display:flex;flex-direction:column;gap:1.5em}
+
+/* ---------- chrome ---------- */
+.rail{position:absolute;top:0;left:0;width:.75cqw;height:100%;background:var(--accent)}
+.slide[data-part="2"] .rail{background:var(--warn)}
+.slide[data-part="3"] .rail{background:var(--accent-ink)}
+.slide[data-part="0"] .rail{background:var(--muted)}
+.eyebrow{position:absolute;top:2cqw;left:5cqw;right:5cqw;display:flex;
+  justify-content:space-between;align-items:baseline;
+  font-family:var(--mono);font-size:.82em;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+.eyebrow b{color:var(--accent);font-weight:500}
+.num{position:absolute;bottom:1.8cqw;right:5cqw;font-family:var(--mono);
+  font-size:.8em;color:var(--muted);font-variant-numeric:tabular-nums}
+
+h1{font-family:var(--display);font-weight:700;font-size:3.4em;line-height:1.03;
+  margin:0;letter-spacing:-.02em;text-wrap:balance}
+h2{font-family:var(--display);font-weight:700;font-size:1.95em;line-height:1.12;
+  margin:0;letter-spacing:-.015em;text-wrap:balance}
+h2 small{display:block;font-family:var(--mono);font-weight:400;font-size:.42em;
+  letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-bottom:.5em}
+h3{font-family:var(--display);font-weight:600;font-size:1.05em;margin:0 0 .35em}
+p{margin:0;line-height:1.62;font-size:.98em}
+.lede{font-size:1.12em;line-height:1.55;color:var(--ink);max-width:52ch}
+.dim{color:var(--muted)}
+strong{font-weight:700}
+code,.k{font-family:var(--mono);font-size:.88em;background:var(--sunk);
+  padding:.1em .35em;border-radius:2px;color:var(--accent-ink)}
+
+.body{flex:1;display:flex;flex-direction:column;gap:1.1em;min-height:0}
+.cols{display:grid;gap:1.6em;align-items:start}
+.c2{grid-template-columns:1fr 1fr}
+.c23{grid-template-columns:1.25fr 1fr}
+.c32{grid-template-columns:1fr 1.35fr}
+
+ul{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:.55em}
+ul li{position:relative;padding-left:1.1em;line-height:1.55;font-size:.96em}
+ul li::before{content:"";position:absolute;left:0;top:.62em;width:.42em;height:.42em;
+  background:var(--accent);border-radius:50%}
+ul.plain li::before{display:none}
+ul.plain li{padding-left:0}
+
+/* ---------- math ---------- */
+.eq{font-family:var(--math);font-size:1.12em;line-height:1.9;text-align:center;
+  padding:.75em .9em;background:var(--sunk);border-left:.22em solid var(--accent);
+  overflow-x:auto;white-space:nowrap}
+.eq.hero{font-size:1.34em;background:var(--accent-soft);border-left-color:var(--accent-ink)}
+.eq.warnbox{border-left-color:var(--warn);background:var(--warn-soft)}
+.eq.flush{text-align:left}
+.eq i{font-style:italic;font-family:var(--math)}
+.eq .op{font-style:normal;padding:0 .18em}
+.eq .fn{font-style:normal;font-family:var(--body);font-size:.86em;letter-spacing:.01em}
+.eq .txt{font-style:normal;font-family:var(--body);font-size:.72em;color:var(--muted)}
+.eq sub,.eq sup{font-size:.62em;font-style:normal}
+.eq sub i,.eq sup i{font-size:1em}
+.fr{display:inline-flex;flex-direction:column;vertical-align:-.62em;text-align:center;
+  margin:0 .25em;line-height:1.25}
+.fr>span:first-child{border-bottom:1px solid currentColor;padding:0 .3em}
+.fr>span:last-child{padding:.05em .3em 0}
+.rt{border-top:1px solid currentColor;padding:0 .2em 0 .1em;margin-left:-.1em}
+.cases{display:inline-grid;grid-template-columns:auto auto;gap:.1em 1.2em;
+  text-align:left;vertical-align:middle;border-left:1px solid currentColor;
+  padding-left:.5em;margin-left:.3em}
+.note{font-size:.82em;color:var(--muted);line-height:1.55}
+
+/* ---------- data ---------- */
+table{border-collapse:collapse;width:100%;font-size:.86em;font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:.42em .6em;border-bottom:1px solid var(--line)}
+th{font-family:var(--mono);font-size:.82em;font-weight:500;letter-spacing:.06em;
+  text-transform:uppercase;color:var(--muted);border-bottom:1.5px solid var(--ink)}
+td.n,th.n{text-align:right}
+tr.best td{background:var(--accent-soft)}
+tr.base td{color:var(--muted);font-style:italic}
+td b{color:var(--accent-ink)}
+.tw{overflow-x:auto}
+
+.card{background:var(--sunk);padding:1em 1.15em;display:flex;flex-direction:column;gap:.5em;
+  border-top:.18em solid var(--line)}
+.card.a{border-top-color:var(--accent)}
+.card.w{border-top-color:var(--warn)}
+.card h3{font-size:1em}
+.card p{font-size:.9em}
+.tag{font-family:var(--mono);font-size:.74em;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--muted)}
+.flag{display:inline-block;font-family:var(--mono);font-size:.76em;letter-spacing:.08em;
+  padding:.15em .5em;background:var(--warn-soft);color:var(--warn);text-transform:uppercase}
+.flag.ok{background:var(--accent-soft);color:var(--accent-ink)}
+
+/* token strip diagram */
+.strip{display:flex;gap:.25em;align-items:stretch;font-family:var(--mono);font-size:.76em}
+.tok{padding:.5em .4em;text-align:center;border:1px solid var(--line);background:var(--surface);
+  display:flex;align-items:center;justify-content:center;flex-direction:column;gap:.15em}
+.tok.cam{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:500}
+.tok.reg{background:var(--accent-soft);color:var(--accent-ink);border-color:var(--accent-soft)}
+.tok.pat{flex:1;background:var(--sunk)}
+.tok.dyn{background:var(--warn-soft);color:var(--warn);border-color:var(--warn)}
+.frameg{display:flex;gap:.6em}
+.frame{flex:1;display:flex;flex-direction:column;gap:.3em}
+.frame .lbl{font-family:var(--mono);font-size:.72em;color:var(--muted);letter-spacing:.08em}
+
+.kv{display:grid;grid-template-columns:auto 1fr;gap:.35em 1em;font-size:.9em;align-items:baseline}
+.kv dt{font-family:var(--mono);font-size:.84em;color:var(--muted);white-space:nowrap}
+.kv dd{margin:0}
+
+/* ---------- title slide ---------- */
+.title{justify-content:center;gap:1.2em}
+.title .meta{display:flex;gap:2.2em;font-family:var(--mono);font-size:.85em;
+  letter-spacing:.1em;text-transform:uppercase;color:var(--muted);flex-wrap:wrap}
+.title .three{display:grid;grid-template-columns:repeat(3,1fr);gap:1.2em;margin-top:.6em}
+.title .three div{border-top:.18em solid var(--accent);padding-top:.6em}
+.title .three div:nth-child(2){border-top-color:var(--warn)}
+.title .three div:nth-child(3){border-top-color:var(--accent-ink)}
+.title .three b{display:block;font-family:var(--display);font-size:1.15em}
+.title .three span{font-size:.84em;color:var(--muted)}
+
+/* ---------- controls ---------- */
+.bar{width:min(100vw,177.78vh);display:flex;align-items:center;gap:.75rem;
+  padding:.55rem .2rem;font-family:var(--mono);font-size:.72rem;color:var(--muted);
+  letter-spacing:.08em}
+.bar button{font:inherit;letter-spacing:inherit;background:none;border:1px solid var(--line);
+  color:var(--muted);padding:.3em .7em;cursor:pointer;border-radius:2px}
+.bar button:hover{border-color:var(--accent);color:var(--accent)}
+.bar button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.bar .grow{flex:1}
+.prog{height:2px;background:var(--line);flex:1;max-width:14rem}
+.prog i{display:block;height:100%;background:var(--accent);transition:width .18s}
+@media (prefers-reduced-motion:reduce){.prog i{transition:none}}
+
+@media print{
+  @page{size:landscape;margin:0}
+  .bar{display:none}
+  .shell{display:block}
+  .stage{width:100%}
+  .slide{display:flex !important;break-after:page;border:none;font-size:1.42cqw}
+}
+</style>
+
+<div class="shell">
+<div class="stage" id="stage">
+
+<!-- 1 ───────────────────────────────────────────── -->
+<section class="slide on title" data-part="0">
+  <span class="rail"></span>
+  <div class="meta"><span>期中報告</span><span>2026-08-26</span><span>Dyn-VGGT</span></div>
+  <h1>把相機 pose<br>從場景運動裡拆出來</h1>
+  <p class="lede">VGGT 在動態場景與內視鏡影像上，唯一明顯落後的指標是<strong>相機 pose</strong>。根因是 pose 與物體／組織的運動在 aggregator 的 global attention 中耦合。本報告從三個正交的軸解除這個耦合，全程<strong>純前饋</strong>、不做 test-time optimization、不動幾何頭。</p>
+  <div class="three">
+    <div><b>① Motion Gate</b><span>前向 · attention bias</span></div>
+    <div><b>② Motion Loss</b><span>監督 · 剛性 warp 約束</span></div>
+    <div><b>③ Temporal</b><span>時序 · 時間軸 attention</span></div>
+  </div>
+</section>
+
+<!-- 2 ───────────────────────────────────────────── -->
+<section class="slide" data-part="0">
+  <span class="rail"></span>
+  <div class="eyebrow"><span>問題定位</span><b>§1</b></div>
+  <h2><small>Problem</small>VGGT 是什麼，弱在哪裡</h2>
+  <div class="body cols c2">
+    <div style="display:flex;flex-direction:column;gap:.9em">
+      <p>VGGT 是<strong>前饋式</strong>多視角幾何 transformer：<em>S</em> 張影像一次前向，同時輸出相機參數、depth、point map。不需要 per-scene 最佳化。</p>
+      <div class="eq flush">
+        {<i>I</i><sub>t</sub>}<sub>t=1..S</sub><span class="op">⟶</span>{<i>ĝ</i><sub>t</sub>}, {<i>D̂</i><sub>t</sub>}, {<i>X̂</i><sub>t</sub>}
+      </div>
+      <p class="note">pose encoding 採 <code>absT_quaR_FoV</code>，9 維，以第一幀為世界原點：<br>
+        <span style="font-family:var(--math)"><i>g</i><sub>t</sub> = [ <i>t</i> ∈ ℝ³ | <i>q</i> ∈ ℝ⁴ | fov ∈ ℝ² ]</span></p>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:.9em">
+      <div class="card w">
+        <span class="tag">觀察到的弱項</span>
+        <h3>深度領先，pose 落後</h3>
+        <p>depth 在動態場景已具競爭力；輸的是相機軌跡。內視鏡場景更嚴重——組織會變形、器械會移動、鏡頭高光跟著相機走。</p>
+      </div>
+      <div class="card a">
+        <span class="tag">刻意的範圍限制</span>
+        <h3>只做 pose，且純前饋</h3>
+        <p>不輸出 scene flow、不改幾何表示、不做 test-time optimization。depth head 全程凍結，保住既有的深度品質。</p>
+      </div>
+    </div>
+  </div>
+  <span class="num">02</span>
+</section>
+
+<!-- 3 ───────────────────────────────────────────── -->
+<section class="slide" data-part="0">
+  <span class="rail"></span>
+  <div class="eyebrow"><span>問題定位 · Token 佈局</span><b>§1.2</b></div>
+  <h2><small>Where pose is born</small>pose 誕生在 camera token</h2>
+  <div class="body" style="gap:1.2em">
+    <div class="frameg">
+      <div class="frame">
+        <span class="lbl">FRAME 1</span>
+        <div class="strip">
+          <div class="tok cam">cam</div><div class="tok reg">reg×4</div>
+          <div class="tok pat">patch × P<sub>patch</sub></div>
+        </div>
+      </div>
+      <div class="frame">
+        <span class="lbl">FRAME 2</span>
+        <div class="strip">
+          <div class="tok cam">cam</div><div class="tok reg">reg×4</div>
+          <div class="tok pat">patch × P<sub>patch</sub></div>
+        </div>
+      </div>
+      <div class="frame">
+        <span class="lbl">FRAME S</span>
+        <div class="strip">
+          <div class="tok cam">cam</div><div class="tok reg">reg×4</div>
+          <div class="tok pat">patch × P<sub>patch</sub></div>
+        </div>
+      </div>
+    </div>
+    <div class="cols c23">
+      <table>
+        <tr><th>token</th><th>誰讀它</th><th>下場</th></tr>
+        <tr><td><b>camera</b>（1/幀）</td><td>camera_head，4 次迭代 refine</td><td><b>→ pose</b></td></tr>
+        <tr><td>register（4/幀）</td><td>沒有任何 head 讀</td><td>attention 的 scratch space</td></tr>
+        <tr><td>patch</td><td>depth / point head</td><td>→ 幾何</td></tr>
+      </table>
+      <div class="card">
+        <span class="tag">實作陷阱</span>
+        <h3>token 是 frame-interleaved</h3>
+        <p>special token <strong>散在每幀開頭</strong>，不是集中在序列最前面。誤把最前 5<i>S</i> 個當 special，會導致只有 frame 1 被門控。</p>
+      </div>
+    </div>
+  </div>
+  <span class="num">03</span>
+</section>
+
+<!-- 4 ───────────────────────────────────────────── -->
+<section class="slide" data-part="0">
+  <span class="rail"></span>
+  <div class="eyebrow"><span>問題定位 · 耦合</span><b>§1.4</b></div>
+  <h2><small>The coupling</small>camera token 把運動平均了進來</h2>
+  <div class="body" style="gap:1.1em">
+    <p class="lede">在 <strong>global attention</strong> 裡，所有幀的所有 token 攤平一起做 attention。每一幀的 camera token 會 attend 到<strong>所有幀的所有 patch</strong>——包含正在移動的那些。</p>
+    <div class="eq hero">
+      <i>A</i> <span class="op">=</span> <span class="fn">softmax</span><span class="op">(</span><span class="fr"><span><i>QK</i><sup>⊤</sup></span><span>√<span class="rt"><i>d</i></span></span></span> <span class="op">+</span> <i>B</i><span class="op">)</span> <span style="padding:0 1.2em">,</span>
+      <i>o</i><sub>i</sub> <span class="op">=</span> <span style="font-size:1.25em">∑</span><sub>j</sub> <i>A</i><sub>ij</sub> <i>v</i><sub>j</sub>
+    </div>
+    <div class="eq warnbox">
+      <i>o</i>[<i>c</i><sub>t</sub>] <span class="op">=</span>
+      <span style="font-size:1.25em">∑</span><sub>s=1..S</sub>
+      <span style="font-size:1.25em">∑</span><sub>j=1..P<sub>patch</sub></sub>
+      <i>A</i>[<i>c</i><sub>t</sub>, <i>x</i><sub>s</sub><sup>(j)</sup>] <span class="op">·</span> <i>v</i>(<i>x</i><sub>s</sub><sup>(j)</sup>)
+      <span class="txt" style="padding-left:1.4em">← j 跑遍所有 patch，靜態與動態一視同仁</span>
+    </div>
+    <div class="cols c2" style="gap:1.2em">
+      <p class="note">原版 VGGT 中 <span style="font-family:var(--math)"><i>B</i> ≡ 0</span>。動態物的運動被平均進 camera token → 送進 camera head → <strong>pose 被污染</strong>。</p>
+      <p class="note"><strong>為什麼 loss 端的 mask 救不了：</strong>在 loss 端屏蔽動態區只是「不去罰它」，pose 在前向時就已經被污染了。屏蔽必須搬到 <strong>attention 端</strong>。</p>
+    </div>
+  </div>
+  <span class="num">04</span>
+</section>
+
+<!-- 5 ───────────────────────────────────────────── -->
+<section class="slide" data-part="0">
+  <span class="rail"></span>
+  <div class="eyebrow"><span>方法總覽</span><b>§2–4</b></div>
+  <h2><small>Overview</small>三個正交的軸，打同一個耦合</h2>
+  <div class="body" style="gap:1.1em">
+    <div class="cols" style="grid-template-columns:repeat(3,1fr)">
+      <div class="card a">
+        <span class="tag">① 前向 · <code>enable_gate</code></span>
+        <h3>Motion Gate</h3>
+        <p>aggregator 中段預測 per-patch 動態 logit <span style="font-family:var(--math)"><i>g</i></span>，在後段 global attention 對 <strong>camera/register 的 query 列</strong>加負 attention bias，讓 camera token 結構性地只聚合靜態 patch。</p>
+      </div>
+      <div class="card w">
+        <span class="tag">② 監督 · <code>loss.static_photo</code></span>
+        <h3>Motion Loss</h3>
+        <p>剛性 warp 只在靜態區成立。用 GT depth 反投影、以<strong>預測 pose</strong> warp 到鄰幀，RGB 必須匹配——造出獨立於 GT pose 重參數化的光度訊號。</p>
+      </div>
+      <div class="card" style="border-top-color:var(--accent-ink)">
+        <span class="tag">③ 時序 · <code>enable_temporal</code></span>
+        <h3>Temporal + Smooth</h3>
+        <p>補上 VGGT 缺的<strong>純時間軸</strong> attention（每個空間位置 attend 自己的 S 幀），並對預測軌跡的二階不連續加正則。</p>
+      </div>
+    </div>
+    <div class="cols c2" style="gap:1.4em;margin-top:.3em">
+      <div>
+        <h3>三者共同的性質</h3>
+        <ul>
+          <li><strong>Identity warm-start</strong>：初始化時前向與 pretrained VGGT-1B 逐位元相同。</li>
+          <li><strong>patch↔patch attention 一字不改</strong>：depth/point head 的輸入特徵不變。</li>
+          <li><strong>純前饋</strong>：推論成本 ≈ 原 VGGT，額外顯存 ≈ 0。</li>
+        </ul>
+      </div>
+      <div>
+        <h3>兩條應用線</h3>
+        <ul>
+          <li><strong>通用動態場景</strong>（Sintel / PointOdyssey / TartanAir / Waymo / Spring）：有動態標註，gate 走 BCE 監督。</li>
+          <li><strong>醫學內視鏡</strong>（SCARED / C3VD / 私人資料）：<strong>沒有動態標註</strong>，gate 改由 pose loss 當老師。<span class="flag">本報告主線</span></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <span class="num">05</span>
+</section>
+
+<!-- 6 ───────────────────────────────────────────── -->
+<section class="slide" data-part="1">
+  <span class="rail"></span>
+  <div class="eyebrow"><span>貢獻 ① Motion Gate</span><b>§2.1</b></div>
+  <h2><small>Contribution ①</small>中段 Gate Predictor</h2>
+  <div class="body cols c32" style="gap:1.8em">
+    <div style="display:flex;flex-direction:column;gap:.9em">
+      <p>門控要在<strong>聚合進行中</strong>就用到動態訊號，但動態訊號通常要讀最終特徵才得到——雞生蛋。解法是在 aggregator 中段插一個輕量 MLP。</p>
+      <dl class="kv">
+        <dt>觸發點</dt><dd>第 <span style="font-family:var(--math)"><i>k</i></span> = 7 個 aa-block 完成後（約全深度 1/3）</dd>
+        <dt>輸入</dt><dd>中段的 contextualized patch token，切掉 camera+register</dd>
+        <dt>輸出</dt><dd>每 patch 一個動態 logit；<span style="font-family:var(--math)">σ(<i>g</i>)</span> 即免費的 dynamic mask</dd>
+      </dl>
+      <p class="note"><strong>為什麼放中段：</strong>太早特徵未成熟，太晚則後面沒幾個 global block 可被清洗。1/3 是「特徵夠成熟」與「後段仍有 2/3 block 可門控」的平衡。</p>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:.9em">
+      <div class="eq hero flush" style="line-height:2.1">
+        <i>g</i><sub>t,j</sub> <span class="op">=</span> <i>W</i><sub>2</sub> <span class="fn">GELU</span>(<i>W</i><sub>1</sub> <span class="fn">LN</span>(<i>x</i><sup>(k)</sup><sub>t,j</sub>))
+      </div>
+      <p class="note" style="font-family:var(--math);text-align:center;font-size:.95em">
+        <i>W</i><sub>1</sub> ∈ ℝ<sup>(C/4)×C</sup>&nbsp;&nbsp;·&nbsp;&nbsp;<i>W</i><sub>2</sub> ∈ ℝ<sup>1×(C/4)</sup>&nbsp;&nbsp;·&nbsp;&nbsp;<i>C</i> = 1024
+      </p>
+      <div class="card a">
+        <span class="tag">關鍵設計</span>
+        <h3>末層 zero-init</h3>
+        <p><span style="font-family:var(--math)"><i>W</i><sub>2</sub> = 0</span> → 訓練第 0 步 <span style="font-family:var(--math)"><i>g</i> ≡ 0</span> → bias ≡ 0 → <strong>前向逐位元等於 pretrained VGGT</strong>。門控隨訓練漸進通電。</p>
+      </div>
+      <p class="note"><strong>解析度天然對齊：</strong><span style="font-family:var(--math)"><i>g</i></span> 在 patch 格上，而 attention 的 key 本來就是 patch token → bias 直接套，零插值。</p>
+    </div>
+  </div>
+  <span class="num">06</span>
+</section>
+
+<!-- 7 ───────────────────────────────────────────── -->
+<section class="slide" data-part="1">
+  <span class="rail"></span>
+  <div class="eyebrow"><span>貢獻 ① Motion Gate</span><b>§2.2 · 核心公式</b></div>
+  <h2><small>The gating bias</small>只壓 camera query 那幾列</h2>
+  <div class="body" style="gap:.9em">
+    <div class="eq flush">
+      <i>B</i>[<i>i</i>, <i>j</i>] <span class="op">=</span>
+      <span class="cases">
+        <span><i>b</i>(<i>g</i><sub>j</sub>)</span><span class="txt">i ∈ camera/register queries，j ∈ patch keys</span>
+        <span>0</span><span class="txt">其餘所有位置（patch↔patch 完全不動）</span>
+      </span>
+    </div>
+    <div class="eq hero">
+      <i>b</i>(<i>g</i>) <span class="op">=</span> <span class="fn">min</span>( 0 ,&nbsp; <span class="fn">softplus</span>(0) <span class="op">−</span> <span class="fn">softplus</span>(<i>g</i>) )
+      <span class="op">=</span> <span class="fn">min</span>( 0 ,&nbsp; ln 2 <span class="op">−</span> ln(1 <span class="op">+</span> <i>e</i><sup>g</sup>) )
+    </div>
+    <div class="cols" style="grid-template-columns:repeat(3,1fr);gap:1.1em">
+      <div class="card a"><span class="tag">性質 1</span><h3>機率意義</h3>
+        <p style="font-family:var(--math);font-size:.95em">−<span class="fn" style="font-family:var(--body)">softplus</span>(<i>g</i>) = ln σ(−<i>g</i>) = ln <i>P</i>(static)</p>
+        <p>softmax 後等於<strong>按靜態機率重新加權</strong>——單邊、soft、只壓不升。</p></div>
+      <div class="card a"><span class="tag">性質 2</span><h3>Warm-start 忠實</h3>
+        <p><span style="font-family:var(--math)">+ln 2</span> 的 offset 讓 <span style="font-family:var(--math)"><i>g</i>=0</span> 時 bias <strong>精確為 0</strong>。裸的 −softplus 在此給 −ln2，會把每個 patch key 的權重減半。</p></div>
+      <div class="card a"><span class="tag">性質 3</span><h3>Suppress-only</h3>
+        <p><span style="font-family:var(--math)">min(0, ·)</span> 夾上界 → 有信心的靜態 patch 得到滿權重，<strong>不會被放大</strong>。</p></div>
+    </div>
+    <table style="margin-top:.2em">
+      <tr><th>patch</th><th>g</th><th>b(g)</th><th>softmax 後的權重</th></tr>
+      <tr><td>有信心靜態</td><td>→ −∞</td><td>→ 0</td><td>維持原樣</td></tr>
+      <tr class="best"><td>初始化（zero-init）</td><td>0</td><td><b>= 0（精確）</b></td><td>逐位元 = pretrained VGGT</td></tr>
+      <tr><td>動態</td><td>→ +∞</td><td>→ −∞</td><td>→ 0（排除）</td></tr>
+    </table>
+  </div>
+  <span class="num">07</span>
+</section>
+
+<!-- 8 ───────────────────────────────────────────── -->
+<section class="slide" data-part="1">
+  <span class="rail"></span>
+  <div class="eyebrow"><span>貢獻 ① · 醫學線變體</span><b>§2.3</b></div>
+  <h2><small>No labels, no teacher</small>沒有動態標註時，讓 pose loss 當老師</h2>
+  <div class="body" style="gap:.95em">
+    <p class="lede">通用線上 <span style="font-family:var(--math)"><i>g</i></span> 由 GT mask 的 BCE 監督，bias 路徑 <strong>detach</strong>。但 SCARED / C3VD <strong>沒有動態標註</strong>——detach 加上沒有 <span style="font-family:var(--math)"><i>L</i><sub>gate</sub></span>，門控完全不可訓練。醫學線因此打開兩個旋鈕。</p>
+    <div class="cols c2" style="gap:1.5em">
+      <div style="display:flex;flex-direction:column;gap:.7em">
+        <h3>(a) <code>gate_pose_grad = True</code></h3>
+        <p style="font-size:.94em">移除 detach，讓 <span style="font-family:var(--math)"><i>L</i><sub>cam</sub></span> 直接訓練 gate：</p>
+        <div class="eq flush" style="font-size:1.05em">
+          <span class="fr"><span>∂<i>L</i><sub>cam</sub></span><span>∂<i>g</i><sub>j</sub></span></span>
+          <span class="op">=</span>
+          <span class="fr"><span>∂<i>L</i><sub>cam</sub></span><span>∂<i>b</i><sub>j</sub></span></span>
+          <span class="op">·</span> <i>b</i>′(<i>g</i><sub>j</sub>) <span style="padding:0 .6em">,</span>
+          <i>b</i>′(<i>g</i>) <span class="op">=</span>
+          <span class="cases"><span>−σ(<i>g</i>)</span><span class="txt">g &gt; 0</span><span>0</span><span class="txt">g &lt; 0</span></span>
+        </div>
+        <p class="note">語意從「哪裡在動」變成「<strong>哪些 patch 對 pose 有害</strong>」——更弱，但在無標註域上唯一可得的訊號。</p>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:.7em">
+        <h3>(b) <code>gate_leaky = 0.1</code></h3>
+        <p style="font-size:.94em">clamp 在 <span style="font-family:var(--math)"><i>g</i>&lt;0</span> 整段是平的，梯度恆為 0——被推下去的 patch 再也回不來（dying-ReLU 式吸收態）：</p>
+        <div class="eq flush" style="font-size:1.05em">
+          <i>b</i><sub>λ</sub>(<i>g</i>) <span class="op">=</span>
+          <span class="cases"><span><i>x</i></span><span class="txt">x ≤ 0</span><span>λ<i>x</i></span><span class="txt">x &gt; 0</span></span>
+          <span style="padding:0 .7em">,</span>
+          <i>x</i> <span class="op">=</span> ln 2 <span class="op">−</span> <span class="fn">softplus</span>(<i>g</i>)
+        </div>
+        <p class="note">代價：有信心的靜態 patch 最多被放大 <span style="font-family:var(--math)">λ ln 2 ≈ 0.07</span>。分界用 <span style="font-family:var(--math)"><i>x</i> ≤ 0</span> 而非 <span style="font-family:var(--math)">&lt;</span>，讓 zero-init 的起點走非 leaky 分支。</p>
+      </div>
+    </div>
+    <div class="card w">
+      <span class="tag">誠實揭露</span>
+      <p><strong>這是方法上的實質差異，不宜與「有標註的 gate」混為一談。</strong>醫學線的 gate 是否收斂到有意義的東西、或只是退化成一個 attention 溫度旋鈕，<strong>目前是開放問題</strong>——<code>gate_g_median</code> 與 <code>gate_frac_active</code> 兩個 log 就是為了監控這件事。</p>
+    </div>
+  </div>
+  <span class="num">08</span>
+</section>
+
+<!-- 9 ───────────────────────────────────────────── -->
+<section class="slide" data-part="1">
+  <span class="rail"></span>
+  <div class="eyebrow"><span>貢獻 ① · 實作</span><b>§2.4</b></div>
+  <h2><small>Memory</small>attention 拆兩條 path，顯存成本 ≈ 0</h2>
+  <div class="body cols c2" style="gap:1.6em">
+    <div style="display:flex;flex-direction:column;gap:.9em">
+      <p>把整個 <span style="font-family:var(--math)">[<i>N</i>,<i>N</i>]</span>（<span style="font-family:var(--math)"><i>N</i>=<i>S</i>·<i>P</i></span>）的浮點 mask 交給 <code>F.scaled_dot_product_attention</code>，會讓 flash kernel fallback 到 memory-heavy 的 math backend → 顯存暴增 <span style="font-family:var(--math)">O(<i>N</i>²)</span>。</p>
+      <p><strong>正解是依 query 拆兩條路徑</strong>——只有帶 bias 的那條需要放棄 flash，而它極小。</p>
+      <div class="eq flush" style="line-height:2.3">
+        <span class="fn">Attn</span>(<i>Q</i><sub>patch</sub>, <i>K</i>, <i>V</i>)<br>
+        <span class="txt">Path 1 — S·P<sub>patch</sub> 個 query，無 bias，走 flash</span><br><br>
+        <span class="fn">Attn</span>(<i>Q</i><sub>special</sub>, <i>K</i>, <i>V</i> ; <i>B</i>)<br>
+        <span class="txt">Path 2 — 只有 5S 個 query，帶 bias，小 op</span>
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:.9em">
+      <div class="card">
+        <span class="tag">拆分必須逐幀 gather</span>
+        <h3>frame-interleaved 的代價</h3>
+        <p style="font-family:var(--mono);font-size:.82em;line-height:1.8">
+          q.view(B,H,<b>S,P</b>,D)[:,:,:,:5]&nbsp; → special<br>
+          q.view(B,H,<b>S,P</b>,D)[:,:,:,5:]&nbsp; → patch
+        </p>
+        <p>key 端的 bias 也照 interleaved 順序組：每幀的 patch 欄位填 <span style="font-family:var(--math)"><i>b</i>(<i>g</i>)</span>、special 欄位填 0。</p>
+      </div>
+      <div class="card w">
+        <span class="tag">曾經踩過的坑</span>
+        <p>早期版本用 <code>q[:, :, :5S]</code>。因為 <span style="font-family:var(--math)">5<i>S</i> ≪ <i>P</i></span>，那些索引<strong>全落在 frame 1 內</strong> → 只有 frame 1 的 camera token 被門控，其餘幀完全沒作用。修正前的所有 gate 數字皆已作廢。</p>
+      </div>
+      <p class="note">效果：camera token 在後 2/3 的 global block 中<strong>結構性地只聚合靜態 patch</strong>，而 patch↔patch attention 一字不改 → 深度品質完全保留。</p>
+    </div>
+  </div>
+  <span class="num">09</span>
+</section>
+
+<!-- 10 ──────────────────────────────────────────── -->
+<section class="slide" data-part="1">
+  <span class="rail"></span>
+  <div class="eyebrow"><span>貢獻 ① · 監督（通用線）</span><b>§2.5</b></div>
+  <h2><small>Labels</small>標籤的語義決定跨域能不能活</h2>
+  <div class="body cols c32" style="gap:1.6em">
+    <div style="display:flex;flex-direction:column;gap:.85em">
+      <div class="eq hero flush">
+        <i>L</i><sub>gate</sub> <span class="op">=</span> <span class="fn">BCE</span>( σ(<i>g</i>) , <i>m</i>*<sub>patch</sub> )
+      </div>
+      <p class="note"><span style="font-family:var(--math)"><i>m</i>*<sub>patch</sub></span> = pixel 級硬 mask 經 <span style="font-family:var(--math)">AvgPool<sub>14×14</sub></span> 後的軟機率。此路徑<strong>不 detach</strong>，梯度回流 predictor。</p>
+      <h3 style="margin-top:.4em">(a) instance × GT scene-flow — 訓練用</h3>
+      <p style="font-size:.93em">以 GT world track 判斷每個 instance 連通塊是否位移，動則整塊填滿。靜態世界點位移恆為 0，<strong>沒有門檻的快慢兩難</strong>。</p>
+      <h3 style="margin-top:.3em">(b) 幾何光流殘差 — 測試／跨域用</h3>
+      <div class="eq flush" style="font-size:1em;line-height:2.1">
+        <i>f</i><sup>cam</sup>(<i>u</i>) <span class="op">=</span> π( <i>P</i><sub>t+1</sub><i>P</i><sub>t</sub><sup>−1</sup> π<sup>−1</sup>(<i>u</i>, <i>D</i><sub>t</sub>) ) <span class="op">−</span> <i>u</i><br>
+        <i>m</i><sub>geo</sub> <span class="op">=</span> <b>1</b>[ ‖<i>f</i><sup>gt</sup> <span class="op">−</span> <i>f</i><sup>cam</sup>‖ <span class="op">&gt;</span> <span class="fn">max</span>(τ<sub>abs</sub>, α‖<i>f</i><sup>gt</sup>‖) ]
+      </div>
+      <p class="note">相對門檻 <span style="font-family:var(--math)">α‖<i>f</i><sup>gt</sup>‖</span> 是必要的：純絕對門檻在高速鏡頭序列會整片灌爆。</p>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:1em">
+      <div class="card w">
+        <span class="tag">被否決的做法</span>
+        <h3>外觀 mask ≠ 運動 mask</h3>
+        <p>PointOdyssey 原生的 <code>masks/</code> 是逐 instance 的<strong>外觀分割</strong>——連牆、地板、靜止的前景都被標。拿它監督，門控學到的是「這個資料集的室內外觀 → 動態」，換域必崩。</p>
+      </div>
+      <h3>跨域證據（只訓 gate predictor）</h3>
+      <table>
+        <tr><th>標籤</th><th class="n">PO AUC</th><th class="n">Sintel AUC</th></tr>
+        <tr><td>RAFT flow-residual</td><td class="n">0.984</td><td class="n"><span class="flag">0.584 崩</span></td></tr>
+        <tr class="best"><td>instance × scene-flow</td><td class="n">0.926</td><td class="n"><b>0.767</b></td></tr>
+      </table>
+      <p class="note">標籤在兩個域是<strong>同一個物理量</strong>（世界真的在動），跨域即不再崩。Sintel AUC +0.183，PO 只掉 0.058。</p>
+      <div class="card">
+        <span class="tag">操作提醒</span>
+        <p>判讀 gate 品質<strong>一律用 AUC / F1，不看 BCE</strong>：pool 後的軟標籤在 boundary patch 有不可約的 floor，val BCE 會看似 overfit 卻與高 AUC 並存。</p>
+      </div>
+    </div>
+  </div>
+  <span class="num">10</span>
+</section>
+
+<!-- 11 ──────────────────────────────────────────── -->
+<section class="slide" data-part="2">
+  <span class="rail"></span>
+  <div class="eyebrow"><span>貢獻 ② Motion Loss</span><b>§3</b></div>
+  <h2><small>Contribution ②</small>剛性 warp 只在靜態區成立</h2>
+  <div class="body" style="gap:.95em">
+    <p class="lede"><span style="font-family:var(--math)"><i>L</i><sub>cam</sub></span> 直接拿預測的 pose encoding 對 GT 算 L1，<strong>不經像素</strong>——pose 因此只有「GT 的一個重參數化」這一個訊號。物理約束提供了獨立的第二個訊號。</p>
+    <div class="eq hero flush" style="line-height:2.2">
+      <i>û</i>′ <span class="op">=</span> π( <i>K</i> [ <i>R̂</i><sub>t→t+1</sub> ( <i>K</i><sup>−1</sup><i>u</i> · <i>D</i><sup>gt</sup><sub>t</sub>(<i>u</i>) ) <span class="op">+</span> <i>t̂</i><sub>t→t+1</sub> ] )
+    </div>
+    <div class="eq flush" style="line-height:2.2">
+      <i>L</i><sub>static_photo</sub> <span class="op">=</span>
+      <span class="fr"><span>1</span><span>|𝒮<sub>t</sub>|</span></span>
+      <span style="font-size:1.25em">∑</span><sub>u ∈ 𝒮<sub>t</sub></sub>
+      ρ<sub>δ</sub>( <i>I</i><sub>t</sub>(<i>u</i>) <span class="op">−</span> <i>I</i><sub>t+1</sub>(<i>û</i>′) )
+      <span class="txt" style="padding-left:1.6em">ρ<sub>δ</sub> = Huber, δ = 0.1</span>
+    </div>
+    <div class="cols c2" style="gap:1.5em">
+      <div>
+        <h3>有效像素集合 𝒮<sub>t</sub></h3>
+        <ul>
+          <li>GT 靜態區：<span style="font-family:var(--math)"><i>m</i>*(<i>u</i>) &lt; τ<sub>dyn</sub></span></li>
+          <li>GT depth 有效</li>
+          <li>重投影落在影像界內</li>
+          <li><strong>遮擋防護</strong>：把 <i>t</i>+1 的 motion mask 也 warp 過去，落在動態區則丟棄</li>
+        </ul>
+      </div>
+      <div>
+        <h3>梯度只進預測 extrinsics</h3>
+        <p style="font-size:.94em">GT depth、內參、影像皆為常數，梯度經 <code>grid_sample</code> 的取樣 grid 回流到 pose。<strong>depth head 完全不碰</strong>，維持「不動幾何頭」的 scope。</p>
+        <div class="card w" style="margin-top:.7em">
+          <span class="tag">現況 · 誠實標註</span>
+          <h3>通用線上是負結果</h3>
+          <p>在 Sintel 上比 warm-start 起點更差，且單調惡化。<strong>醫學線未使用此 loss</strong>（config 中 <code>static_photo: null</code>）。列為「已試、方向為負、待重新設計」，不當賣點。</p>
+        </div>
+      </div>
+    </div>
+  </div>
+  <span class="num">11</span>
+</section>
+
+<!-- 12 ──────────────────────────────────────────── -->
+<section class="slide" data-part="3">
+  <span class="rail"></span>
+  <div class="eyebrow"><span>貢獻 ③ Temporal Attention</span><b>§4.1</b></div>
+  <h2><small>Contribution ③</small>補上 VGGT 缺的純時間軸</h2>
+  <div class="body cols c2" style="gap:1.6em">
+    <div style="display:flex;flex-direction:column;gap:.9em">
+      <p>VGGT 原生只有 <strong>frame</strong>（幀內空間）與 <strong>global</strong>（全攤平）兩種 attention，缺一種讓同一空間位置沿自己的 <span style="font-family:var(--math)"><i>S</i></span> 幀互看的注意力。</p>
+      <div class="eq flush" style="font-size:1em;line-height:2.2">
+        (<i>B</i>, <i>S</i>, <i>P</i>, <i>C</i>)
+        <span class="op">→</span> (<i>B</i>·<i>P</i>, <i>S</i>, <i>C</i>)<br>
+        <span class="txt" style="padding-left:2em">沿 S（時間）跑 attention</span><br>
+        <span class="op">→</span> (<i>B</i>·<i>S</i>, <i>P</i>, <i>C</i>)
+      </div>
+      <dl class="kv">
+        <dt>aa_order</dt><dd><code>[frame, temporal, global]</code></dd>
+        <dt>插入頻率</dt><dd>每 3 個 aa-block 一個 → 24/3 = <strong>8 個</strong> temporal block</dd>
+        <dt>head 介面</dt><dd>只更新 streaming token、<strong>不 emit intermediate</strong> → head 輸入維持 2C，下游維度不變</dd>
+        <dt>位置編碼</dt><dd>獨立的 1D 時間 RoPE，與空間 2D RoPE <strong>分開</strong></dd>
+      </dl>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:.9em">
+      <div class="card a">
+        <span class="tag">與 gate 同哲學</span>
+        <h3>Identity warm-start</h3>
+        <div class="eq flush" style="background:none;border:none;padding:.3em 0;font-size:1.05em;text-align:left">
+          <i>x</i> <span class="op">←</span> <i>x</i> <span class="op">+</span> γ · <span class="fn">Attn</span>( <span class="fn">LN</span>(<i>x</i>) ) <span style="padding:0 .5em">,</span> γ|<sub>t=0</sub> <span class="op">=</span> 0
+        </div>
+        <p>每個 temporal block 的 LayerScale 初始為 0 → 整塊是<strong>恆等映射</strong> → 加了 temporal 仍能 byte-for-byte 載入 VGGT-1B。訓練中 γ 漸長、temporal 漸進通電。</p>
+      </div>
+      <div class="card">
+        <span class="tag">與貢獻 ① 的互補</span>
+        <p>若某幀幾乎全是動態，門控排除大多數 patch 後 camera token 可能<strong>資訊不足</strong>。temporal attention 讓它從<strong>較靜態的鄰幀</strong>借幾何上下文——兩者正交但互補。</p>
+      </div>
+    </div>
+  </div>
+  <span class="num">12</span>
+</section>
+
+<!-- 13 ──────────────────────────────────────────── -->
+<section class="slide" data-part="3">
+  <span class="rail"></span>
+  <div class="eyebrow"><span>貢獻 ③ · Camera-Smooth Loss</span><b>§4.2</b></div>
+  <h2><small>Trajectory prior</small>罰預測軌跡的加速度</h2>
+  <div class="body" style="gap:.9em">
+    <p class="lede">困難序列上觀察到明顯的軌跡「跳動」（native VGGT-1B 也有）。加一個<strong>只作用在網路自身輸出</strong>的平滑先驗——類似 MonST3R 的 trajectory smoothness，但作為<strong>訓練 loss</strong> 而非 test-time 項。<strong>不使用 GT pose。</strong></p>
+    <div class="cols c2" style="gap:1.5em">
+      <div class="eq flush" style="line-height:2.3">
+        <span class="txt">速度（一階，除以真實時間間隔）</span><br>
+        <i>v</i><sup>T</sup><sub>s</sub> <span class="op">=</span>
+        <span class="fr"><span><i>t̂</i><sub>s+1</sub> <span class="op">−</span> <i>t̂</i><sub>s</sub></span><span>Δ<i>t</i><sub>s</sub></span></span>
+        <span style="padding:0 .8em">,</span>
+        <i>v</i><sup>R</sup><sub>s</sub> <span class="op">=</span>
+        <span class="fr"><span><i>q̃</i><sub>s+1</sub> <span class="op">−</span> <i>q̃</i><sub>s</sub></span><span>Δ<i>t</i><sub>s</sub></span></span>
+        <br><br>
+        <span class="txt">加速度（二階，預設）</span><br>
+        <i>a</i><sub>s</sub> <span class="op">=</span> <i>v</i><sub>s+1</sub> <span class="op">−</span> <i>v</i><sub>s</sub>
+      </div>
+      <div class="eq hero flush" style="line-height:2.3">
+        <i>L</i><sub>smooth</sub> <span class="op">=</span>
+        <span class="fr"><span>1</span><span><i>n</i></span></span>
+        <span style="font-size:1.25em">∑</span><sub>i=1..n</sub> γ<sup>&nbsp;n−i</sup>
+        [ <i>w</i><sub>T</sub> · <span style="text-decoration:overline">|<i>a</i><sup>T,(i)</sup>|</span>
+        <span class="op">+</span> <i>w</i><sub>R</sub> · <span style="text-decoration:overline">|<i>a</i><sup>R,(i)</sup>|</span> ]
+        <br>
+        <span class="txt">n = 4 個 refine stage&nbsp;·&nbsp;γ = 0.6&nbsp;·&nbsp;w<sub>T</sub> = w<sub>R</sub> = 1</span>
+      </div>
+    </div>
+    <div class="cols" style="grid-template-columns:repeat(3,1fr);gap:1.1em">
+      <div class="card"><span class="tag">細節 1</span><h3>Δt 正規化</h3>
+        <p>訓練 clip 的抽幀間距不規則、可能重複。用真實時序 index 算 <span style="font-family:var(--math)">Δ<i>T</i>/Δ<i>t</i></span>，<span style="font-family:var(--math)">Δ<i>t</i>=0</span> 的 pair 排除。</p></div>
+      <div class="card"><span class="tag">細節 2</span><h3>四元數半球對齊</h3>
+        <p><span style="font-family:var(--math)"><i>q</i></span> 與 <span style="font-family:var(--math)">−<i>q</i></span> 是同一旋轉；差分前先逐幀 sign-fix，否則 sign flip 會被誤當成巨大的旋轉跳動。</p></div>
+      <div class="card"><span class="tag">細節 3</span><h3>FoV 不平滑</h3>
+        <p>與觀察到的跳動症狀無關。需 <span style="font-family:var(--math)"><i>S</i> ≥ 3</span>，故取樣張數下界取 4。</p></div>
+    </div>
+    <p class="note"><strong>機制 vs 目標：</strong>temporal attention 是<em>機制</em>（讓網路能跨幀看），camera_smooth 是<em>目標</em>（要求輸出時序連貫）。兩者可獨立開關，但目前的實驗把它們綁在同一個 arm —— <span class="flag">因子未拆解</span></p>
+  </div>
+  <span class="num">13</span>
+</section>
+
+<!-- 14 ──────────────────────────────────────────── -->
+<section class="slide" data-part="0">
+  <span class="rail"></span>
+  <div class="eyebrow"><span>總損失</span><b>§5</b></div>
+  <h2><small>Objective</small>四項損失，全部由 yaml 開關</h2>
+  <div class="body" style="gap:1em">
+    <div class="eq hero">
+      <i>L</i> <span class="op">=</span> λ<sub>cam</sub><i>L</i><sub>cam</sub>
+      <span class="op">+</span> λ<sub>d</sub><i>L</i><sub>depth</sub>
+      <span class="op">+</span> λ<sub>g</sub><i>L</i><sub>gate</sub>
+      <span class="op">+</span> λ<sub>p</sub><i>L</i><sub>static_photo</sub>
+      <span class="op">+</span> λ<sub>s</sub><i>L</i><sub>camera_smooth</sub>
+    </div>
+    <p class="note" style="text-align:center">dispatcher 只在該項的 config block 存在時才加 → loss 組合純靠 yaml 開關，不需改程式。</p>
+    <div class="cols c2" style="gap:1.6em">
+      <div style="display:flex;flex-direction:column;gap:.7em">
+        <h3>L<sub>cam</sub>（VGGT 原生，不變）</h3>
+        <div class="eq flush" style="font-size:1em;line-height:2.1">
+          <i>L</i><sub>cam</sub> <span class="op">=</span>
+          <span class="fr"><span>1</span><span><i>n</i></span></span>
+          <span style="font-size:1.25em">∑</span><sub>i</sub> γ<sup>&nbsp;n−i</sup>
+          [ <i>w</i><sub>T</sub>‖<i>t̂</i><sup>(i)</sup><span class="op">−</span><i>t</i>‖<sub>1</sub>
+          <span class="op">+</span> <i>w</i><sub>R</sub>‖<i>q̂</i><sup>(i)</sup><span class="op">−</span><i>q</i>‖<sub>1</sub>
+          <span class="op">+</span> <i>w</i><sub>f</sub>‖<i>f̂</i><sup>(i)</sup><span class="op">−</span><i>f</i>‖<sub>1</sub> ]
+        </div>
+        <p class="note"><span style="font-family:var(--math)"><i>n</i>=4</span>, γ=0.6, <span style="font-family:var(--math)"><i>w</i><sub>T</sub>=<i>w</i><sub>R</sub>=1.0</span>, <span style="font-family:var(--math)"><i>w</i><sub>f</sub>=0.5</span>。平移項逐元素 clamp ≤ 100 防爆；只在 <strong>valid frame</strong>（有效深度點數 &gt; 100）上計算。L1 比 smooth-L1 / L2 更穩定。</p>
+      </div>
+      <div>
+        <h3>各線的實際組合</h3>
+        <table>
+          <tr><th>線</th><th>L</th></tr>
+          <tr><td>通用 <code>inst_g</code></td><td>L<sub>cam</sub> + L<sub>gate</sub></td></tr>
+          <tr><td>通用 <code>inst_gts</code></td><td>L<sub>cam</sub> + L<sub>gate</sub> + λ<sub>s</sub>L<sub>smooth</sub></td></tr>
+          <tr class="best"><td>醫學 <code>*_vanilla</code> / <code>_b16</code> / <code>_gg</code></td><td><b>5.0 · L<sub>cam</sub></b></td></tr>
+          <tr class="best"><td>醫學 <code>*_smooth_temporal</code> / <code>c3vd_gts</code></td><td><b>5.0 · L<sub>cam</sub> + 3.0 · L<sub>smooth</sub></b></td></tr>
+        </table>
+        <p class="note" style="margin-top:.7em">醫學線 <strong>沒有</strong> L<sub>depth</sub>、L<sub>gate</sub>、L<sub>static_photo</sub>：depth head 全程凍結（保住 pretrained 的深度能力、避免在小資料集上過擬合），且無動態標註可餵 gate。</p>
+      </div>
+    </div>
+  </div>
+  <span class="num">14</span>
+</section>
+
+<!-- 15 ──────────────────────────────────────────── -->
+<section class="slide" data-part="0">
+  <span class="rail"></span>
+  <div class="eyebrow"><span>訓練策略</span><b>§6</b></div>
+  <h2><small>Training</small>絕不從頭訓：warm-start + 部分解凍</h2>
+  <div class="body cols c32" style="gap:1.5em">
+    <div style="display:flex;flex-direction:column;gap:.8em">
+      <div class="card w">
+        <span class="tag">永遠凍結</span>
+        <p><code>patch_embed</code>（DINOv2，最強的 pretrained 特徵）· <code>frame_blocks</code>（耦合不在這裡）· <code>global_blocks[0..7]</code>（gate 之前的前段）· <code>depth_head</code>（scope 是純 pose）</p>
+      </div>
+      <div class="card a">
+        <span class="tag">可解凍（依 arm）</span>
+        <p><code>global_blocks[8..23]</code> · <code>camera_head</code> · <code>camera_token</code>/<code>register_token</code> · <code>gate_predictor</code> · <code>temporal_blocks</code></p>
+      </div>
+      <dl class="kv">
+        <dt>optimizer</dt><dd>AdamW，base lr 3e−5</dd>
+        <dt>schedule</dt><dd>前 5% linear warmup，後 95% cosine 至 1e−8</dd>
+        <dt>max_epochs</dt><dd>10 —— 它驅動整條 cosine 曲線，同組比較的每個 arm <strong>必須共用</strong></dd>
+        <dt>clip</dt><dd>max_norm 1.0，分組（global+camera / token / gate / temporal）</dd>
+        <dt>精度</dt><dd>bf16 autocast + gradient checkpointing，單張 RTX 5090 32 GB</dd>
+      </dl>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:.7em">
+      <h3>SCARED 的 arm 設計</h3>
+      <p class="note">所有 arm 都建成 <code>enable_gate=True + enable_temporal=True</code>（即使凍結），讓 checkpoint 的 key 集合一致、後續 arm 能直接接續載入。</p>
+      <div class="tw">
+      <table>
+        <tr><th>arm</th><th>temporal</th><th>gate</th><th>L<sub>smooth</sub></th><th>張數</th></tr>
+        <tr class="base"><td><code>vanilla</code></td><td>不存在</td><td>不存在</td><td>—</td><td>4–12</td></tr>
+        <tr><td><code>b16</code></td><td>凍結</td><td>凍結</td><td>—</td><td>4–16</td></tr>
+        <tr><td><code>b16_gg</code></td><td>凍結</td><td><b>可訓練</b></td><td>—</td><td>4–16</td></tr>
+        <tr class="best"><td><code>smooth_temporal</code></td><td><b>可訓練</b></td><td>可訓練</td><td><b>λ=3</b></td><td>4–12</td></tr>
+        <tr><td><code>wide</code></td><td>可訓練</td><td>可訓練</td><td>λ=3</td><td>4–12 <span class="flag">取樣窗 ±120</span></td></tr>
+      </table>
+      </div>
+      <div class="card w">
+        <span class="tag">已知混淆 · 必須揭露</span>
+        <p><code>vanilla</code>(12 張) 與 <code>b16</code>(16 張) <strong>輸入張數不同</strong>，兩者之差不是純架構效果。<code>smooth_temporal</code> 同時開了 temporal 解凍與 L<sub>smooth</sub>，<strong>無法歸因是哪一半在起作用</strong>。<code>wide</code> 的唯一 delta 是取樣窗，與架構正交。</p>
+      </div>
+    </div>
+  </div>
+  <span class="num">15</span>
+</section>
+
+<!-- 16 ──────────────────────────────────────────── -->
+<section class="slide" data-part="0">
+  <span class="rail"></span>
+  <div class="eyebrow"><span>資料集</span><b>§7</b></div>
+  <h2><small>Data</small>兩個有 GT 的醫學域 + 兩份無標定的臨床影像</h2>
+  <div class="body" style="gap:1em">
+    <div class="tw">
+    <table>
+      <tr><th>資料集</th><th>性質</th><th>GT</th><th>切分</th><th>用途</th></tr>
+      <tr><td><b>SCARED</b></td><td>腹腔鏡（da Vinci），結構光重建</td><td>稀疏 depth（mm）+ camera pose</td><td>train = keyframe1/2、val = keyframe3、<b>test = keyframe4</b></td><td>主要訓練與評測（17,824 幀）</td></tr>
+      <tr><td><b>C3VD</b></td><td>大腸鏡（真實鏡頭 + 矽膠假體），對 CT mesh 註冊</td><td><b>稠密</b> depth（mm）+ pose</td><td>按整段序列、以<b>貼圖紋理</b>切分；test 另含唯一的降結腸序列</td><td>第二個有 GT 的醫學域</td></tr>
+      <tr><td>私人病灶</td><td>內視鏡，3 段</td><td><b>無標定、無 GT</b></td><td>—</td><td>warp PSNR 自洽性 + 點雲視覺對照</td></tr>
+      <tr><td>私人胃</td><td>內視鏡，單目</td><td><b>無標定、無 GT</b></td><td>—</td><td>僅點雲視覺對照</td></tr>
+      <tr class="base"><td>Sintel / PO / TartanAir / Waymo / Spring</td><td>通用動態場景</td><td>depth + pose (+ 動態標註)</td><td>—</td><td>通用線訓練與消融</td></tr>
+    </table>
+    </div>
+    <div class="cols c2" style="gap:1.5em">
+      <div class="card w">
+        <span class="tag">SCARED 的兩個 split 陷阱</span>
+        <ul style="margin-top:.2em">
+          <li><code>test/</code>（550 幀）是官方<strong>稀疏抽樣</strong>（間隔 1–296 幀）→ <strong>不能算 snippet ATE</strong>。</li>
+          <li><code>pose_seq/</code>（411 / 834 幀）是同段影片<strong>逐幀重抽</strong>（連續）→ pose 用這個。</li>
+          <li><code>test/dataset3/keyframe4</code> 與 <code>pose_seq/dataset3/keyframe4</code> <strong>同名不同物</strong>，引用必須帶 split。</li>
+        </ul>
+      </div>
+      <div class="card">
+        <span class="tag">協定對齊（逐幀驗證過）</span>
+        <p>depth 用 AF-SfMLearner 的 <code>test_files.txt</code>：<strong>幀數與幀號完全相同</strong>。pose 用 <code>test_files_sequence1/2.txt</code> 的同兩段序列。兩者皆屬 keyframe4 = test，<strong>沒進訓練</strong>。</p>
+        <p class="note">SCARED 有<strong>空深度幀</strong>，會靜默吃掉 camera loss（valid frame 判準是有效點數 &gt; 100），取樣時要避開當 anchor。</p>
+      </div>
+    </div>
+  </div>
+  <span class="num">16</span>
+</section>
+
+<!-- 17 ──────────────────────────────────────────── -->
+<section class="slide" data-part="0">
+  <span class="rail"></span>
+  <div class="eyebrow"><span>評測協定 · Pose</span><b>§8.1</b></div>
+  <h2><small>Metrics</small>兩種 ATE，不可互換</h2>
+  <div class="body cols c2" style="gap:1.6em">
+    <div style="display:flex;flex-direction:column;gap:.8em">
+      <h3>(a) 全序列 ATE — evo，Sintel / C3VD 用</h3>
+      <p style="font-size:.93em">把預測外參轉成相機中心軌跡，與 GT 做 <strong>Sim(3) 對齊</strong>後算 RMSE：</p>
+      <div class="eq flush" style="line-height:2.2;font-size:1em">
+        (<i>s</i>*, <i>R</i>*, <i>t</i>*) <span class="op">=</span> <span class="fn">argmin</span>
+        <span style="font-size:1.2em">∑</span><sub>i</sub> ‖<i>s R p̂</i><sub>i</sub> <span class="op">+</span> <i>t</i> <span class="op">−</span> <i>p</i><sub>i</sub>‖²
+        <br><br>
+        ATE <span class="op">=</span> √<span class="rt">
+        <span class="fr" style="vertical-align:-.5em"><span>1</span><span><i>N</i></span></span>
+        <span style="font-size:1.2em">∑</span><sub>i</sub> ‖<i>s</i>*<i>R</i>*<i>p̂</i><sub>i</sub> <span class="op">+</span> <i>t</i>* <span class="op">−</span> <i>p</i><sub>i</sub>‖²</span>
+      </div>
+      <p class="note">同時報 RPE（delta = 1 frame，all pairs）與 <code>ate_rel</code> = ATE ÷ 軌跡 bbox 對角線，讓不同尺度的序列可比。</p>
+      <div class="card w">
+        <span class="tag">為什麼 SCARED 不報這個</span>
+        <p>VGGT 單次前向上限約 80 幀，長序列須用重疊 chunk + 逐接縫 <strong>Umeyama Sim(3)</strong> 拼接。實測拼接誤差讓 ATE 擺動 <strong>−1% ~ +32%</strong>，訊號被拼接本身淹沒。<br>→ SCARED 只報 snippet ATE。這是<strong>選擇不估，不是估錯</strong>。</p>
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:.8em">
+      <h3>(b) Snippet ATE — AF-SfMLearner 協定，SCARED 用</h3>
+      <p style="font-size:.93em">對每個長度 <span style="font-family:var(--math)"><i>n</i></span>=5 的滑動窗，把窗內位姿表示到<strong>窗首座標系</strong>，錨定後擬合單一 scale：</p>
+      <div class="eq flush" style="font-size:1em;line-height:2.2">
+        <i>x</i><sub>j</sub> <span class="op">=</span> ( <i>C</i><sub>i</sub><sup>−1</sup><i>C</i><sub>j</sub> )<sub>[:3,3]</sub>
+        <span style="padding:0 .8em">,</span>
+        <i>s</i> <span class="op">=</span>
+        <span class="fr"><span>∑<sub>j</sub> ⟨<i>x</i><sub>j</sub>, <i>x̂</i>′<sub>j</sub>⟩</span><span>∑<sub>j</sub> ‖<i>x̂</i>′<sub>j</sub>‖²</span></span>
+      </div>
+      <div class="eq hero flush" style="font-size:1.05em">
+        ATE<sub>snippet</sub> <span class="op">=</span>
+        <span class="fr"><span>1</span><span><i>n</i></span></span>
+        √<span class="rt"><span style="font-size:1.2em">∑</span><sub>j</sub> ‖<i>s x̂</i>′<sub>j</sub> <span class="op">−</span> <i>x</i><sub>j</sub>‖²</span>
+      </div>
+      <p class="note"><strong>分母是 n 不是 √n</strong>——這不是筆誤，是 AF 原始碼的定義；要讓數字可與其表格對比就必須照抄。窗的枚舉也照抄：尾端的窗被<strong>截斷</strong>而非丟棄，共 S−2 個窗。</p>
+      <div class="card">
+        <span class="tag">chunk 長度是預測的一部分</span>
+        <p><code>chunk 64</code> 的每個窗有 64 幀 context，<code>chunk 5</code> 只有 5 幀（更貼近單目設定）。算指標的方式相同但<strong>預測不同，不可互相取代</strong>，必須分開記錄。</p>
+      </div>
+    </div>
+  </div>
+  <span class="num">17</span>
+</section>
+
+<!-- 18 ──────────────────────────────────────────── -->
+<section class="slide" data-part="0">
+  <span class="rail"></span>
+  <div class="eyebrow"><span>評測協定 · Depth 與無 GT 資料</span><b>§8.2–8.3</b></div>
+  <h2><small>Metrics</small>對齊方式決定數字能不能比</h2>
+  <div class="body cols c2" style="gap:1.6em">
+    <div style="display:flex;flex-direction:column;gap:.8em">
+      <h3>Depth：先對齊，再算指標</h3>
+      <div class="eq flush" style="font-size:1em;line-height:2.2">
+        <span class="txt">afsfm — per-frame 中位數縮放，1 DOF</span><br>
+        <i>s</i><sub>t</sub> <span class="op">=</span>
+        <span class="fr"><span><span class="fn">median</span>(<i>D</i><sup>gt</sup><sub>t</sub>)</span><span><span class="fn">median</span>(<i>D̂</i><sub>t</sub>)</span></span>
+        <span class="txt" style="padding-left:1.2em">有效範圍 (10⁻², 150] mm</span>
+        <br><br>
+        <span class="txt">monst3r (lad2) — 全序列共同 scale + shift，2 DOF</span><br>
+        (<i>s</i>*, <i>b</i>*) <span class="op">=</span> <span class="fn">argmin</span>
+        <span style="font-size:1.2em">∑</span> |<i>s D̂</i> <span class="op">+</span> <i>b</i> <span class="op">−</span> <i>D</i>|
+      </div>
+      <div class="eq flush" style="font-size:.98em;line-height:2.2">
+        AbsRel <span class="op">=</span>
+        <span class="fr"><span>1</span><span>|ℳ|</span></span>
+        <span style="font-size:1.2em">∑</span>
+        <span class="fr"><span>|<i>D̂</i> <span class="op">−</span> <i>D</i>|</span><span><i>D</i></span></span>
+        <span style="padding:0 1em">,</span>
+        δ<sub>k</sub> <span class="op">=</span> <span class="fn">frac</span>[ <span class="fn">max</span>(<i>D̂</i>/<i>D</i>, <i>D</i>/<i>D̂</i>) <span class="op">&lt;</span> 1.25<sup>k</sup> ]
+      </div>
+      <p class="note">中位數必須用 <code>np.median</code> 語意（偶數取中間兩者<strong>平均</strong>）；<code>torch.median</code> 取較小者，數字會與參考實作對不上。</p>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:.8em">
+      <div class="card w">
+        <span class="tag">最重要的讀表提醒</span>
+        <h3>輸入張數是隱藏變因</h3>
+        <p>發表的醫學表格幾乎都是<strong>單目</strong>。零樣本 VGGT-1B 光靠 multi-view 就把 AbsRel 從 <b>0.0758 → 0.0488</b>——<strong>排名有很大一部分是輸入設定決定的</strong>。每張表都必須標註輸入。</p>
+      </div>
+      <h3>無 GT 資料：Warp PSNR（自洽性）</h3>
+      <p style="font-size:.93em">私人資料沒有標定、沒有 GT，因此沒有精度指標。改量 <strong>depth 與 pose 合不合得起來</strong>：</p>
+      <div class="eq flush" style="font-size:.98em;line-height:2.2">
+        <i>Î</i><sub>dst</sub>(<i>u</i>) <span class="op">=</span> <i>I</i><sub>src</sub>( π( <i>T</i><sub>dst→src</sub> π<sup>−1</sup>(<i>u</i>, <i>D̂</i><sub>dst</sub>(<i>u</i>)) ) )
+      </div>
+      <p class="note">另報 <strong>PSNR<sub>no spec</sub></strong>：排除飽和高光（任一通道 ≥ 250/255）。內視鏡光源黏在鏡頭上，高光跟著相機動，幾何 warp 原理上重現不了它。</p>
+      <p class="note"><span class="flag">這不是精度指標</span> 只是自洽性，且相對 VGGT 自身的 depth scale 定義，<strong>與其他模型不可比</strong>。</p>
+    </div>
+  </div>
+  <span class="num">18</span>
+</section>
+
+<!-- 19 ──────────────────────────────────────────── -->
+<section class="slide" data-part="0">
+  <span class="rail"></span>
+  <div class="eyebrow"><span>結果 · SCARED</span><b>§9.1–9.2</b></div>
+  <h2><small>Results</small>SCARED：depth 與 pose（單位 mm）</h2>
+  <div class="body cols c2" style="gap:1.5em">
+    <div>
+      <h3>Depth — test split，afsfm 協定，AbsRel</h3>
+      <table style="margin-top:.5em">
+        <tr><th>ckpt</th><th class="n">單張輸入</th><th class="n">多張輸入</th></tr>
+        <tr class="base"><td>VGGT-1B 零樣本</td><td class="n">0.0758</td><td class="n">0.0488</td></tr>
+        <tr><td>vanilla（微調 baseline）</td><td class="n">0.0561</td><td class="n">0.0454</td></tr>
+        <tr><td>b16</td><td class="n">0.0563</td><td class="n">0.0459</td></tr>
+        <tr><td>b16_gg</td><td class="n">0.0550</td><td class="n">0.0449</td></tr>
+        <tr class="best"><td>smooth_temporal</td><td class="n"><b>0.0537</b></td><td class="n">0.0434</td></tr>
+        <tr><td>wide</td><td class="n">0.0550</td><td class="n"><b>0.0419</b></td></tr>
+      </table>
+      <p class="note" style="margin-top:.6em">只有<strong>單張</strong>那欄可與論文的單目表對比。depth head 全程凍結——這裡的改善來自 aggregator 特徵本身的變化。</p>
+    </div>
+    <div>
+      <h3>Pose — pose_seq split，snippet ATE</h3>
+      <div class="cols c2" style="gap:1em;margin-top:.5em">
+        <div>
+          <p class="tag" style="margin-bottom:.3em">chunk 64 / overlap 16</p>
+          <table>
+            <tr><th>ckpt</th><th class="n">mean</th></tr>
+            <tr class="base"><td>VGGT-1B</td><td class="n">0.1209</td></tr>
+            <tr><td>vanilla</td><td class="n">0.0764</td></tr>
+            <tr><td>b16</td><td class="n">0.0706</td></tr>
+            <tr><td>b16_gg</td><td class="n">0.0699</td></tr>
+            <tr class="best"><td>smooth_temporal</td><td class="n"><b>0.0597</b></td></tr>
+            <tr><td>wide</td><td class="n">0.0705</td></tr>
+          </table>
+        </div>
+        <div>
+          <p class="tag" style="margin-bottom:.3em">chunk 5 / overlap 4</p>
+          <table>
+            <tr><th>ckpt</th><th class="n">mean</th></tr>
+            <tr class="base"><td>VGGT-1B</td><td class="n">0.1421</td></tr>
+            <tr><td>vanilla</td><td class="n">0.0865</td></tr>
+            <tr><td>b16</td><td class="n">0.0824</td></tr>
+            <tr><td>b16_gg</td><td class="n">0.0810</td></tr>
+            <tr class="best"><td>smooth_temporal</td><td class="n"><b>0.0705</b></td></tr>
+            <tr><td>wide</td><td class="n">0.0865</td></tr>
+          </table>
+        </div>
+      </div>
+      <ul style="margin-top:.8em">
+        <li>context 從 5 幀放大到 64 幀，<strong>每個 arm 都變好</strong>（−12% ~ −19%）——這是 VGGT 多視角架構本身的紅利。</li>
+        <li>排名大致一致（<code>smooth_temporal</code> 兩邊都最好），但 <code>wide</code> 在 chunk 5 掉到與 <code>vanilla</code> 並列最差。</li>
+      </ul>
+    </div>
+  </div>
+  <span class="num">19</span>
+</section>
+
+<!-- 20 ──────────────────────────────────────────── -->
+<section class="slide" data-part="0">
+  <span class="rail"></span>
+  <div class="eyebrow"><span>結果 · C3VD 與私人資料</span><b>§9.3–9.4</b></div>
+  <h2><small>Results</small>C3VD：改善很大，但 best 在 epoch 0</h2>
+  <div class="body cols c23" style="gap:1.5em">
+    <div>
+      <h3>C3VD test — 5 序列 × 50 幀（單位 mm）</h3>
+      <div class="tw">
+      <table style="margin-top:.5em">
+        <tr><th>ckpt</th><th class="n">ATE</th><th class="n">ate_rel</th><th class="n">rpe_t</th><th class="n">rpe_r</th><th class="n">AbsRel</th><th class="n">δ₁</th></tr>
+        <tr class="base"><td>VGGT-1B 零樣本</td><td class="n">2.6343</td><td class="n">0.0985</td><td class="n">1.1681</td><td class="n">0.7625</td><td class="n">0.2252</td><td class="n">0.6186</td></tr>
+        <tr><td>vanilla best_ate</td><td class="n">0.5978</td><td class="n">0.0218</td><td class="n">0.2356</td><td class="n">0.2173</td><td class="n">0.0874</td><td class="n">0.9584</td></tr>
+        <tr class="best"><td>gts best_ate</td><td class="n"><b>0.4329</b></td><td class="n">0.0176</td><td class="n">0.1865</td><td class="n">0.1859</td><td class="n"><b>0.0736</b></td><td class="n">0.9649</td></tr>
+      </table>
+      </div>
+      <div class="card w" style="margin-top:.9em">
+        <span class="tag">必須一起講的事</span>
+        <h3>兩個 run 的 best_ate.pt 都是 epoch 0</h3>
+        <p>之後再沒更新過。test 也同向（ep0 0.4329 &lt; ep5 0.4642）。<strong>C3VD 上訓練越久越差</strong>——這件事本身需要解釋，不能只報最好的那格。</p>
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:.9em">
+      <h3>私人資料（無 GT）</h3>
+      <div class="card">
+        <span class="tag">lesion · warp PSNR</span>
+        <p>所有 arm 之間差 <strong>≤ 0.56 dB</strong>，排序幾乎不變 → <strong>在這個指標上分辨不出模型差異</strong>。零樣本 VGGT-1B 在其中兩段上還是最高。</p>
+      </div>
+      <div class="card">
+        <span class="tag">gastric · 僅點雲</span>
+        <p><code>ply_points</code> 由幀數 × 像素數決定，<strong>不帶模型資訊</strong>，只能做視覺對照。</p>
+      </div>
+      <div class="card w">
+        <span class="tag">baseline 政策</span>
+        <p>對比對象必須是<strong>微調過的</strong> VGGT-1B 與 MonST3R。MonST3R 至今<strong>未在內視鏡微調</strong>，故目前不算有效 baseline；pretrained VGGT-1B 只能當 sanity reference。</p>
+      </div>
+    </div>
+  </div>
+  <span class="num">20</span>
+</section>
+
+<!-- 21 ──────────────────────────────────────────── -->
+<section class="slide" data-part="0">
+  <span class="rail"></span>
+  <div class="eyebrow"><span>限制與缺口</span><b>§10</b></div>
+  <h2><small>What we cannot claim yet</small>報告必須揭露的七件事</h2>
+  <div class="body cols c2" style="gap:1.4em">
+    <div style="display:flex;flex-direction:column;gap:.7em">
+      <div class="card w"><span class="tag">01 · 敘事</span><h3>「最好的版本」沒有單一答案</h3>
+        <p>選 ckpt 的 val ATE 選出 <code>wide</code>，test 上卻是 <code>smooth_temporal</code> 較好。報告要先決定用哪個指標敘事。</p></div>
+      <div class="card w"><span class="tag">02 · 歸因</span><h3>因子未拆解</h3>
+        <p><code>smooth_temporal</code> 同時開了 temporal 解凍與 L<sub>smooth</sub>；<code>wide</code> 與它的差是<strong>取樣</strong>而非架構。</p></div>
+      <div class="card w"><span class="tag">03 · 對照</span><h3>輸入張數混淆</h3>
+        <p><code>vanilla</code>(12) 與 <code>b16</code>(16) 張數不同，兩者之差不是純架構效果。</p></div>
+      <div class="card w"><span class="tag">04 · 機制</span><h3>醫學線的 gate 沒有標籤</h3>
+        <p>靠 pose loss 訓練，語意變成「哪些 patch 對 pose 有害」。是否收斂到有意義的東西<strong>未驗證</strong>。</p></div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:.7em">
+      <div class="card w"><span class="tag">05 · 可比性</span><h3>SCARED 沒有全序列 evo ATE</h3>
+        <p>拼接誤差 −1% ~ +32%，EndoSfM3D 系的 pose 欄填不了。</p></div>
+      <div class="card w"><span class="tag">06 · 定位</span><h3>成本軸完全沒有資料</h3>
+        <p>本方法是單次前饋（秒級），MonST3R 是 test-time optimization（分鐘級／序列）。wall-clock / VRAM / 是否需 per-scene 最佳化<strong>是核心宣稱，但待補</strong>。</p></div>
+      <div class="card w"><span class="tag">07 · 訓練完整性</span><h3>兩個 run 沒跑完</h3>
+        <p><code>b16_gg</code> 在 ep8 被中斷，其 best 是 8-epoch 產物；C3VD 在 ep6 之後暫停。</p></div>
+      <p class="note" style="margin-top:.2em">另：貢獻 ② 在通用線是負結果、醫學線未用；通用線（Sintel）沒有 held-out，且單次比較的雜訊門檻高達 <strong>16.9%</strong>（2σ）。</p>
+    </div>
+  </div>
+  <span class="num">21</span>
+</section>
+
+<!-- 22 ──────────────────────────────────────────── -->
+<section class="slide title" data-part="0">
+  <span class="rail"></span>
+  <div class="eyebrow"><span>結論</span><b>Novelty</b></div>
+  <h2 style="font-size:2.4em"><small>One sentence</small>三個正交的軸，同一個耦合</h2>
+  <div class="body" style="gap:1.2em;justify-content:center">
+    <p class="lede" style="max-width:none;font-size:1.15em">
+      <strong>前向</strong>上，用 aggregator 中段的輕量 gate 在 global attention 裡讓 camera token 結構性地只聚合靜態 patch——並在無標註的內視鏡域改由 pose loss 當老師；
+      <strong>監督</strong>上，用「剛性 warp 只在靜態區成立」造出獨立於 GT pose 重參數化的光度訊號；
+      <strong>時序</strong>上，補足 VGGT 缺失的純時間軸 attention 與軌跡連貫性目標。
+    </p>
+    <p class="lede" style="max-width:none;font-size:1.15em">
+      三者皆為 <strong>identity warm-start</strong>、皆不動幾何頭——在保留深度品質的前提下，<strong>純前饋</strong>地拿回動態／形變場景的相機 pose。
+    </p>
+    <div class="three">
+      <div><b>SCARED pose</b><span>snippet ATE 0.1209 → 0.0597（vs 微調 baseline 0.0764）</span></div>
+      <div><b>SCARED depth</b><span>單張 AbsRel 0.0758 → 0.0537（depth head 全程凍結）</span></div>
+      <div><b>C3VD pose</b><span>ATE 2.6343 → 0.4329（vs 微調 baseline 0.5978）</span></div>
+    </div>
+  </div>
+  <span class="num">22</span>
+</section>
+
+</div>
+
+<div class="bar">
+  <button id="prev" aria-label="上一頁">← 上一頁</button>
+  <button id="next" aria-label="下一頁">下一頁 →</button>
+  <span id="counter">01 / 22</span>
+  <span class="prog"><i id="progbar" style="width:4.5%"></i></span>
+  <span class="grow"></span>
+  <span>← → 空白鍵翻頁 · Ctrl/⌘+P 列印成 PDF</span>
+</div>
+</div>
+
+<script>
+(function(){
+  var slides = Array.prototype.slice.call(document.querySelectorAll('.slide'));
+  var i = 0;
+  var counter = document.getElementById('counter');
+  var progbar = document.getElementById('progbar');
+  function pad(n){ return (n<10?'0':'') + n; }
+  function show(n){
+    i = Math.max(0, Math.min(slides.length-1, n));
+    slides.forEach(function(s, k){ s.classList.toggle('on', k===i); });
+    counter.textContent = pad(i+1) + ' / ' + pad(slides.length);
+    progbar.style.width = ((i+1)/slides.length*100) + '%';
+    try { localStorage.setItem('dynvggt-slide', String(i)); } catch(e){}
+  }
+  document.getElementById('next').addEventListener('click', function(){ show(i+1); });
+  document.getElementById('prev').addEventListener('click', function(){ show(i-1); });
+  document.addEventListener('keydown', function(e){
+    if(e.key==='ArrowRight' || e.key===' ' || e.key==='PageDown'){ e.preventDefault(); show(i+1); }
+    else if(e.key==='ArrowLeft' || e.key==='PageUp'){ e.preventDefault(); show(i-1); }
+    else if(e.key==='Home'){ show(0); }
+    else if(e.key==='End'){ show(slides.length-1); }
+  });
+  var saved = 0;
+  try { saved = parseInt(localStorage.getItem('dynvggt-slide') || '0', 10) || 0; } catch(e){ saved = 0; }
+  show(saved);
+})();
+</script>

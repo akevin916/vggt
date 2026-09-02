@@ -57,7 +57,7 @@ cd vggt
 pip install -r requirements.txt
 ```
 
-Alternatively, you can install VGGT as a package (<a href="docs/package.md">click here</a> for details).
+Alternatively, you can install VGGT as a package (<a href="docs/ops/upstream_package.md">click here</a> for details).
 
 
 Now, try the model with just a few lines of code:

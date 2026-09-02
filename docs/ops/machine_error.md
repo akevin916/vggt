@@ -157,7 +157,7 @@ nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader   # 確認
 
 **沒有任何軟體設定能修好這個問題**，只能降低每次崩潰的代價：
 
-- **`checkpoint.save_steps_freq: 500`**（[trainer.py:888](../training/trainer.py#L888)）—— 每 N 步存一次 `last.pt`，崩潰最多損失約 15 分鐘而非整個 epoch。存檔會寫 `epoch_completed=False` 與 `resume_iter`，`--resume` 會快轉 dataloader 接回同一個 epoch。代價每次約 30 秒、7.8 GB。
+- **`checkpoint.save_steps_freq: 500`**（[trainer.py:888](../../training/trainer.py#L888)）—— 每 N 步存一次 `last.pt`，崩潰最多損失約 15 分鐘而非整個 epoch。存檔會寫 `epoch_completed=False` 與 `resume_iter`，`--resume` 會快轉 dataloader 接回同一個 epoch。代價每次約 30 秒、7.8 GB。
   *（2026-08-13 使用者判斷暫不啟用：epoch 級存檔最多損失一個 epoch ≈ 1.5 小時，可接受。）*
 - **`--resume`** 續訓：接自己的 `logs/<exp>/ckpts/last.pt`，而不是 config 裡的 warm start。LR 排程依絕對 epoch 計算，會正確接上。
 - 規劃實驗時把 MTBF 算進去：現況下**不要設計需要連續 20 小時以上的 run**。
