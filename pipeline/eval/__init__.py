@@ -1,0 +1,9 @@
+# Dyn-VGGT shared evaluation library: inference, metrics, output paths, gate helpers.
+#
+# Library only -- no argparse entry points live here. pipeline/training/trainer.py depends on this
+# package (e.g. paths.py), so nothing in this package may have import-time side effects.
+#
+# CLI entry points (run from the repo root):
+#   pipeline/benchmark/  paper numbers, stable contract  -- python -m pipeline.benchmark.eval_sintel --ckpt ...
+#   pipeline/diag/       intermediate investigation      -- python -m pipeline.diag.gate_eval --ckpt ...
+#   pipeline/diag/vis/   visualization                   -- python -m pipeline.diag.vis.gate_gif --ckpt ...

@@ -153,10 +153,8 @@ skyseg.onnx
 
 # Dyn-VGGT: training artifacts, data symlink, third-party reference clones
 /logs/
-training/logs/
 /data
 /reference/
-training/benchmark/__pycache__/
 outputs/
 /archive/
 
@@ -165,8 +163,9 @@ docs/planning/
 docs/reading/
 
 # Dyn-VGGT: 實驗 config 與一次性診斷不進版控（檔案留在磁碟上）
-training/config/
-training/diag/*
-!training/diag/gate_eval.py
-!training/diag/stitch_error.py
-!training/diag/pnp_pose.py
+pipeline/training/config/
+pipeline/diag/*
+!pipeline/diag/__init__.py
+!pipeline/diag/gate_eval.py
+!pipeline/diag/stitch_error.py
+!pipeline/diag/pnp_pose.py
