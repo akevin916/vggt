@@ -4,7 +4,7 @@
 #      fresh optimizer (which is the correct curriculum behavior anyway).
 #
 # Usage:
-#   python extract_weights.py --src logs/dyn_vggt_po_s0/ckpts/checkpoint_7.pt --dst checkpoints/dyn_vggt_s0.pt
+#   python extract_weights.py --src logs/inst_g/ckpts/epoch_15.pt --dst checkpoints/inst_g.pt
 import argparse, torch, os
 
 ap = argparse.ArgumentParser()

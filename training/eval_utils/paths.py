@@ -26,6 +26,8 @@ TRAJECTORY = "trajectory"
 GATE_GIF = "gate_gif"
 POINTCLOUD_EXPORT = "pointcloud_export"
 TRAIN_CURVES = "train_curves"
+PROFILE_COST = "profile_cost"
+WASHOUT_IMPACT = "washout_impact"
 
 
 def _join_path_parts(parts: list[str]) -> str:

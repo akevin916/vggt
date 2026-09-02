@@ -104,7 +104,7 @@ def evaluate(args, model=None) -> Dict[str, Any]:
                 gt_tum, gt_ts = load_sintel_gt_poses(cam_dir, rgb_paths)
                 pose_per_seq[seq] = eval_pose_metrics(pred["extrinsic"], gt_tum, gt_ts)
 
-            # Pose-only checkpoints (e.g. the gate/camera-only v3 configs with depth_head
+            # Pose-only checkpoints (e.g. the gate/camera-only configs with depth_head
             # disabled) return no depth -- score pose only in that case.
             if "depth" in pred:
                 pred_on_gt = []

@@ -25,11 +25,11 @@ from data.paths import data_path
 
 class PointOdysseyDataset(BaseDataset):
     # NEW: returns the standard VGGT fields plus a binary `motion_mask` (1=dynamic foreground).
-    # v3 §5.3: which dynamic-mask source to load as `motion_mask`.
-    #   "native"   — masks/mask_{fid:05d}.png, instance-segmentation appearance mask (NOT motion; §5.3).
-    #   "instance" — dynmask_inst/dyn_{fid:05d}.png, instance x GT-scene-flow motion label (§5.3(b),
+    # method.md §3.4: which dynamic-mask source to load as `motion_mask`.
+    #   "native"   — masks/mask_{fid:05d}.png, instance-segmentation appearance mask (NOT motion; §3.4).
+    #   "instance" — dynmask_inst/dyn_{fid:05d}.png, instance x GT-scene-flow motion label (§3.4 (m*_inst),
     #                produced by preprocess/po_instance_dynmask.py). Used for PO training.
-    #   "raft"     — dynmask_raft/dyn_{fid:05d}.png, RAFT optical-flow residual motion label (§5.3(a),
+    #   "raft"     — dynmask_raft/dyn_{fid:05d}.png, RAFT optical-flow residual motion label (§3.4 (m_geo),
     #                produced by preprocess/po_raft_dynmask.py). Domain-invariant, used cross-domain.
     # "instance" falls back to dynmask_raft per-frame when dynmask_inst is absent for a sequence
     # (e.g. several `character*` PO scenes have degenerate GT trajs_3d, so dynmask_inst was never
@@ -133,9 +133,9 @@ class PointOdysseyDataset(BaseDataset):
 
     def _binary_dynamic_mask(self, seq_dir, fid, hw):
         # Some PO scenes have degenerate GT trajs_3d (e.g. several `character*` sequences), so
-        # dynmask_inst (§5.3b) was never precomputable for them. Rather than silently treating
+        # dynmask_inst (§3.4 (m*_inst)) was never precomputable for them. Rather than silently treating
         # every frame of those sequences as all-static (wrong label, not missing supervision),
-        # fall back to the domain-invariant RAFT-residual mask (dynmask_raft, §5.3a) when the
+        # fall back to the domain-invariant RAFT-residual mask (dynmask_raft, §3.4 (m_geo)) when the
         # primary dynamic_source="instance" file is absent. Only fall back to all-zero if
         # neither is available.
         m = self._read_binary_mask(self._motion_mask_path(seq_dir, fid), hw)

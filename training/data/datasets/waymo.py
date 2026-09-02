@@ -28,7 +28,7 @@
 #
 # Dynamic GT (`motion_mask`):
 #   Waymo ships no per-pixel dynamic segmentation GT, so the only geometrically-derivable
-#   label is the RAFT flow-residual mask (§5.3a, preprocess/waymo_raft_dynmask.py ->
+#   label is the RAFT flow-residual mask (§3.4 (m_geo), preprocess/waymo_raft_dynmask.py ->
 #   <seg>/dynmask_raft/dyn_{fid:05d}_{cam_id}.png, one dir per segment shared across cameras,
 #   with a per-camera `.done_cam{cam_id}` completion flag). Selected via dynamic_source:
 #     "none" — motion_mask absent from get_data() (ComposedDataset zero-fills; NOT a valid
@@ -172,7 +172,7 @@ class WaymoDataset(BaseDataset):
         )
 
     def _binary_dynamic_mask(self, seg_dir, fid, cam_id, hw):
-        # RAFT flow-residual dynamic mask (§5.3a), uint8 {0,255} at native res, one dir per
+        # RAFT flow-residual dynamic mask (§3.4 (m_geo)), uint8 {0,255} at native res, one dir per
         # segment shared across cameras: dynmask_raft/dyn_{fid:05d}_{cam_id}.png. Returns float32
         # {0,1} of shape hw; all-zero (all-static) if disabled or the per-frame png is missing.
         if self.dynamic_source != "raft":
@@ -327,7 +327,7 @@ class WaymoDataset(BaseDataset):
             "point_masks": point_masks,
             "original_sizes": original_sizes,
         }
-        # RAFT flow-residual dynamic mask (§5.3a) when dynamic_source="raft"; omitted for "none"
+        # RAFT flow-residual dynamic mask (§3.4 (m_geo)) when dynamic_source="raft"; omitted for "none"
         # so ComposedDataset's zero-fill fallback applies.
         if self.dynamic_source == "raft":
             batch["motion_mask"] = motion_masks

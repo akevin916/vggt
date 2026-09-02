@@ -123,10 +123,6 @@ class ComposedDataset(Dataset, ABC):
         motion_mask = None
         if batch.get("motion_mask", None) is not None:
             motion_mask = torch.from_numpy(np.stack(batch["motion_mask"]).astype(np.float32))
-        scene_flow_gt = None
-        if batch.get("scene_flow_gt", None) is not None:
-            scene_flow_gt = torch.from_numpy(np.stack(batch["scene_flow_gt"]).astype(np.float32))
-
 
         # --- Apply Color Augmentation (training mode only) ---
         if self.training and self.image_aug is not None:
@@ -156,8 +152,6 @@ class ComposedDataset(Dataset, ABC):
         if motion_mask is None:
             motion_mask = torch.zeros_like(depths)
         sample["motion_mask"] = motion_mask
-        if scene_flow_gt is not None:
-            sample["scene_flow_gt"] = scene_flow_gt
 
         # --- Track Processing (if enabled) ---
         if self.load_track:

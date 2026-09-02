@@ -11,7 +11,7 @@ Protocol notes:
   * ``--n_frames`` frames are taken evenly across each keyframe in ONE forward pass. Chunked
     inference would split the sequence into independent passes and inflate ATE, so the frame
     count is capped instead (same frames for every checkpoint -> comparable).
-  * GT extrinsics are already world-to-cam (docs/scared_dataset.md #2), converted to TUM the
+  * GT extrinsics are already world-to-cam (docs/topics/scared_dataset.md #2), converted to TUM the
     same way as Sintel: c2w translation, mean-centred, wxyz quaternion.
   * ATE is computed with scale alignment (evo, correct_scale=True), so SCARED's millimetre
     units need no conversion.
@@ -60,7 +60,7 @@ from data.sintel_io import compute_preprocess_meta, resize_pred_to_gt
 from eval_utils.metrics_depth import average_depth_results, eval_sequence_depth
 from eval_utils.metrics_pose import (eval_pose_metrics, snippet_metrics_from_chunks,
                                      snippet_pose_metrics)
-from eval_utils.paths import output_dir_for_exp
+from eval_utils.paths import exp_name_from_ckpt, output_dir_for_exp
 from eval_utils.vggt_infer import infer_sequence, infer_sequence_stitched, load_vggt_for_eval
 
 TOOL = "eval_scared"
@@ -348,7 +348,16 @@ def main():
 
     results = {}
     for ckpt in args.ckpts:
-        name = os.path.splitext(os.path.basename(ckpt))[0]
+        # Identity is the RUN, not the file name. Every run's ckpts are called best_ate.pt /
+        # last.pt / epoch_N.pt, so keying on the basename alone made five different arms all
+        # answer to "best_ate" -- one sub-dir, one json key, each ckpt silently destroying the
+        # previous one (2026-08-25: a 6-ckpt sweep kept only the last arm, and overwrote two
+        # older results.json in the process). <exp>_<stem> is unique in both directions; the
+        # stem is dropped when it already equals <exp>, so checkpoints/VGGT-1B.pt stays
+        # "VGGT-1B" rather than becoming "VGGT-1B_VGGT-1B".
+        exp = exp_name_from_ckpt(ckpt)
+        stem = os.path.splitext(os.path.basename(ckpt))[0]
+        name = exp if stem == exp else f"{exp}_{stem}"
         args.ckpt, args.seqs = ckpt, seqs
         # Always one sub-dir per ckpt. Keying it on len(ckpts) > 1 meant two single-ckpt runs
         # with the same split/flags wrote to the same results.json, and the second silently

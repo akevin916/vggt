@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Precompute domain-invariant DYNAMIC MASKS for Spring via RAFT flow residual.
 
-Same convention as po_raft_dynmask.py (docs/method.md §5.3a):
+Same convention as po_raft_dynmask.py (docs/method.md §3.4 (m_geo)):
     m*_raft(t) = 1[ || f^gt - f^cam || > thr ]
       f^gt  = RAFT optical flow  frame t -> t+delta            (observed, domain-invariant)
       f^cam = camera-induced ego-flow from GT depth + GT pose  (compute_ego_flow)
 
 Spring is a DYNAMIC-scene dataset (animated characters, see spring.py header) but ships no
 per-pixel dynamic segmentation GT - only dense stereo disparity + camera poses. This is exactly
-the case §5.3(a) targets: derive the label geometrically from GT depth+pose vs. observed
+the case §3.4 (m_geo) targets: derive the label geometrically from GT depth+pose vs. observed
 (RAFT) flow, since there is no instance/track GT here to fall back on (unlike PointOdyssey's
-m*_inst, §5.3b).
+m*_inst, §3.4).
 
 Output (drop-in for future dataset-loader wiring): <seq_dir>/dynmask_raft/dyn_{frame_idx:04d}.png
 (uint8 {0,255}, native res, 1-based frame_idx to match frame_left_XXXX.png/disp1_left_XXXX.dsp5).

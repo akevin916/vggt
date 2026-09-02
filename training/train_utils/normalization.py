@@ -31,7 +31,6 @@ def normalize_camera_extrinsics_and_points_batch(
     depths: Optional[torch.Tensor] = None,
     scale_by_points: bool = True,
     point_masks: Optional[torch.Tensor] = None,
-    scene_flow: Optional[torch.Tensor] = None,   # NEW (Dyn-VGGT B6): 3D scene flow Δ, normalised in lock-step
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
     Normalize camera extrinsics and corresponding 3D points.
@@ -110,18 +109,8 @@ def normalize_camera_extrinsics_and_points_batch(
             new_depths = new_depths / avg_scale.view(-1, 1, 1, 1)
         if cam_points is not None:
             new_cam_points = new_cam_points / avg_scale.view(-1, 1, 1, 1, 1)
-        # B6 + v2 fix: scene flow is a world-frame displacement of world points. The world frame is
-        # rotated by R (line 92, the first camera's world→cam rotation) AND scaled by avg_scale.
-        # A displacement transforms by the SAME rotation (the translation cancels for differences),
-        # so it must be rotated by R too — not only scaled — to stay in lock-step with world_points.
-        if scene_flow is not None:
-            scene_flow = scene_flow @ R.transpose(-1, -2).unsqueeze(1).unsqueeze(2)
-            scene_flow = scene_flow / avg_scale.view(-1, 1, 1, 1, 1)
     else:
-        # No scaling, but the world frame is still rotated by R → rotate scene flow in lock-step.
-        if scene_flow is not None and world_points is not None:
-            scene_flow = scene_flow @ R.transpose(-1, -2).unsqueeze(1).unsqueeze(2)
-        return new_extrinsics[:, :, :3], cam_points, new_world_points, depths, scene_flow
+        return new_extrinsics[:, :, :3], cam_points, new_world_points, depths
 
     new_extrinsics = new_extrinsics[:, :, :3] # 4x4 -> 3x4
     new_extrinsics = check_and_fix_inf_nan(new_extrinsics, "new_extrinsics", hard_max=None)
@@ -130,7 +119,7 @@ def normalize_camera_extrinsics_and_points_batch(
     new_depths = check_and_fix_inf_nan(new_depths, "new_depths", hard_max=None)
 
 
-    return new_extrinsics, new_cam_points, new_world_points, new_depths, scene_flow  # MODIFIED: + scene_flow (B6)
+    return new_extrinsics, new_cam_points, new_world_points, new_depths
 
 
 

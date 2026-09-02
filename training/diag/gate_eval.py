@@ -23,8 +23,9 @@ Two metric families, independently switchable via --metrics:
              off           neutral no-gate control (uniform large-negative logit)
              predicted     the model's own gate
              oracle        GT / trusted mask-derived gate -- the headroom bound
-             predicted_xT  temperature-scaled model gate, to split "under-confident" from
-                           "wrong pattern" (--scales; empty to skip)
+             predicted_hard@t / predicted_topR
+                           the model's own gate binarised to 0/1 (--hard_taus / --hard_topk),
+                           i.e. an oracle-SHAPED signal driven by the prediction
 
 Outputs keep the two pre-merge layouts so older results stay comparable:
     pose     -> outputs/gate_bias_ablation[_po]/<exp>/results.json
@@ -34,7 +35,7 @@ PointOdyssey supports ``pose`` only -- the quality metrics read Sintel's flow-re
 
 Run from training/:
     python diag/gate_eval.py --ckpt logs/<exp>/ckpts/best.pt --all_seqs
-    python diag/gate_eval.py --ckpt <ckpt> --metrics quality --all_seqs --max_frames 16
+    python diag/gate_eval.py --ckpt <ckpt> --metrics quality --all_seqs --max_frames 16 --gif
     python diag/gate_eval.py --ckpt <ckpt> --dataset po --metrics pose
 """
 
@@ -68,6 +69,7 @@ from data.sintel_io import (
     sintel_seq_paths,
 )
 from eval_utils.gate_common import oracle_logits_from_masks, po_common_conf, pool_to_patch
+from eval_utils.gate_vis import save_gate_overlay_gif
 from eval_utils.metrics_pose import eval_pose_metrics, extrinsics_w2c_to_tum
 from eval_utils.paths import (
     GATE_BIAS_ABLATION,
@@ -97,14 +99,23 @@ def parse_args():
     ap.add_argument("--quality_out_dir", default=None)
     ap.add_argument("--patch_size", type=int, default=14)
     ap.add_argument("--k", type=float, default=30.0, help="oracle/off logit magnitude (bias ~ -softplus(k))")
-    ap.add_argument(
-        "--scales",
-        type=float,
-        nargs="*",
-        default=[3.0, 10.0],
-        help="temperature(s) T for predicted_x{T}: bias=-softplus(T*g_predicted). Empty to skip.",
-    )
     ap.add_argument("--device", default="cuda")
+    ap.add_argument(
+        "--gate_leaky",
+        type=float,
+        default=0.0,
+        help="model flag: >0 gives the bias clamp's flat half a slope, so patches the gate is "
+             "only mildly suspicious of (g<0) stop being indistinguishable from confident-static "
+             "ones. 1.0 removes the clamp entirely.",
+    )
+    ap.add_argument(
+        "--gate_bias_zero_ref",
+        action="store_true",
+        help="model flag: measure the bias from 0 instead of softplus(0), i.e. drop the kink that "
+             "makes the gate act only above sigma(g)=0.5. Same ordering among patches as "
+             "--gate_leaky 1.0, differing only by the constant log(2) relative to the "
+             "camera/register keys.",
+    )
     ap.add_argument(
         "--require_gate",
         action=argparse.BooleanOptionalAction,
@@ -126,13 +137,41 @@ def parse_args():
         action="store_true",
         help=f"Run all {len(SINTEL_EVAL_SEQUENCES)} Sintel eval sequences",
     )
-    # 12 was the ablation's default; the published quality table (docs/table.md table 3) was
+    # 12 was the ablation's default; the published quality table (docs/results/natural.md table 3) was
     # measured at 16 over --all_seqs. The quality json is named quality_f<max_frames>.json, so a
     # run at a different length lands in its own file rather than overwriting that table's source.
     ap.add_argument("--max_frames", type=int, default=12)
     ap.add_argument("--motion_thr", type=float, default=2.0, help="px threshold for GT flow-residual mask")
     ap.add_argument("--label_thr", type=float, default=0.5, help="patch dynamic-fraction -> binary label")
     ap.add_argument("--cal_bins", type=int, default=10, help="reliability-curve bins over sigma(g)")
+    ap.add_argument(
+        "--gif",
+        action="store_true",
+        help="quality only: also write one animated GIF per sequence (sigma(g) heat-overlaid on "
+             "the RGB, GT outlined in green, AUC/F1 burned into every frame) next to the json",
+    )
+    ap.add_argument(
+        "--hard_taus",
+        type=float,
+        nargs="*",
+        default=[],
+        help="pose only: binarise the PREDICTED gate at each absolute tau on sigma(g) and feed it "
+             "as a 0/1 override (+k / -k), the same shape of signal as `oracle`. Temperature "
+             "scaling cannot reach these operating points, which is why that mode was dropped: it is "
+             "multiplicative, so a gate whose logits are all negative stays under the bias "
+             "clamp at every temperature. Re-centring g additively is the only knob that moves it.",
+    )
+    ap.add_argument(
+        "--hard_topk",
+        type=float,
+        nargs="*",
+        default=[],
+        help="pose only: same 0/1 override, but the threshold is the PER-FRAME (1-rho) quantile of "
+             "g instead of an absolute value -- adapts to sequences whose confidence sits at a "
+             "different level, at the cost of masking rho of the patches even in a static scene.",
+    )
+    ap.add_argument("--overlay_alpha", type=float, default=0.45, help="heatmap blend weight")
+    ap.add_argument("--duration_ms", type=int, default=200, help="ms per frame in the GIF")
     ap.add_argument("--chunk_size", type=int, default=0, help="0 = full sequence; else chunk inference")
     ap.add_argument(
         "--report_dynamic_fraction",
@@ -230,12 +269,17 @@ def _patch_labels(masks, s: int, ph: int, pw: int, label_thr: float) -> np.ndarr
 # ---------------------------------------------------------------------------
 
 
-def _scaled_mode_names(scales: List[float]) -> List[str]:
-    return [f"predicted_x{T:g}" for T in scales]
+def _hard_mode_names(args) -> List[str]:
+    return ([f"predicted_hard@{t:g}" for t in getattr(args, "hard_taus", [])]
+            + [f"predicted_top{r:g}" for r in getattr(args, "hard_topk", [])])
 
 
-def _mean_by_mode(items: Dict[str, Dict[str, Dict[str, float]]], scales: List[float]) -> Dict[str, Dict[str, float]]:
-    all_modes = MODES + _scaled_mode_names(scales)
+def _extra_mode_names(args) -> List[str]:
+    return _hard_mode_names(args)
+
+
+def _mean_by_mode(items: Dict[str, Dict[str, Dict[str, float]]], extra: List[str]) -> Dict[str, Dict[str, float]]:
+    all_modes = MODES + list(extra)
     return {
         mode: {
             metric: float(np.mean([items[k][mode][metric] for k in items if mode in items[k]]))
@@ -354,20 +398,50 @@ def _run_sintel_seq(model, args, sintel_root: str, seq: str) -> Dict[str, Any]:
     if "gate_logits" not in pred:
         if want_quality:
             raise RuntimeError("ckpt returned no gate_logits -- quality metrics need them")
-        if args.scales:
-            print(f"[warn] {seq}: model returned no gate_logits, skipping predicted_x{{T}} modes")
+        if args.hard_taus or args.hard_topk:
+            print(f"[warn] {seq}: model returned no gate_logits, skipping predicted_hard modes")
     else:
         g = np.asarray(pred["gate_logits"], dtype=np.float32).reshape(s, -1)
         if want_quality:
+            labels = _patch_labels(masks, s, ph, pw, args.label_thr)
             probs = (1.0 / (1.0 + np.exp(-g))).reshape(-1)
-            out["quality"] = (probs, _patch_labels(masks, s, ph, pw, args.label_thr))
-        if want_pose and args.scales:
-            g_pred = torch.from_numpy(g).reshape(1, s, -1)
-            for T in args.scales:
-                scaled = infer_sequence_chunked(
-                    model, rgb_paths, gate_logits_override=(g_pred * T).to(args.device), **infer_kw
+            out["quality"] = (probs, labels)
+            if args.gif:
+                # GIF inputs are the SCORED arrays reshaped back to the patch grid --
+                # never a re-derived mask, so the picture cannot disagree with the number.
+                out["overlay"] = (
+                    images.cpu().numpy(),
+                    probs.reshape(s, ph, pw),
+                    labels.reshape(s, ph, pw),
                 )
-                pose[f"predicted_x{T:g}"] = eval_pose_metrics(scaled["extrinsic"], gt_tum, gt_ts)
+        if want_pose and (args.hard_taus or args.hard_topk):
+            # 0/1 override built from the model's OWN gate: keep the ranking (AUC is the healthy
+            # part), discard the absolute values (calibration is the broken part). This is an
+            # additive re-centring of g, which is what the bias clamp actually needs -- see
+            # --hard_taus for why a multiplicative temperature cannot do it.
+            probs_g = 1.0 / (1.0 + np.exp(-g))                    # [s, P_patch]
+            hard_frac: Dict[str, float] = {}
+
+            def _run_hard(sel: np.ndarray, name: str) -> None:
+                override = torch.from_numpy(
+                    np.where(sel, args.k, -args.k).astype(np.float32)
+                ).reshape(1, s, -1)
+                hp = infer_sequence_chunked(
+                    model, rgb_paths, gate_logits_override=override.to(args.device), **infer_kw
+                )
+                pose[name] = eval_pose_metrics(hp["extrinsic"], gt_tum, gt_ts)
+                # How much of the frame each mode actually suppressed. Without it an ATE change
+                # is unattributable: "masked the right patches" and "masked almost nothing" look
+                # identical in the pose column alone.
+                hard_frac[name] = float(sel.mean())
+
+            for tau in args.hard_taus:
+                _run_hard(probs_g >= tau, f"predicted_hard@{tau:g}")
+            for rho in args.hard_topk:
+                # Per-frame quantile: each frame masks exactly rho of its patches.
+                kth = np.quantile(g, 1.0 - rho, axis=1, keepdims=True)
+                _run_hard(g >= kth, f"predicted_top{rho:g}")
+            out["hard_frac"] = hard_frac
 
     if want_pose:
         out["pose"] = pose
@@ -382,11 +456,14 @@ def _evaluate_sintel(args) -> Dict[str, Any]:
     print(f"Metrics: {sorted(args.metric_set)}")
 
     model = load_vggt_for_eval(
-        args.ckpt, device=args.device, require_gate=args.require_gate, force_gate=args.force_gate
+        args.ckpt, device=args.device, require_gate=args.require_gate, force_gate=args.force_gate,
+        gate_leaky=args.gate_leaky, gate_bias_zero_ref=args.gate_bias_zero_ref,
     )
 
     pose_per_seq: Dict[str, Dict[str, Dict[str, float]]] = {}
     quality_per_seq: Dict[str, Dict[str, float]] = {}
+    overlay_payload: Dict[str, Any] = {}
+    hard_frac_by_seq: Dict[str, Dict[str, float]] = {}
     all_probs: List[np.ndarray] = []
     all_labels: List[np.ndarray] = []
     dynamic_fraction_by_seq: Dict[str, float] = {}
@@ -402,11 +479,15 @@ def _evaluate_sintel(args) -> Dict[str, Any]:
         dynamic_fraction_by_seq[seq] = out["dynamic_fraction"]
         if "pose" in out:
             pose_per_seq[seq] = out["pose"]
+            if "hard_frac" in out:
+                hard_frac_by_seq[seq] = out["hard_frac"]
         if "quality" in out:
             probs, labels = out["quality"]
             quality_per_seq[seq] = _score(probs, labels)
             all_probs.append(probs)
             all_labels.append(labels)
+            if "overlay" in out:
+                overlay_payload[seq] = out["overlay"]
 
     meta = {
         "dataset": "sintel",
@@ -418,6 +499,10 @@ def _evaluate_sintel(args) -> Dict[str, Any]:
         # (see _run_sintel_seq) and the json is otherwise indistinguishable from a correct run.
         "chunk_size": args.chunk_size,
         "motion_thr": args.motion_thr,
+        # The bias formulation is part of the model, not the override, so it silently applies to
+        # every mode -- recorded here or two runs become indistinguishable in the json.
+        "gate_leaky": args.gate_leaky,
+        "gate_bias_zero_ref": args.gate_bias_zero_ref,
         "metrics": sorted(args.metric_set),
         "timestamp": datetime.now().isoformat(timespec="seconds"),
     }
@@ -425,18 +510,29 @@ def _evaluate_sintel(args) -> Dict[str, Any]:
 
     if "pose" in args.metric_set:
         results = {
-            "meta": {**meta, "k": args.k, "scales": args.scales},
+            "meta": {**meta, "k": args.k,
+                     "hard_taus": args.hard_taus, "hard_topk": args.hard_topk},
             "per_seq": pose_per_seq,
-            "mean": _mean_by_mode(pose_per_seq, args.scales),
+            "mean": _mean_by_mode(pose_per_seq, _extra_mode_names(args)),
             "errors": errors,
         }
         if args.report_dynamic_fraction:
             valid = [v for v in dynamic_fraction_by_seq.values() if np.isfinite(v)]
             results["dynamic_fraction_by_seq"] = dynamic_fraction_by_seq
             results["dynamic_fraction_mean"] = float(np.mean(valid)) if valid else float("nan")
+        if hard_frac_by_seq:
+            results["hard_frac_by_seq"] = hard_frac_by_seq
+            results["hard_frac_mean"] = {
+                mode: float(np.mean([v[mode] for v in hard_frac_by_seq.values() if mode in v]))
+                for mode in _hard_mode_names(args)
+            }
         out_dir = args.out_dir or default_output_dir(args.ckpt, GATE_BIAS_ABLATION)
         _save_json(out_dir, "results.json", results)
         _print_pose_summary(results, "GATE BIAS ABLATION (Sintel)", item_label="seq")
+        if hard_frac_by_seq:
+            print("\nfraction of patches suppressed (mean over seqs):")
+            for mode, f in results["hard_frac_mean"].items():
+                print(f"  {mode:<22} {f*100:5.1f}%")
         if args.report_dynamic_fraction:
             print("\nsequence dynamic_fraction (desc):")
             for seq, frac in sorted(dynamic_fraction_by_seq.items(), key=lambda x: -x[1]):
@@ -461,6 +557,22 @@ def _evaluate_sintel(args) -> Dict[str, Any]:
         out_dir = args.quality_out_dir or default_output_dir(args.ckpt, GATE_QUALITY)
         _save_json(out_dir, f"quality_f{args.max_frames}.json", results)
         _print_quality_summary(results)
+        if overlay_payload:
+            ck = os.path.basename(args.ckpt)
+            vis_dir = os.path.join(out_dir, f"overlay_f{args.max_frames}")
+            print(f"\noverlay GIFs -> {vis_dir}")
+            for seq, (imgs, p_grid, y_grid) in overlay_payload.items():
+                q = quality_per_seq[seq]
+                head = (f"{seq}   AUC {q['auc']:.3f}   F1 {q['f1']:.3f}   "
+                        f"gap {q['gap']:+.3f}   dyn {q['dynamic_fraction']*100:.1f}%")
+                sub = (f"ckpt={ck}  label_thr={args.label_thr}  motion_thr={args.motion_thr}px  "
+                       f"frames={imgs.shape[0]}")
+                fp = save_gate_overlay_gif(
+                    os.path.join(vis_dir, f"{seq}.gif"), imgs, p_grid, y_grid,
+                    header=head, subheader=sub,
+                    alpha=args.overlay_alpha, duration_ms=args.duration_ms,
+                )
+                print(f"  {fp}")
         out_all["quality"] = results
 
     return out_all
@@ -506,14 +618,6 @@ def _run_po_clip(model, args, ds: PointOdysseyDataset, seq_index: int) -> Dict[s
     extrinsic_np, g_pred = _infer_extrinsic(model, img, h, w, args.device, None)
     results["predicted"] = eval_pose_metrics(extrinsic_np, gt_tum, gt_ts)
 
-    if g_pred is not None:
-        g_pred_t = torch.from_numpy(g_pred).unsqueeze(0)
-        for T in args.scales:
-            extrinsic_np, _ = _infer_extrinsic(model, img, h, w, args.device, (g_pred_t * T).to(args.device))
-            results[f"predicted_x{T:g}"] = eval_pose_metrics(extrinsic_np, gt_tum, gt_ts)
-    elif args.scales:
-        print("[warn] model returned no gate_logits, skipping predicted_x{T} modes")
-
     return results
 
 
@@ -523,6 +627,7 @@ def _evaluate_po(args) -> Dict[str, Any]:
     model = load_vggt_for_eval(
         args.ckpt, img_size=args.img_size, device=args.device,
         require_gate=args.require_gate, force_gate=args.force_gate,
+        gate_leaky=args.gate_leaky, gate_bias_zero_ref=args.gate_bias_zero_ref,
     )
     ds = PointOdysseyDataset(
         common_conf=po_common_conf(args),
@@ -555,12 +660,11 @@ def _evaluate_po(args) -> Dict[str, Any]:
             "n_clips": args.n_clips,
             "img_per_seq": args.img_per_seq,
             "k": args.k,
-            "scales": args.scales,
             "seed": args.seed,
             "timestamp": datetime.now().isoformat(timespec="seconds"),
         },
         "per_clip": per_clip,
-        "mean": _mean_by_mode(per_clip, args.scales),
+        "mean": _mean_by_mode(per_clip, _extra_mode_names(args)),
         "errors": errors,
     }
 

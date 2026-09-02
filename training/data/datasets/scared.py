@@ -3,7 +3,7 @@
 # SCARED is a stereo ENDOSCOPY dataset (porcine abdominal anatomy, surgical instruments).
 # Everything here reads the CONVERTED layout produced by data/preprocess/scared_convert.py;
 # the raw release's quirks (BGR-swapped tiffs, dataset 8/9 off-by-one, stacked left/right
-# point maps) were absorbed at conversion time. Full spec: docs/scared_dataset.md.
+# point maps) were absorbed at conversion time. Full spec: docs/topics/scared_dataset.md.
 #
 # Disk layout:  <SCARED_DIR>/<split>/dataset{n}/keyframe{m}/
 #   image_left/{fid:06d}.png     RGB 1280x1024 uint8
@@ -33,7 +33,7 @@
 # frames with valid_frac > `min_anchor_valid_frac`.
 #
 # motion_mask: SCARED has NO dynamic annotation, and the RAFT flow-residual recipe used by
-# Spring/Waymo was measured NOT to work here (docs/scared_dataset.md). `dynamic_source` is
+# Spring/Waymo was measured NOT to work here (docs/topics/scared_dataset.md). `dynamic_source` is
 # therefore "none" by default, which returns all-zero masks. NOTE that all-zero means
 # "everything is GT-static", which is a LIE for endoscopy (deforming tissue, moving
 # instruments) -- it is a placeholder to keep the key present, not a label. Do not enable
@@ -66,6 +66,7 @@ class ScaredDataset(BaseDataset):
         depth_max: float = 655.35,          # MILLIMETRES (see note 1)
         dynamic_source: str = "none",
         min_anchor_valid_frac: float = 0.05,
+        nearby_expand_range: int | None = None,
     ):
         super().__init__(common_conf=common_conf)
 
@@ -80,11 +81,18 @@ class ScaredDataset(BaseDataset):
         self.depth_max = depth_max
         self.len_train = len_train
         self.min_anchor_valid_frac = min_anchor_valid_frac
+        # Half-width of the get_nearby sampling window, in frames. None keeps the inherited
+        # expand_ratio=2.0 behaviour (window = +-2*img_per_seq, i.e. +-24 for a 12-view
+        # sample). Measured GT camera displacement on the train split, median over the 22
+        # keyframes: gap 1 = 0.26 mm, 24 = 4.40, 48 = 6.91, 120 = 12.40, 240 = 19.26,
+        # 480 = 21.72 -- the endoscope loiters and doubles back, so displacement SATURATES
+        # past ~240 and a wider window buys baseline at the cost of view overlap.
+        self.nearby_expand_range = nearby_expand_range
 
         if dynamic_source not in ("none",):
             raise ValueError(
                 f"SCARED has no dynamic annotation; dynamic_source must be 'none', got "
-                f"{dynamic_source!r}. See docs/scared_dataset.md."
+                f"{dynamic_source!r}. See docs/topics/scared_dataset.md."
             )
         self.dynamic_source = dynamic_source
 
@@ -155,7 +163,12 @@ class ScaredDataset(BaseDataset):
             if self.get_nearby:
                 # anchor from the dense-depth pool only (see module header)
                 anchor = int(np.random.choice(store["anchors"]))
-                ids = self.get_nearby_ids([anchor] * img_per_seq, num_frames, expand_ratio=2.0)
+                if self.nearby_expand_range is None:
+                    ids = self.get_nearby_ids([anchor] * img_per_seq, num_frames,
+                                              expand_ratio=2.0)
+                else:
+                    ids = self.get_nearby_ids([anchor] * img_per_seq, num_frames,
+                                              expand_range=self.nearby_expand_range)
             else:
                 ids = np.random.choice(num_frames, img_per_seq,
                                        replace=self.allow_duplicate_img)

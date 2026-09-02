@@ -42,6 +42,7 @@ from train_utils.logging import setup_logging
 from train_utils.normalization import normalize_camera_extrinsics_and_points_batch
 from train_utils.optimizer import construct_optimizers
 from loss import oracle_gate_logits_from_mask
+from data.photometric_corruption import corrupt_batch
 
 # TensorBoard tag layout: "<phase>/<group>_<key>" -- train/loss_*, validation/loss_*,
 # validation/depth_*, validation/pose_*. The internal phase name is 'val'; TB spells it out.
@@ -85,6 +86,7 @@ class Trainer:
         env_variables: Optional[Dict[str, Any]] = None,
         accum_steps: int = 1,
         oracle_gate: Optional[Dict[str, Any]] = None,
+        corruption: Optional[Dict[str, Any]] = None,
         resume: bool = False,
         **kwargs,
     ):
@@ -111,7 +113,7 @@ class Trainer:
             oracle_gate: If {"enabled": True, ...}, replaces the model's own gate bias with one
                 built directly from batch["motion_mask"] (GT dynamic mask) on every forward pass
                 (see loss.oracle_gate_logits_from_mask and the oracle_camera_only ablation).
-                Used to test the v3 architectural bet in isolation from gate-predictor quality.
+                Used to test the gate architectural bet in isolation from gate-predictor quality.
             resume: CLI-driven (--resume), not config-driven. False (default): always load
                 checkpoint.resume_checkpoint_path (the experiment's warm-start/base weights);
                 refuses to start if logs/<exp>/ckpts/last.pt already exists, so a forgotten flag
@@ -151,6 +153,12 @@ class Trainer:
         # channel A (val_epoch) never computes metrics, only loss. See val_epoch docstring.
         self.pose_eval_conf = pose_eval or {}
         self.oracle_gate_conf = oracle_gate
+        # Illumination robustness. When enabled, every TRAIN step forwards the batch twice:
+        # once clean under no_grad (the teacher) and once with a few frames photometrically
+        # corrupted (the student, which is what L_sup is computed on -- so the corruption doubles
+        # as augmentation). loss.influence then scores how far the UNCORRUPTED frames moved.
+        # Config keys: enabled, warmup_steps, plus anything data.photometric_corruption reads.
+        self.corruption_conf = corruption
         # Two independently-selected best checkpoints, both restored on resume:
         #   best_ate  -> lowest channel-B full-sequence Sintel ATE (the report metric).
         #   best_loss -> lowest channel-A held-out (PO-test) camera loss (unbiased vs the
@@ -1057,15 +1065,13 @@ class Trainer:
             batch = self._apply_batch_repetition(batch)
         
         # Normalize camera extrinsics and points. The function returns new tensors.
-        # MODIFIED (B6): also normalises scene_flow_gt in lock-step when present (Dyn-VGGT).
-        normalized_extrinsics, normalized_cam_points, normalized_world_points, normalized_depths, normalized_scene_flow = \
+        normalized_extrinsics, normalized_cam_points, normalized_world_points, normalized_depths = \
             normalize_camera_extrinsics_and_points_batch(
                 extrinsics=batch["extrinsics"],
                 cam_points=batch["cam_points"],
                 world_points=batch["world_points"],
                 depths=batch["depths"],
                 point_masks=batch["point_masks"],
-                scene_flow=batch.get("scene_flow_gt", None),
             )
 
         # Replace the original values in the batch with the normalized ones.
@@ -1073,8 +1079,6 @@ class Trainer:
         batch["cam_points"] = normalized_cam_points
         batch["world_points"] = normalized_world_points
         batch["depths"] = normalized_depths
-        if normalized_scene_flow is not None:
-            batch["scene_flow_gt"] = normalized_scene_flow
 
         return batch
 
@@ -1093,10 +1097,57 @@ class Trainer:
                 patch_size=self.oracle_gate_conf.get("patch_size", 14),
                 k=self.oracle_gate_conf.get("k", 30.0),
             )
-        y_hat = model(images=batch["images"], gate_logits_override=gate_override)
+        # Illumination robustness: the double forward.
+        #   teacher -- the CLEAN sequence under no_grad. no_grad is what keeps this cheap: no
+        #              activations are stored, so the extra pass costs compute, not the ~2x memory
+        #              a second differentiable forward would.
+        #   student -- the SAME sequence with 1-2 frames photometrically corrupted. L_sup is
+        #              computed on this one, so the corruption doubles as augmentation; setting
+        #              loss.influence.weight to 0 therefore leaves exactly the augmentation-only
+        #              ablation arm, with no other difference.
+        # Train phase only: validation must stay a plain single forward or its loss stops being
+        # comparable with every previous run's.
+        images_in = batch["images"]
+        y_teacher = None
+        if (
+            phase == "train"
+            and self.corruption_conf is not None
+            and self.corruption_conf.get("enabled", False)
+            and self.steps[phase] >= int(self.corruption_conf.get("warmup_steps", 0))
+        ):
+            corrupted, corrupt_mask = corrupt_batch(batch["images"], self.corruption_conf)
+            if bool(corrupt_mask.any()):
+                # cache_enabled=False is REQUIRED, not a tuning choice. autocast caches the bf16
+                # casts of each weight for the lifetime of its context; the teacher pass would
+                # populate that cache, the student pass would then consume cached casts instead of
+                # producing them, and gradient checkpointing's recompute in the backward would save
+                # a different set of tensors than the forward did -- which surfaces as
+                # CheckpointError: "Recomputed values ... have different metadata". Disabling the
+                # cache for the teacher alone leaves the student pass byte-identical to the
+                # single-forward case.
+                with torch.no_grad(), torch.amp.autocast(
+                    "cuda",
+                    enabled=self.optim_conf.amp.enabled,
+                    dtype=(torch.bfloat16 if self.optim_conf.amp.amp_dtype == "bfloat16"
+                           else torch.float16),
+                    cache_enabled=False,
+                ):
+                    y_teacher = model(images=batch["images"], gate_logits_override=gate_override)
+                    y_teacher = {
+                        k: v for k, v in y_teacher.items()
+                        if k in ("world_points", "world_points_conf", "depth", "pose_enc_list")
+                    }
+                images_in = corrupted
+                batch["_teacher"] = y_teacher
+                batch["corrupt_frame_mask"] = corrupt_mask
+
+        y_hat = model(images=images_in, gate_logits_override=gate_override)
         
         # Loss computation
         loss_dict = self.loss(y_hat, batch)
+        # Keep the teacher out of the logging merge below: it is a dict of prediction tensors,
+        # not batch data, and _update_and_log_scalars would try to .item() whatever it matched.
+        batch.pop("_teacher", None)
         
         # Combine all data for logging
         log_data = {**y_hat, **loss_dict, **batch}
@@ -1107,6 +1158,11 @@ class Trainer:
         # and switching off is the outcome the pose loss is known to prefer here.
         #   gate_g_median   -- where the logits sit; the clamp kink is at 0
         #   gate_frac_active-- fraction of patches past that kink, i.e. actually suppressed
+        if y_teacher is not None:
+            # Without this the L_inf curve is unreadable: a falling loss_influence could mean the
+            # model got robust, or simply that fewer frames were being corrupted.
+            log_data["corrupt_frac"] = batch["corrupt_frame_mask"].float().mean()
+
         if "gate_logits" in y_hat and y_hat["gate_logits"] is not None:
             with torch.no_grad():
                 _g = y_hat["gate_logits"].detach().float()

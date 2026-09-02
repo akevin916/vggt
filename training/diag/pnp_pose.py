@@ -14,10 +14,10 @@ Three pose columns, one question each:
                                                                        recoverable by simply dropping
                                                                        the dynamic pixels?)
 
-``pnp_all`` vs ``pnp_static`` is a gate-free, training-free measurement of the v3 thesis.
+``pnp_all`` vs ``pnp_static`` is a gate-free, training-free measurement of the gate thesis.
 RANSAC already rejects dynamic pixels as outliers, so pnp_static isolates what an
 *explicit* static prior buys on top of that. If neither moves toward MonST3R's 0.108,
-the Sintel pose gap is not primarily caused by dynamic content -- which is what table.md's
+the Sintel pose gap is not primarily caused by dynamic content -- which is what results_natural.md's
 f50 oracle (+0.7%) already hints at.
 
 Two depth columns as a side product:
@@ -76,7 +76,7 @@ def parse_args():
         type=str,
         default=None,
         help="Borrow point_head weights from this checkpoint (e.g. checkpoints/VGGT-1B.pt) "
-        "for a ckpt that has none -- every v3 run disables the point head. The grafted "
+        "for a ckpt that has none -- every gate-lineage run disables the point head. The grafted "
         "head reads a trunk it never trained on; read the result as indicative only.",
     )
     ap.add_argument("--sintel_root", type=str, default=None)
@@ -246,7 +246,7 @@ def eval_sequence(seq: str, model, args) -> Dict[str, Any]:
         out["pose"][mode] = eval_pose_metrics(ext, gt_tum, gt_ts)
 
     # Depth: both variants scored on GT resolution with the same per-frame median scaling
-    # the Sintel benchmark uses, so these numbers are comparable to table.md's.
+    # the Sintel benchmark uses, so these numbers are comparable to results_natural.md's.
     depth_variants: Dict[str, np.ndarray] = {}
     if "depth" in pred:
         d = pred["depth"]
@@ -305,12 +305,12 @@ def main():
         graft_point_head(model, args.point_head_from)
         print(
             "⚠️  grafted point_head: it never trained on this checkpoint's trunk "
-            "(v3 S1 trains global blocks 8-23) -- indicative only."
+            "(gate-method S1 trains global blocks 8-23) -- indicative only."
         )
     if model.point_head is None:
         raise SystemExit(
             f"checkpoint has no point_head weights: {args.ckpt}\n"
-            "Every v3 config disables the point head (method §7.2). Pass "
+            "Every gate-lineage config disables the point head (docs/method.md §8.2). Pass "
             "--point_head_from checkpoints/VGGT-1B.pt to borrow the pretrained one."
         )
 

@@ -5,7 +5,7 @@
 # DYNAMIC-scene dataset for depth/pose supervision.
 #
 # Dynamic GT (`motion_mask`): Spring ships no per-pixel dynamic segmentation GT, so the only
-# geometrically-derivable label is the RAFT flow-residual mask (§5.3a, precompute_spring_raft_
+# geometrically-derivable label is the RAFT flow-residual mask (§3.4 (m_geo), precompute_spring_raft_
 # dynmask.py -> dynmask_raft/dyn_{frame_idx:04d}.png). Selected via dynamic_source:
 #   "none" — motion_mask absent from get_data() (ComposedDataset zero-fills; NOT valid for a
 #            dynamic scene, only kept as a legacy/debug escape hatch).
@@ -127,7 +127,7 @@ class SpringDataset(BaseDataset):
         )
 
     def _binary_dynamic_mask(self, seq_dir, frame_idx, hw):
-        # RAFT flow-residual dynamic mask (§5.3a); precomputed as uint8 {0,255} at native res,
+        # RAFT flow-residual dynamic mask (§3.4 (m_geo)); precomputed as uint8 {0,255} at native res,
         # 1-based frame_idx to match frame_left_XXXX.png. Returns float32 {0,1} of shape hw;
         # all-zero (all-static) if disabled or the file is missing for this frame.
         if self.dynamic_source != "raft":
@@ -282,7 +282,7 @@ class SpringDataset(BaseDataset):
             "point_masks": point_masks,
             "original_sizes": original_sizes,
         }
-        # RAFT flow-residual dynamic mask (§5.3a) when dynamic_source="raft"; omitted for "none"
+        # RAFT flow-residual dynamic mask (§3.4 (m_geo)) when dynamic_source="raft"; omitted for "none"
         # so ComposedDataset's zero-fill fallback applies.
         if self.dynamic_source == "raft":
             batch["motion_mask"] = motion_masks

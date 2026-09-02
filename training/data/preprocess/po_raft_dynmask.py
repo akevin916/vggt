@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Precompute domain-invariant DYNAMIC MASKS for PointOdyssey via RAFT flow residual.
 
-Faithful to docs/method.md §5.3(a) (and identical to the Sintel eval convention):
+Faithful to docs/method.md §3.4 (m_geo) (and identical to the Sintel eval convention):
     m*_raft(t) = 1[ || f^gt - f^cam || > thr ]
       f^gt  = RAFT optical flow  frame t -> t+1              (observed, domain-invariant)
       f^cam = camera-induced ego-flow from GT depth + GT pose (compute_ego_flow)

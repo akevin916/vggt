@@ -21,12 +21,12 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# v3: Motion-Gated Camera Aggregation (docs/method.md §3)
+# Motion-Gated Camera Aggregation (docs/method.md §3)
 # ---------------------------------------------------------------------------
 
 class GatePredictor(nn.Module):
     """
-    Mid-aggregator motion gate predictor (Dyn-VGGT v3 §3).
+    Mid-aggregator motion gate predictor (Dyn-VGGT gate method, docs/method.md §3).
 
     Takes patch tokens from the middle of the aggregator (~1/3 depth) and
     predicts a per-patch dynamic logit g ∈ ℝ.  Downstream uses:
@@ -119,11 +119,12 @@ class Aggregator(nn.Module):
         rope_freq=100,
         init_values=0.01,
         temporal_every=3,   # NEW: insert one temporal block every `temporal_every` aa-blocks (decision A3)
-        # v3: motion-gated camera aggregation
-        enable_gate: bool = False,   # v3 gate predictor + gated global attention
+        # motion-gated camera aggregation
+        enable_gate: bool = False,   # gate predictor + gated global attention
         gate_block_iter: int = 7,    # fire gate after this 0-indexed aa-block iteration (~1/3 of 24)
         gate_pose_grad: bool = False,  # let the downstream (pose) loss train the gate -- see below
         gate_leaky: float = 0.0,       # >0 replaces the bias clamp with a leaky one -- see below
+        gate_bias_zero_ref: bool = False,  # drop the softplus(0) reference -- see below
     ):
         super().__init__()
 
@@ -216,7 +217,7 @@ class Aggregator(nn.Module):
             self.n_temporal = 0
             self.temporal_blocks = None
 
-        # v3: motion gate predictor (§3)
+        # motion gate predictor (§3)
         self.enable_gate = enable_gate
         self.gate_block_iter = gate_block_iter
         # The attention bias is detached by default, so L_camera CANNOT train the gate and the
@@ -233,6 +234,21 @@ class Aggregator(nn.Module):
         # gate_leaky * log2 (0.07 at 0.1) instead of exactly 0. 0.0 keeps the hard clamp and
         # is byte-for-byte the old behaviour.
         self.gate_leaky = float(gate_leaky)
+        # gate_bias_zero_ref: measure the bias from softplus(-inf)=0 instead of softplus(0).
+        # The softplus(0) reference is what puts the clamp's kink at sigma(g)=0.5, i.e. it makes
+        # the gate act ONLY on patches it believes are more likely dynamic than not. On this data
+        # an honestly-calibrated gate reaches ~0.36 for the average dynamic patch, so that kink
+        # leaves the bias identically 0 and the gate inert. With zero_ref the bias is
+        # -softplus(g), which is <= 0 everywhere (so the clamp becomes a no-op) and varies
+        # smoothly with the evidence: confident-static -> 0 (identical to no gate), mildly
+        # suspicious -> mildly suppressed. It differs from gate_leaky=1.0 only by the constant
+        # log(2) -- identical ordering AMONG patches, different only relative to the
+        # camera/register keys, whose bias slot stays 0.
+        # COST: it breaks the warm start. GatePredictor is zero-init so g==0 at step 0, and
+        # softplus(0) is exactly what makes bias==0 there, i.e. byte-for-byte pretrained VGGT.
+        # Under zero_ref every patch starts at -log(2) instead. Eval-only use is unaffected --
+        # there is no initialisation to preserve when scoring a trained ckpt.
+        self.gate_bias_zero_ref = bool(gate_bias_zero_ref)
         if enable_gate:
             self.gate_predictor = GatePredictor(embed_dim)
         else:
@@ -371,7 +387,7 @@ class Aggregator(nn.Module):
         temporal_idx = 0
         output_list = []
 
-        # v3: gate logits computed lazily after gate_block_iter; None until then
+        # gate logits computed lazily after gate_block_iter; None until then
         gate_logits: Optional[torch.Tensor] = None
 
         for block_iter in range(self.aa_block_num):
@@ -396,7 +412,7 @@ class Aggregator(nn.Module):
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
 
-            # v3: compute gate logits from patch tokens after gate_block_iter is complete.
+            # compute gate logits from patch tokens after gate_block_iter is complete.
             # tokens is in [B, S*P, C] after global attention; extract patch slice.
             if self.gate_predictor is not None and block_iter == self.gate_block_iter:
                 tokens_4d = tokens.view(B, S, P, C)
@@ -441,7 +457,7 @@ class Aggregator(nn.Module):
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
 
-        v3 extension: when gate_logits [B, S, P_patch] is provided, the camera and register
+        Extension: when gate_logits [B, S, P_patch] is provided, the camera and register
         query rows receive an additive attention bias of −softplus(gate_logits) on all patch
         key positions, structurally preventing dynamic patches from polluting the camera token.
         Patch↔patch attention is unmodified (flash-friendly, no bias). See §4.
@@ -457,7 +473,7 @@ class Aggregator(nn.Module):
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
             if gate_logits is not None:
-                # v3: gated attention — split into patch-query path (flash, no bias) and
+                # gated attention — split into patch-query path (flash, no bias) and
                 # camera/register-query path (small, with per-patch-key bias).
                 # detach unless gate_pose_grad: see __init__ for why the default is detached
                 gate_bias = gate_logits if self.gate_pose_grad else gate_logits.detach()
@@ -498,7 +514,7 @@ class Aggregator(nn.Module):
         patch_start_idx: int,
     ) -> torch.Tensor:
         """
-        One global attention block with motion-gated camera aggregation (v3 §4).
+        One global attention block with motion-gated camera aggregation (docs/method.md §3.2).
 
         Splits the attention into two memory-efficient paths:
           • Path 1 — Patch queries → ALL keys: standard F.sdpa, no bias (flash-friendly).
@@ -571,7 +587,8 @@ class Aggregator(nn.Module):
         # some unknown fraction of patches already inside the dead zone. The forward value
         # stays continuous either way.
         bias_key = gate_logits_det.new_zeros(B, S, P)                # [B, S, P]
-        _x = math.log(2.0) - F.softplus(gate_logits_det)
+        _ref = 0.0 if self.gate_bias_zero_ref else math.log(2.0)
+        _x = _ref - F.softplus(gate_logits_det)
         if self.gate_leaky > 0.0:
             # `<=` not `<`: at x == 0 (i.e. g == 0, where a zero-init gate starts) the strict
             # form would take the leaky branch and cut the gradient there by 1/gate_leaky --

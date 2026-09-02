@@ -34,6 +34,8 @@ from dust3r.utils.image import load_images
 from data.paths import data_path
 from eval_utils.media_io import write_video
 from eval_utils.ply_io import write_ply
+from eval_utils.seq_io import dump_seq_npz
+from benchmark.eval_monst3r_lesion import MONST3R_VIDEO_OPTS
 
 TOOL = "eval_gastric"
 MODEL_SUBDIR = "MonST3R"
@@ -132,12 +134,17 @@ def run_segment(model, seg_dir, out_dir, args):
     print(f"  {seg_name}: {len(paths)} frames, niter={args.niter}")
 
     imgs = load_images(paths, size=512, verbose=False)
-    pairs = make_pairs(imgs, scene_graph="swin-5", prefilter=None, symmetrize=True)
+    # Same story as the lesion runner: MonST3R's video settings have to be passed
+    # explicitly or the optimizer runs plain DUSt3R. See MONST3R_VIDEO_OPTS there.
+    pairs = make_pairs(imgs, scene_graph=args.scene_graph, prefilter=None, symmetrize=True)
     output = inference(pairs, model, args.device, batch_size=1, verbose=False)
+    opts = ({} if args.no_video_opts else
+            dict(MONST3R_VIDEO_OPTS, num_total_iter=args.niter))
     scene = global_aligner(
         output, device=args.device,
         mode=GlobalAlignerMode.PointCloudOptimizer,
         verbose=False,
+        **opts,
     )
     scene.compute_global_alignment(init="mst", niter=args.niter,
                                    schedule=args.schedule, lr=args.lr)
@@ -146,6 +153,8 @@ def run_segment(model, seg_dir, out_dir, args):
 
     os.makedirs(out_dir, exist_ok=True)
     write_video(os.path.join(out_dir, "input.mp4"), imgs_np, fps=args.fps)
+    dump_seq_npz(os.path.join(out_dir, "seq.npz"), depths, Ks, Es, imgs_np,
+                 frames=np.array([os.path.basename(p) for p in paths]))
 
     stem = os.path.join(out_dir, "cloud")
     n_pts = save_cloud(stem, depths, Ks, Es, imgs_np, args.max_points, args.depth_pct)
@@ -167,7 +176,10 @@ def main():
                     help="truncate each segment to the first N frames (0=all)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--niter",    type=int,   default=300)
-    ap.add_argument("--schedule", default="cosine", choices=["cosine", "linear"])
+    ap.add_argument("--schedule", default="linear", choices=["cosine", "linear"])
+    ap.add_argument("--scene_graph", default="swinstride-5-noncyclic")
+    ap.add_argument("--no_video_opts", action="store_true",
+                    help="bare DUSt3R-style alignment; only to reproduce the old numbers")
     ap.add_argument("--lr",       type=float, default=0.01)
     ap.add_argument("--max_points", type=int, default=8_000_000)
     ap.add_argument("--fps",      type=float, default=10.0)

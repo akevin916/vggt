@@ -3,14 +3,15 @@
 Shared geometry for the L_ego_flow training loss (`loss.compute_ego_flow_loss`). The
 formulation is MonST3R's `warp_by_disp` (`reference/monst3r/dust3r/utils/goem_opt.py:196`,
 `use_depth=False` branch); what differs downstream is the *target* — see
-`docs/monst3r_design.md`.
+`docs/topics/monst3r_design.md`.
 
 Why a module rather than an import from `diag/`: `loss.py` is training-layer code and must
 not depend on the diagnostic scripts (CLAUDE.md layering). `diag/flow_loss_probe.py` and
-`diag/flow_pose_headroom.py` keep their own private copies of this geometry ON PURPOSE —
-the numbers they produced are published in docs/table.md and must stay reproducible from
-the code that produced them. If this file is ever changed, cross-check against the probe
-(verification step 2 of the port plan) instead of editing the probe to match.
+`diag/flow_pose_headroom.py` kept their own private copies of this geometry ON PURPOSE —
+the numbers they produced are published in docs/results/natural.md and had to stay reproducible
+from the code that produced them. BOTH PROBES WERE REMOVED 2026-08-19 in the diag cleanup, so
+that cross-check is no longer runnable; the published numbers stand on their own and this file
+is now the single copy of the geometry.
 """
 
 from functools import lru_cache
@@ -81,8 +82,8 @@ def ego_flow_from_disp(
     the scene (scale by s -> disp becomes disp/s, t becomes s*t). So a flow computed
     entirely from predicted quantities and one computed entirely from GT quantities are
     directly comparable in pixels with NO scale alignment — as long as neither is mixed.
-    Mixing (GT depth with predicted translation, say) is what needs a scale factor; see
-    `diag/flow_loss_probe.py`'s mixed variants.
+    Mixing (GT depth with predicted translation, say) is what needs a scale factor; this was
+    measured by `diag/flow_loss_probe.py`'s mixed variants (removed 2026-08-19).
 
     Args:
         R_rel: (P, 3, 3) cam_src -> cam_tgt rotation

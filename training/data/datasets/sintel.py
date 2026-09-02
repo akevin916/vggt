@@ -15,7 +15,7 @@
 #   "none"    — motion_mask absent (ComposedDataset zero-fills). Use when only ATE/depth matter;
 #               gate BCE would then be measured against an all-static label (not meaningful).
 #   "gt_flow" — per-frame flow-residual mask m*(t) = 1[‖f^gt(t→t+1) − f^ego(t→t+1)‖ > motion_thr]
-#               (§5.3a) built from Sintel GT flow (not RAFT) + ego-flow from GT depth+pose. This
+#               (§3.4 (m_geo)) built from Sintel GT flow (not RAFT) + ego-flow from GT depth+pose. This
 #               is the cleanest possible label — the same signal the oracle gate ablation uses.
 #               The last frame of each sequence (no GT flow) and invalid-depth pixels are static.
 #
@@ -119,7 +119,7 @@ class SintelDataset(BaseDataset):
         return K.astype(np.float32), ext_w2c.astype(np.float32)
 
     def _gt_flow_mask(self, store, fid, depth_raw, K, w2c_cur, hw):
-        # Per-frame GT-flow residual dynamic mask (§5.3a). Native res. All-static for the last
+        # Per-frame GT-flow residual dynamic mask (§3.4 (m_geo)). Native res. All-static for the last
         # frame (no GT flow) or when dynamic_source != gt_flow. Invalid-depth pixels are static.
         if self.dynamic_source != "gt_flow":
             return np.zeros(hw, dtype=np.float32)

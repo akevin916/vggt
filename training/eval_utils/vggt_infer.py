@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -27,14 +27,16 @@ def load_vggt_for_eval(
     require_gate: bool = False,
     force_gate: bool = False,
     force_point: bool = False,
+    gate_leaky: float = 0.0,
+    gate_bias_zero_ref: bool = False,
     verbose: bool = True,
 ) -> VGGT:
     """Build VGGT with architecture inferred from checkpoint keys.
 
     Each head/block family is detected independently from its own key prefix, so any
-    combination (e.g. v3's pose-only oracle-gate ablation: temporal + camera, no gate,
+    combination (e.g. the pose-only oracle-gate ablation: temporal + camera, no gate,
     no depth/point/motion/flow) reconstructs correctly -- not just the three presets
-    (plain VGGT / v1-v2 dyn / v3 gate) this used to special-case.
+    (plain VGGT / v1-v2 dyn / gate) this used to special-case.
     """
     sd = _load_state_dict(ckpt)
     keys = list(sd.keys())
@@ -44,12 +46,10 @@ def load_vggt_for_eval(
     has_gate = any("gate_predictor" in k for k in keys) or force_gate
     has_temporal = any("temporal" in k for k in keys)
     has_depth = any(k.startswith("depth_head") for k in keys)
-    # force_point: same idea for the point head, which the v3 configs disable entirely
+    # force_point: same idea for the point head, which the gate configs disable entirely
     # (method §7.2). The head is then random-init and only useful once real weights are
     # grafted in -- see graft_point_head.
     has_point = any(k.startswith("point_head") for k in keys) or force_point
-    has_motion = any(k.startswith("motion_head") for k in keys)
-    has_flow = any(k.startswith("flow_head") for k in keys)
 
     if require_gate and not has_gate:
         raise SystemExit(f"checkpoint has no gate_predictor weights: {ckpt}")
@@ -61,10 +61,10 @@ def load_vggt_for_eval(
         enable_point=has_point,
         enable_track=False,
         enable_temporal=has_temporal,
-        enable_motion=has_motion,
-        enable_flow=has_flow,
         enable_gate=has_gate,
         gate_block_iter=gate_block_iter,
+        gate_leaky=gate_leaky,
+        gate_bias_zero_ref=gate_bias_zero_ref,
     )
     miss, unexp = model.load_state_dict(sd, strict=False)
     if verbose:
@@ -82,10 +82,10 @@ def load_vggt_for_eval(
 def graft_point_head(model: VGGT, donor_ckpt: str, verbose: bool = True) -> VGGT:
     """Load ``point_head`` weights from ``donor_ckpt`` into an already-built model.
 
-    Lets a v3 checkpoint -- which never builds a point head -- borrow the pretrained
+    Lets a gate-method checkpoint -- which never builds a point head -- borrow the pretrained
     VGGT-1B one. Build ``model`` with ``force_point=True`` first.
 
-    ⚠️ The grafted head reads trunk features it was never trained on: the v3 S1 runs
+    ⚠️ The grafted head reads trunk features it was never trained on: the gate-method S1 runs
     train global blocks 8-23, so the aggregator has drifted from what the donor head saw.
     Treat its output as indicative, not as the point head's true quality on that trunk.
     (The frozen depth_head survives the same drift -- AbsRel 0.2747 -> 0.2136 on run1 --
@@ -106,37 +106,6 @@ def graft_point_head(model: VGGT, donor_ckpt: str, verbose: bool = True) -> VGGT
     return model
 
 
-def load_dyn_vggt(
-    ckpt: str,
-    img_size: int = 518,
-    temporal: bool = True,
-    motion: bool = True,
-    flow: bool = True,
-    device: str = "cuda",
-) -> VGGT:
-    model = VGGT(
-        img_size=img_size,
-        enable_camera=True,
-        enable_depth=True,
-        enable_point=True,
-        enable_track=False,
-        enable_temporal=temporal,
-        enable_motion=motion,
-        enable_flow=flow,
-    )
-    sd = _load_state_dict(ckpt)
-    model.load_state_dict(sd, strict=False)
-    return model.to(device).eval()
-
-
-def variant_flags(variant: str) -> Tuple[bool, bool, bool]:
-    if variant == "vggt_base":
-        return False, False, False
-    if variant in ("s0", "dyn_vggt_s0"):
-        return True, True, True
-    raise ValueError(f"Unknown variant: {variant}")
-
-
 @torch.no_grad()
 def infer_sequence(
     model: VGGT,
@@ -145,17 +114,26 @@ def infer_sequence(
     dtype: Optional[torch.dtype] = None,
     gate_logits_override: Optional[torch.Tensor] = None,
     want_point: bool = False,
+    images: Optional[torch.Tensor] = None,
 ) -> Dict[str, np.ndarray]:
     """Run VGGT on one sequence.
 
     ``want_point`` opts in to returning the point head's ``world_points`` /
     ``world_points_conf``. It is off by default because those are [S,H,W,3] fp32
     arrays (~160 MB for a 50-frame Sintel sequence) that only diag/pnp_pose.py wants.
+
+    ``images`` bypasses loading and runs on an already-preprocessed [S,3,H,W] (or
+    [1,S,3,H,W]) tensor instead, so a caller can perturb the pixels first --
+    diag/washout_impact.py injects saturated blobs this way. ``image_paths`` is then
+    only used for its length, and passing an image tensor whose geometry differs from
+    what those paths would have produced silently invalidates every GT correspondence.
     """
     if dtype is None:
         dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
-    images = load_and_preprocess_images(image_paths, mode="crop").to(device)
+    if images is None:
+        images = load_and_preprocess_images(image_paths, mode="crop")
+    images = images.to(device)
     if images.dim() == 4:
         images = images.unsqueeze(0)
 
@@ -171,7 +149,7 @@ def infer_sequence(
         "pose_enc": pred["pose_enc"].squeeze(0).float().cpu().numpy(),
         "input_hw": np.array([h, w], dtype=np.int32),
     }
-    # Pose-only checkpoints (e.g. the v3 oracle-camera-only ablation) have no depth_head.
+    # Pose-only checkpoints (e.g. the oracle-camera-only ablation) have no depth_head.
     if "depth" in pred:
         depth = pred["depth"]
         if depth.ndim == 5 and depth.shape[-1] == 1:

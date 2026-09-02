@@ -55,6 +55,7 @@ from data.paths import data_path
 from eval_utils.media_io import write_video
 from eval_utils.paths import default_output_dir
 from eval_utils.ply_io import write_ply
+from eval_utils.seq_io import dump_seq_npz
 
 TOOL = "eval_lesion"          # same bucket as VGGT eval so outputs sit together
 MODEL_SUBDIR = "MonST3R"
@@ -147,15 +148,60 @@ def load_model(ckpt, device):
     return model
 
 
-def run_monst3r_sequence(model, img_paths, device, niter, schedule, lr):
-    """Pairwise inference + global alignment → returns the optimised scene."""
+# MonST3R's video settings, copied from its own demo.py (the defaults passed at
+# reference/monst3r/demo.py:424-447). These are NOT the optimizer's defaults: without them
+# flow_loss_weight, temporal_smoothing_weight and use_self_mask are all off, the total loss
+# in cloud_opt/optimizer.py collapses to DUSt3R's pairwise reprojection term, and what runs
+# is DUSt3R with MonST3R weights -- every part of the method that handles video is disabled.
+# Measured consequence of running it that way on the lesion clips: MonST3R's camera
+# trajectory came out 4-18x longer relative to scene depth than VGGT's, i.e. the trajectory
+# drifted, which is exactly what the flow and smoothing terms exist to prevent.
+MONST3R_VIDEO_OPTS = dict(
+    shared_focal=True,
+    temporal_smoothing_weight=0.01,
+    translation_weight=1.0,
+    flow_loss_weight=0.01,
+    flow_loss_start_epoch=0.1,
+    flow_loss_thre=25,
+    use_self_mask=True,
+    # Two deviations from demo.py, both forced by what is on disk in reference/monst3r:
+    #   sintel_ckpt=True  -> RAFT-sintel, because the SEA-RAFT weights the flow loss reaches
+    #                        for by default (Tartan-C-T-TSKH-spring540x960-M.pth) are absent.
+    #   sam2_mask_refine=False -> the SAM2 refinement of the motion mask needs
+    #                        third_party/sam2/checkpoints/sam2.1_hiera_large.pt, also absent.
+    sintel_ckpt=True,
+    sam2_mask_refine=False,
+    # batchify=False is a third deviation, forced by this card. Batchified alignment warps
+    # the ego-flow for every pair in one go; at 60 square 512x512 frames that OOMs a 32 GB
+    # 5090 inside warp_by_disp (measured). The per-pair loop computes the same loss with a
+    # far smaller peak, at the cost of speed. empty_cache follows demo.py's intent (it turns
+    # this on past 72 frames) but is on unconditionally here for the same headroom reason.
+    batchify=False,
+    empty_cache=True,
+)
+
+
+def run_monst3r_sequence(model, img_paths, device, niter, schedule, lr,
+                         scene_graph="swinstride-5-noncyclic", video_opts=True):
+    """Pairwise inference + global alignment → returns the optimised scene.
+
+    ``scene_graph`` matters once the folder stops being a slideshow: "complete" is
+    O(N^2) pairs, fine for the 12-19 shipped frames but 4032 pairs at 64, which neither
+    fits nor finishes. "swinstride-5-noncyclic" is the sliding window demo.py builds for
+    video, and is the default here for the same reason.
+
+    ``video_opts=False`` restores the bare DUSt3R-style alignment, kept only so the old
+    numbers can be reproduced.
+    """
     imgs = load_images(img_paths, size=512, verbose=False)
-    pairs = make_pairs(imgs, scene_graph="complete", prefilter=None, symmetrize=True)
+    pairs = make_pairs(imgs, scene_graph=scene_graph, prefilter=None, symmetrize=True)
     output = inference(pairs, model, device, batch_size=1, verbose=False)
+    opts = dict(MONST3R_VIDEO_OPTS, num_total_iter=niter) if video_opts else {}
     scene = global_aligner(
         output, device=device,
         mode=GlobalAlignerMode.PointCloudOptimizer,
         verbose=False,
+        **opts,
     )
     scene.compute_global_alignment(init="mst", niter=niter,
                                    schedule=schedule, lr=lr)
@@ -228,14 +274,19 @@ def run_folder(model, folder_dir, out_dir, args):
     paths  = [os.path.join(folder_dir, n) for n in names]
 
     print(f"  {os.path.basename(folder_dir)}: {len(paths)} frames, "
-          f"niter={args.niter}")
+          f"niter={args.niter}, scene_graph={args.scene_graph}")
 
     scene, imgs_raw = run_monst3r_sequence(
-        model, paths, args.device, args.niter, args.schedule, args.lr)
+        model, paths, args.device, args.niter, args.schedule, args.lr,
+        scene_graph=args.scene_graph, video_opts=not args.no_video_opts)
     depths, Ks, Es, imgs_np = scene_to_arrays(scene, imgs_raw, args.device)
 
     os.makedirs(out_dir, exist_ok=True)
     write_video(os.path.join(out_dir, "input.mp4"), imgs_np, fps=args.fps)
+    # seq.npz as well as the cloud: without it this arm cannot be drawn by the polished
+    # renderer that the VGGT arms use, and a 2x2 comparison would be mixing two renderers.
+    dump_seq_npz(os.path.join(out_dir, "seq.npz"), depths, Ks, Es, imgs_np,
+                 frames=np.array(names))
 
     info = dict(n_frames=len(paths), niter=args.niter)
     stem = os.path.join(out_dir, "cloud")
@@ -265,9 +316,15 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--niter",    type=int,   default=300,
                     help="global alignment optimisation steps (seq mode only)")
-    ap.add_argument("--schedule", default="cosine",
+    ap.add_argument("--schedule", default="linear",
                     choices=["cosine", "linear"])
     ap.add_argument("--lr",       type=float, default=0.01)
+    ap.add_argument("--scene_graph", default="swinstride-5-noncyclic",
+                    help="pair graph for seq mode; demo.py's video default. 'complete' is "
+                         "O(N^2) and only viable for the shipped ~15-frame folders")
+    ap.add_argument("--no_video_opts", action="store_true",
+                    help="run the bare DUSt3R-style alignment instead of MonST3R's video "
+                         "settings -- only to reproduce the old numbers")
     ap.add_argument("--max_points", type=int, default=8_000_000)
     ap.add_argument("--fps",      type=float, default=4.0)
     ap.add_argument("--depth_pct", type=float, default=99.0)
