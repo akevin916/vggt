@@ -63,7 +63,7 @@ if L_flow > flow_loss_thre:  L_flow = 0                      ← 太大就整段
 - ⚠️ 「整段不用」是 Python `>` 比較，而 `nan > thre` 為 False → **NaN 擋不住**（分母為 0 時可達）
 
 ### Dyn-VGGT `compute_static_photo_loss`
-[loss.py:488-591](../../training/loss.py#L488-L591)
+[loss.py:488-591](../../pipeline/training/loss.py#L488-L591)
 
 ```
 X_t     = K_gt⁻¹·ũ · D_gt                                    ← GT 深度反投影（相機 t 座標系）
@@ -72,7 +72,7 @@ u'      = π( R_rel·X_t + t_rel )                             ← 預測相對�
 L       = Huber( I_{t+1}(u') − I_t(u) , δ=0.1 )              ← RGB 強度差
 ```
 
-程式碼分成 cam_t → world → cam_{t+1} 兩步走（[loss.py:555-556](../../training/loss.py#L555-L556)），
+程式碼分成 cam_t → world → cam_{t+1} 兩步走（[loss.py:555-556](../../pipeline/training/loss.py#L555-L556)），
 和上式等價。**真正影響 loss 的只有相對位姿** —— 整段軌跡一起平移旋轉，這個 loss 不會變。
 
 - 幾何量：**只有 pose 是預測的**，depth / K / 影像皆為常數
@@ -110,7 +110,7 @@ L_temp = Σ_t [ ‖R_rel − I‖_F  +  w_t·‖t_rel‖₂ ]              w_t =
 **一階** —— 懲罰相鄰幀的**運動本身**，隱含先驗是「相機幾乎不動」，等速運動亦受罰。
 
 ### Dyn-VGGT `compute_camera_smooth_loss`
-[loss.py:594-681](../../training/loss.py#L594-L681)
+[loss.py:594-681](../../pipeline/training/loss.py#L594-L681)
 
 ```
 v    = (T_{t+1} − T_t) / Δt                     Δt 由 batch["ids"] 給（真實幀號差）
@@ -161,7 +161,7 @@ mask = mask ∨ SAM2_mask                                      ← 預設開啟�
   多 pair 平均後才有機會全部低於 0.35。全靜態場景還是容易憑空生出動態區。
 
 ### Dyn-VGGT `compute_gate_loss` —— 可學模組，且回饋進架構
-[loss.py:702-757](../../training/loss.py#L702-L757)
+[loss.py:702-757](../../pipeline/training/loss.py#L702-L757)
 
 ```
 m*_patch = adaptive_avg_pool2d( motion_mask , patch grid )

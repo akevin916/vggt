@@ -16,13 +16,13 @@ gate 前向 bug 修正 = commit `e064087`（2026-07-09 12:17）。**修正是 co
 
 | 位置 | 世代 | 內容 |
 |---|---|---|
-| `training/logs/inst_g/` | ✅ **clean** | run 1，24 epoch。`gate_sweep`/`gate_sweep_scales`/`gate_quality`/`gate_bias_ablation`/`pose_eval` |
-| `training/logs/inst_g_hard/` | ✅ clean | 只有 3 epoch |
-| `training/logs/train/*/` | ✅ clean | 07-13 評測 harness：`VGGT-1B` / `dyn_vggt_v3_s0_inst` / `inst_g` / `s1_buggy` |
-| `training/logs/inst_g_buggy/` | ❌ buggy | 專門保留作對照 |
+| `logs/inst_g/` | ✅ **clean** | run 1，24 epoch。`gate_sweep`/`gate_sweep_scales`/`gate_quality`/`gate_bias_ablation`/`pose_eval` |
+| `logs/inst_g_hard/` | ✅ clean | 只有 3 epoch |
+| `logs/train/*/` | ✅ clean | 07-13 評測 harness：`VGGT-1B` / `dyn_vggt_v3_s0_inst` / `inst_g` / `s1_buggy` |
+| `logs/inst_g_buggy/` | ❌ buggy | 專門保留作對照 |
 | `outputs/train/*/` | ❌ **buggy** | photo / smooth_temporal / oracle_cam 的 Sintel 數字全在這 |
 | `archive/logs/v3_bug/` | ❌ buggy | |
-| `training/logs/inst_gtsp_buginit/` | ❌ buggy-init | lineage 不乾淨，已棄 |
+| `logs/inst_gtsp_buginit/` | ❌ buggy-init | lineage 不乾淨，已棄 |
 
 **checkpoint 更名**：`dyn_vggt_v3_s1.pt` == `archive/checkpoints/dyn_vggt_v3_s1_inst.pt`（歸檔時更名）。
 同一模式：`dyn_vggt_v3_oracle.pt` ← `oracle_camera_only` run。
@@ -64,7 +64,7 @@ gate 前向 bug 修正 = commit `e064087`（2026-07-09 12:17）。**修正是 co
 
 | 項目 | 值 |
 |---|---|
-| script | `training/benchmark/eval_sintel.py` |
+| script | `pipeline/benchmark/eval_sintel.py` |
 | 序列 | 14 seq（Sintel training split 全部） |
 | `chunk_size` | **0 = 完整序列**（非分塊） |
 | 實際幀數 | mean **45.9** frames/seq |
@@ -73,7 +73,7 @@ gate 前向 bug 修正 = commit `e064087`（2026-07-09 12:17）。**修正是 co
 | depth 指標 | `abs_rel`, `sq_rel`, `rmse`, `log_rmse`, `delta_1/2/3` |
 | ATE(12) | 14 seq 去掉 `cave_2`、`temple_3` 兩個離群值後的平均 |
 | **Δ% 基準** | **本表無 Δ%，全部為絕對值**。要比較請自行以 `VGGT-1B base` 列為分母 |
-| 資料來源 | `outputs/train/*/eval_sintel/`、`training/logs/*/pose_eval/epoch_*/`、`archive/logs/v1_train/`；v3CLEAN photo/smooth_temp 列（‡）來自 `outputs/<run>/eval_sintel/<ckpt>/`（`training/eval_three_runs.sh`，**max_depth=70**） |
+| 資料來源 | `outputs/train/*/eval_sintel/`、`logs/*/pose_eval/epoch_*/`、`archive/logs/v1_train/`；v3CLEAN photo/smooth_temp 列（‡）來自 `outputs/<run>/eval_sintel/<ckpt>/`（`eval_three_runs.sh`，**max_depth=70**） |
 
 ### 表
 
@@ -137,14 +137,14 @@ gate 前向 bug 修正 = commit `e064087`（2026-07-09 12:17）。**修正是 co
 
 | 項目 | 值 |
 |---|---|
-| script | `training/diag/gate_bias_ablation.py --dataset sintel`（2026-08-19 併入 `diag/gate_eval.py --metrics pose`，輸出佈局不變） |
+| script | `pipeline/diag/gate_bias_ablation.py --dataset sintel`（2026-08-19 併入 `diag/gate_eval.py --metrics pose`，輸出佈局不變） |
 | `max_frames` | **50**（≈ 完整序列，Sintel mean 45.9） |
 | `chunk_size` | 0 = 完整序列 |
 | `k` | 30.0 — oracle/off 的 logit 幅度，bias ≈ `−softplus(k)` |
 | `motion_thr` | 2.0 px — GT flow-residual oracle mask 閾值 |
 | 序列 | **14 seq** |
 | **Δ% 基準** | **同一列自己的 `off`**（同 ckpt、同 f50、同序列）。例：VGGT-1B oracle `+2.3%` = (0.1752 − 0.1713) / 0.1713。**不同列之間的 Δ% 分母不同，不可相減** |
-| 資料來源 | `training/logs/train/VGGT-1B/`、`training/logs/inst_g/gate_sweep/f50/`、`training/logs/inst_g_buggy/gate_sweep/f50/` |
+| 資料來源 | `logs/train/VGGT-1B/`、`logs/inst_g/gate_sweep/f50/`、`logs/inst_g_buggy/gate_sweep/f50/` |
 
 **模式定義**
 - `off` — gate bias 關閉（`enable_gate` 前向不施加 bias）
@@ -182,8 +182,8 @@ gate 前向 bug 修正 = commit `e064087`（2026-07-09 12:17）。**修正是 co
 
 | 項目 | 值 |
 |---|---|
-| script | `training/diag/gate_bias_ablation.py --dataset sintel`（2026-08-19 併入 `diag/gate_eval.py --metrics pose`，輸出佈局不變） |
-| ckpt | `training/logs/inst_g/ckpts/best.pt`（= run1 ep15） |
+| script | `pipeline/diag/gate_bias_ablation.py --dataset sintel`（2026-08-19 併入 `diag/gate_eval.py --metrics pose`，輸出佈局不變） |
+| ckpt | `logs/inst_g/ckpts/best.pt`（= run1 ep15） |
 | `chunk_size` | 0 = 完整序列（`max_frames` 只截斷序列長度，不分塊） |
 | `k` | 30.0 |
 | `motion_thr` | 2.0 px |
@@ -220,7 +220,7 @@ gate 前向 bug 修正 = commit `e064087`（2026-07-09 12:17）。**修正是 co
 
 | 項目 | 值 |
 |---|---|
-| script | `training/diag/gate_bias_ablation.py --dataset sintel`，取 `off` 模式（2026-08-19 併入 `diag/gate_eval.py --metrics pose`） |
+| script | `pipeline/diag/gate_bias_ablation.py --dataset sintel`，取 `off` 模式（2026-08-19 併入 `diag/gate_eval.py --metrics pose`） |
 | 比較對象 | `off` 模式 = 不施加 gate bias 的裸 pose，用以隔離「架構修復 + 訓練」的收益，排除 gate 本身 |
 | clean ckpt | `inst_g/ckpts/best.pt`（post-`e064087` 重訓，warm from `s0_inst.pt`） |
 | buggy ckpt | `inst_g_buggy`（pre-fix 訓練） |
@@ -268,8 +268,8 @@ oracle 模式的世代對比（同格子）：
 
 | 項目 | 值 |
 |---|---|
-| 品質來源 | `training/logs/inst_g/gate_quality/quality_f16.json` |
-| pose 來源 | `training/logs/inst_g/gate_sweep_scales/f16/results.json` |
+| 品質來源 | `logs/inst_g/gate_quality/quality_f16.json` |
+| pose 來源 | `logs/inst_g/gate_sweep_scales/f16/results.json` |
 | ckpt | `inst_g/ckpts/best.pt`（clean run1 ep15） |
 | `max_frames` | **16**（兩份對齊） |
 | `motion_thr` | 2.0 px — GT mask 由 flow-residual 導出 |
@@ -352,8 +352,8 @@ micro（132608 patch）：AUC 0.839 / F1 0.289 / p_dyn 0.274 / p_stat 0.065 / dy
 
 | 項目 | 值 |
 |---|---|
-| script | `training/benchmark/eval_sintel.py`（2026-07-22 改版，對齊 MonST3R depth 協議） |
-| Dyn-VGGT ckpt | `training/logs/inst_g/ckpts/best.pt`（= clean run1 ep15） |
+| script | `pipeline/benchmark/eval_sintel.py`（2026-07-22 改版，對齊 MonST3R depth 協議） |
+| Dyn-VGGT ckpt | `logs/inst_g/ckpts/best.pt`（= clean run1 ep15） |
 | pose 序列 | **14 seq**（`SINTEL_EVAL_SEQUENCES`） |
 | depth 序列 | **23 seq**（`final/` 全部，MonST3R `--full_seq` 口徑；共 1064 幀） |
 | depth 對齊 | **lad2** = scale+shift，Adam L1，lr=1e-4 / 1000 iters（`absolute_value_scaling2`，自 MonST3R verbatim port） |
@@ -387,7 +387,7 @@ micro（132608 patch）：AUC 0.839 / F1 0.289 / p_dyn 0.274 / p_stat 0.065 / dy
 - **Pose 分歧**：MonST3R 的 **ATE / RPE-trans 較低**（平移軌跡較準，得益於 per-seq global-alignment 優化），但 Dyn-VGGT 的 **RPE-rot 明顯更好**（0.494 vs 0.780）。**缺口是純平移的**，與表 1、表 2.3 附註一致。
 - **本機實測的 MonST3R 數字與表 1「MonST3R（目標）」列（論文抄錄：ATE 0.108 / RPE-t 0.042 / RPE-r 0.732 / AbsRel 0.345 / δ1 0.562）有小幅差異**，屬實測 vs 論文的正常落差；本表以實測為準，因為它與 Dyn-VGGT 走完全相同的序列集與對齊碼。
 - **殘留協議差異（未對齊）**：Dyn-VGGT 推論用 crop@518，MonST3R depth 用 `--no_crop`。此為模型輸入前處理、非評估方法；強制 no_crop 可能反使 VGGT 吃虧（原生 crop 訓練），故保留。
-- 對齊碼改動：`eval_utils/metrics_depth.py`（新增 `absolute_value_scaling2` + lad2/pool/加權）、`data/sintel_io.py`（`list_sintel_full_sequences`）、`benchmark/eval_sintel.py`（depth-23 / pose-14 拆分、`max_depth` 預設 70）。trainer 線上 val（`metrics_val.py`）仍走 per-frame median，未受影響。
+- 對齊碼改動：`pipeline/eval/metrics_depth.py`（新增 `absolute_value_scaling2` + lad2/pool/加權）、`data/sintel_io.py`（`list_sintel_full_sequences`）、`benchmark/eval_sintel.py`（depth-23 / pose-14 拆分、`max_depth` 預設 70）。trainer 線上 val（`metrics_val.py`）仍走 per-frame median，未受影響。
 
 ---
 

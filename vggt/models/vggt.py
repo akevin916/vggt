@@ -23,7 +23,10 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                  enable_temporal=False,
                  # motion-gated camera aggregation
                  enable_gate=False, gate_block_iter=7, gate_pose_grad=False, gate_leaky=0.0,
-                 gate_bias_zero_ref=False):
+                 gate_bias_zero_ref=False,
+                 gate_bias_scale=None, gate_bias_a=1.0, gate_bias_tau=0.0, gate_bias_learn=False,
+                 enable_dual_stream=False, dual_stream_scope="camera", dual_stream_start=8,
+                 dual_stream_init=0.01):
         super().__init__()
 
         # NEW: enable_temporal injects temporal attention into the aggregator (aa_order gains "temporal").
@@ -33,6 +36,10 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             enable_gate=enable_gate, gate_block_iter=gate_block_iter,
             gate_pose_grad=gate_pose_grad, gate_leaky=gate_leaky,
             gate_bias_zero_ref=gate_bias_zero_ref,
+            gate_bias_scale=gate_bias_scale, gate_bias_a=gate_bias_a, gate_bias_tau=gate_bias_tau,
+            gate_bias_learn=gate_bias_learn,
+            enable_dual_stream=enable_dual_stream, dual_stream_scope=dual_stream_scope,
+            dual_stream_start=dual_stream_start, dual_stream_init=dual_stream_init,
         )
 
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None

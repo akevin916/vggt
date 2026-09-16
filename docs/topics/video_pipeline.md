@@ -92,5 +92,5 @@ MonST3R 略快是因為它的 depth 有效像素比較少（512×512 對 518×51
 | SCARED ds2 | `val/dataset2/keyframe3` | 開頭 64 幀 | 64 | azim 0 / elev 12 |
 
 擺動一律 `azim ±60 / elev ±40`，`--dist 0.9`，`--scale_norm --no_progress --frame_pct 2`。
-SCARED 用的是 **val**（模型選擇集，`pose_eval.split: val` 挑出 best_ate.pt），不是 test；
-真正 held-out 且對應論文 pose 表的是 `pose_seq/dataset{3,5}/keyframe4`。
+SCARED 用的是 **val**（模型選擇集，`pose_eval.split: val` 挑出 best_ate.pt），不是 test/depth 或 test/pose；
+真正 held-out 且對應論文 pose 表的是 `test/pose/dataset{3,5}/keyframe4`。

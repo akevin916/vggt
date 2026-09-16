@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from vggt.utils.pose_enc import extri_intri_to_pose_encoding, pose_encoding_to_extri_intri
 from pipeline.training.train_utils.general import check_and_fix_inf_nan
 from pipeline.training.ego_flow import ego_flow_from_disp, pixel_grid, relative_w2c
+from pipeline.training.flow_mask import pair_flows
 from math import ceil, floor
 
 
@@ -32,6 +33,9 @@ class MultitaskLoss(torch.nn.Module):
     def __init__(self, camera=None, depth=None, point=None, track=None,
                  gate=None,    # gate: motion-gate BCE (docs/method.md §3.4)
                  static_photo=None,   # Extension: static-region photometric consistency ("route B")
+                 self_photo=None,     # self-supervised photometric reprojection (predicted depth + pose)
+                 smooth=None,         # edge-aware disparity smoothness (pairs with self_photo)
+                 flow_geom=None,      # cross-frame 3D consistency via RAFT correspondence (ColonAdapter)
                  camera_smooth=None,  # Extension: camera-trajectory smoothness regularizer
                  ego_flow=None,       # Extension: pixel-space ego-flow reprojection consistency
                  influence=None,      # illumination robustness: cross-view appearance influence loss
@@ -44,6 +48,9 @@ class MultitaskLoss(torch.nn.Module):
         self.track = track
         self.gate = gate          # gate: gate-predictor BCE against GT dynamic mask
         self.static_photo = static_photo   # Extension: static-region photometric consistency
+        self.self_photo = self_photo       # self-supervised photometric reprojection (no GT)
+        self.smooth = smooth               # edge-aware disparity smoothness
+        self.flow_geom = flow_geom         # cross-frame 3D consistency via RAFT correspondence
         self.camera_smooth = camera_smooth  # Extension: camera-trajectory smoothness regularizer
         self.ego_flow = ego_flow  # Extension: ego-flow reprojection consistency (MonST3R geometry, GT target)
         self.influence = influence  # L_inf -- bound one view's appearance influence on the others
@@ -102,6 +109,30 @@ class MultitaskLoss(torch.nn.Module):
             photo_loss_dict = compute_static_photo_loss(predictions, batch, **self.static_photo)
             total_loss = total_loss + photo_loss_dict["loss_static_photo"] * self.static_photo.get("weight", 1.0)
             loss_dict.update(photo_loss_dict)
+
+        # Self-supervised photometric reprojection: predicted depth + predicted pose warp a
+        # neighbouring frame onto this one and must reproduce real pixel content. Needs the depth
+        # head live (it is half the geometry) and GT intrinsics; needs NO pose/depth annotation.
+        # Pair it with `loss.smooth` -- without the smoothness prior the depth head is free to
+        # produce texture-copied garbage in low-gradient regions.
+        if self.self_photo is not None and "pose_enc_list" in predictions and "depth" in predictions:
+            sp_dict = compute_self_photo_loss(predictions, batch, **self.self_photo)
+            total_loss = total_loss + sp_dict["loss_self_photo"] * self.self_photo.get("weight", 1.0)
+            loss_dict.update(sp_dict)
+
+        # Edge-aware smoothness on mean-normalised disparity. Only meaningful when the depth head
+        # is trainable; harmless (constant) otherwise.
+        if self.smooth is not None and "depth" in predictions:
+            sm_dict = compute_smooth_loss(predictions, batch, **self.smooth)
+            total_loss = total_loss + sm_dict["loss_smooth"] * self.smooth.get("weight", 1.0)
+            loss_dict.update(sm_dict)
+
+        # Cross-frame 3D consistency through RAFT correspondence (ColonAdapter geometry_loss).
+        # Shares its RAFT evaluations with self_photo's flow mask via batch["_flow_cache"].
+        if self.flow_geom is not None and "pose_enc_list" in predictions and "depth" in predictions:
+            fg_dict = compute_flow_geom_loss(predictions, batch, **self.flow_geom)
+            total_loss = total_loss + fg_dict["loss_flow_geom"] * self.flow_geom.get("weight", 1.0)
+            loss_dict.update(fg_dict)
 
         # Extension: camera-trajectory smoothness regularizer — penalises 2nd-order (acceleration)
         # jumps in the PREDICTED T/quaternion sequence, Δt-normalised by real frame-index gaps
@@ -451,6 +482,336 @@ def compute_static_photo_loss(predictions, batch, huber_delta=0.1, dyn_thresh=0.
     if n_pairs == 0:
         return {"loss_static_photo": (0.0 * pose_enc).mean()}
     return {"loss_static_photo": total_loss / n_pairs}
+
+
+def _ssim(x, y):
+    """Monodepth2's 3x3 SSIM (avg_pool, reflection pad), returned as the dissimilarity
+    (1 - SSIM) / 2 clamped to [0, 1]. Shapes (N, C, H, W) -> (N, C, H, W)."""
+    C1, C2 = 0.01 ** 2, 0.03 ** 2
+    xp = F.pad(x, (1, 1, 1, 1), mode="reflect")
+    yp = F.pad(y, (1, 1, 1, 1), mode="reflect")
+    mu_x = F.avg_pool2d(xp, 3, 1)
+    mu_y = F.avg_pool2d(yp, 3, 1)
+    sigma_x = F.avg_pool2d(xp * xp, 3, 1) - mu_x ** 2
+    sigma_y = F.avg_pool2d(yp * yp, 3, 1) - mu_y ** 2
+    sigma_xy = F.avg_pool2d(xp * yp, 3, 1) - mu_x * mu_y
+    ssim_n = (2 * mu_x * mu_y + C1) * (2 * sigma_xy + C2)
+    ssim_d = (mu_x ** 2 + mu_y ** 2 + C1) * (sigma_x + sigma_y + C2)
+    return ((1 - ssim_n / ssim_d) / 2).clamp(0, 1)
+
+
+def _photometric_error(pred, target, alpha_ssim=0.85):
+    """pe(a, b) = alpha * SSIM_dissim + (1 - alpha) * L1, averaged over channels.
+    Shapes (N, 3, H, W) -> (N, H, W)."""
+    l1 = (pred - target).abs().mean(1)
+    if alpha_ssim <= 0:
+        return l1
+    return alpha_ssim * _ssim(pred, target).mean(1) + (1 - alpha_ssim) * l1
+
+
+def _affine_match(src, ref, mask):
+    """Closed-form per-image affine brightness match src -> ref over `mask` (N,H,W bool).
+    a, b are DETACHED: they correct the appearance gap without giving the network a way to
+    explain a geometric residual away. Shapes (N,3,H,W) -> (N,3,H,W)."""
+    m = mask[:, None].to(src.dtype)
+    cnt = m.sum(dim=(2, 3), keepdim=True).clamp(min=1.0)
+    mu_s = (src * m).sum(dim=(2, 3), keepdim=True) / cnt
+    mu_r = (ref * m).sum(dim=(2, 3), keepdim=True) / cnt
+    sd_s = ((((src - mu_s) ** 2) * m).sum(dim=(2, 3), keepdim=True) / cnt).clamp(min=0).sqrt()
+    sd_r = ((((ref - mu_r) ** 2) * m).sum(dim=(2, 3), keepdim=True) / cnt).clamp(min=0).sqrt()
+    a = ((sd_r + 1e-4) / (sd_s + 1e-4)).clamp(0.5, 2.0).detach()
+    b = (mu_r - a * mu_s).detach()
+    return (a * src + b).clamp(0.0, 1.0)
+
+
+def compute_self_photo_loss(predictions, batch, src_offsets=(-1, 1), alpha_ssim=0.85,
+                            auto_mask=True, brightness_affine=True, min_valid=100,
+                            mask_mode="auto", conf_alpha=None, conf_mix=0.9,
+                            symmetric_brightness=False, flow_proc=256, occ_thresh=0.95,
+                            **kwargs):
+    """Self-supervised photometric reprojection: the model's OWN depth warped by the model's
+    OWN pose must reproduce the neighbouring frames' real pixel content.
+
+    This is the label-free sibling of compute_static_photo_loss. The difference is not
+    cosmetic: that one back-projects with GT depth inside the GT static mask, so it needs
+    annotation and only trains the camera head; this one back-projects with the PREDICTED
+    depth, so gradient reaches the depth head too and nothing but the images and the (known)
+    intrinsics is required. GT intrinsics are still used -- calibration is always available in
+    practice and using them leaks neither pose nor depth.
+
+    Terms, following Monodepth2:
+      * per-pixel MINIMUM over source frames rather than an average. Averaging makes every
+        pixel that is occluded in one source frame carry an irreducible error that pushes
+        depth the wrong way; the min lets each pixel pick the frame that can actually see it.
+      * auto-masking: a pixel is dropped when the warp does not beat the identity
+        (pe(I_i, I_hat) >= pe(I_i, I_j)), which removes pixels the camera motion cannot
+        explain -- a still camera, or content moving with it.
+      * per-pair affine brightness alignment (endoscopy-specific, on by default): the light
+        source travels with the scope so brightness constancy is violated frame to frame.
+        a, b are closed-form from the valid pixels' mean/std and DETACHED, so they correct the
+        appearance gap without giving the network a way to explain the residual away.
+
+    ColonAdapter-derived options (all default OFF, so scared_selfsup / _sm05 reproduce exactly;
+    see reference/ColonAdapter/trainer.py):
+      * mask_mode="flow": replace the auto-mask with RAFT backward-flow coverage
+        (pipeline/training/flow_mask.py). A target pixel no source pixel maps onto is treated as
+        unseen in that source and gets +inf cost for it, so the per-pixel min picks a source that
+        can see it. The auto-mask test is skipped entirely in this mode.
+      * conf_alpha: confidence-weighted error using the depth head's `depth_conf`,
+            L = conf_mix * mean(conf * e - conf_alpha * log conf) + (1 - conf_mix) * mean(e).
+        ColonAdapter uses alpha 0.2 with a 0.9/0.1 mix. The unweighted (1 - conf_mix) floor is
+        kept on purpose: docs/status.md §B.3 traces a failed depth arm to exactly this
+        -alpha*log(c) term, so alpha should stay low (0.05) and the floor should stay.
+      * symmetric_brightness: also affine-match the UN-warped source before the auto-mask
+        comparison. Without it the warped branch alone gets a brightness correction and the
+        auto-mask is biased toward keeping pixels. Only affects mask_mode="auto".
+
+    GAUGE. Reprojection is invariant to (D, t) -> (sD, st), so global scale carries no
+    gradient; depth and translation are divided by the window's mean depth here purely to keep
+    the numerics in a fixed range. The unnormalised mean disparity is reported as `disp_mean`
+    precisely because the normalisation would otherwise hide a collapse (depth -> infinity
+    degenerates the warp into a pure rotation, which small-parallax endoscopy is prone to).
+
+    Returns loss_self_photo plus three diagnostics that are the actual early-warning signals:
+    disp_mean (collapse), photo_valid_frac (how much of the image the loss still sees), and
+    traj_len_ratio (predicted trajectory length / GT, when GT extrinsics are in the batch --
+    this model is known to under-predict SCARED travel by ~47x, and photometric is the only
+    term that can see that error).
+    """
+    pose_enc = predictions["pose_enc_list"][-1]                # (B, S, 9)
+    images = batch["images"]                                   # (B, S, 3, H, W), [0, 1]
+    intr = batch["intrinsics"]                                 # (B, S, 3, 3), GT
+    B, S, _, H, W = images.shape
+
+    offsets = [int(o) for o in src_offsets if int(o) != 0]
+    if S < 2 or not offsets:
+        return {"loss_self_photo": (0.0 * pose_enc).mean()}
+
+    depth = check_and_fix_inf_nan(predictions["depth"][..., 0], "self_photo_depth")  # (B,S,H,W)
+    depth = depth.clamp(min=1e-6)
+    scale = depth.mean(dim=(1, 2, 3), keepdim=True).clamp(min=1e-6)     # (B,1,1,1)
+    depth_n = depth / scale
+
+    extrinsics, _ = pose_encoding_to_extri_intri(pose_enc, (H, W), build_intrinsics=False)
+    R = extrinsics[..., :3, :3]                                 # (B, S, 3, 3)
+    T = extrinsics[..., :3, 3] / scale[..., 0]                  # (B, S, 3), same gauge as depth_n
+
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=images.device, dtype=images.dtype),
+        torch.arange(W, device=images.device, dtype=images.dtype),
+        indexing="ij",
+    )
+
+    if mask_mode not in ("auto", "flow"):
+        raise ValueError(f"mask_mode must be 'auto' or 'flow', got {mask_mode!r}")
+    flows = pair_flows(batch, offsets, proc=flow_proc, occ_thresh=occ_thresh) if mask_mode == "flow" else None
+
+    inf = torch.finfo(images.dtype).max
+    cost = images.new_full((len(offsets), B, S, H, W), inf)     # warped error
+    ident = images.new_full((len(offsets), B, S, H, W), inf)    # unwarped error (auto-mask)
+    ok = torch.zeros((len(offsets), B, S, H, W), dtype=torch.bool, device=images.device)
+
+    for k, off in enumerate(offsets):
+        tgt = torch.arange(max(0, -off), min(S, S - off), device=images.device)
+        if tgt.numel() == 0:
+            continue
+        src = tgt + off
+        n = tgt.numel()
+
+        def flat(x, idx):                      # (B, S, ...) -> (B*n, ...)
+            return x[:, idx].reshape(B * n, *x.shape[2:])
+
+        img_t = flat(images, tgt)              # (N, 3, H, W)
+        img_s = flat(images, src)
+        D_t = flat(depth_n, tgt)               # (N, H, W)
+        K_t, K_s = flat(intr, tgt), flat(intr, src)
+        R_t, R_s = flat(R, tgt), flat(R, src)
+        T_t, T_s = flat(T, tgt), flat(T, src)
+        N = B * n
+
+        fx = K_t[:, 0, 0][:, None, None]; cx = K_t[:, 0, 2][:, None, None]
+        fy = K_t[:, 1, 1][:, None, None]; cy = K_t[:, 1, 2][:, None, None]
+        pts = torch.stack([(xx[None] - cx) / fx * D_t,
+                           (yy[None] - cy) / fy * D_t,
+                           D_t], dim=-1).reshape(N, H * W, 3)
+
+        # target camera -> source camera (column convention: X_cam = R X_world + T)
+        R_rel = torch.bmm(R_s, R_t.transpose(1, 2))
+        t_rel = T_s - torch.bmm(R_rel, T_t[..., None])[..., 0]
+        pts_s = torch.bmm(pts, R_rel.transpose(1, 2)) + t_rel[:, None, :]
+        pts_s = pts_s.reshape(N, H, W, 3)
+
+        Z = pts_s[..., 2]
+        Zc = Z.clamp(min=1e-4)
+        u = K_s[:, 0, 0][:, None, None] * pts_s[..., 0] / Zc + K_s[:, 0, 2][:, None, None]
+        v = K_s[:, 1, 1][:, None, None] * pts_s[..., 1] / Zc + K_s[:, 1, 2][:, None, None]
+        gx = 2.0 * u / (W - 1) - 1.0
+        gy = 2.0 * v / (H - 1) - 1.0
+        valid = (gx.abs() <= 1) & (gy.abs() <= 1) & (Z > 1e-4)
+
+        warped = F.grid_sample(img_s, torch.stack([gx, gy], dim=-1), mode="bilinear",
+                               align_corners=True, padding_mode="border")
+
+        if brightness_affine:
+            warped = _affine_match(warped, img_t, valid)
+
+        pe = _photometric_error(warped, img_t, alpha_ssim).reshape(B, n, H, W)
+        val = valid.reshape(B, n, H, W)
+        if flows is not None:
+            val = val & flows[off][2]                     # geometric visibility from flow coverage
+            pe_id = pe                                    # unused in flow mode
+        else:
+            ident_src = img_s
+            if brightness_affine and symmetric_brightness:
+                ident_src = _affine_match(img_s, img_t, torch.ones_like(valid))
+            pe_id = _photometric_error(ident_src, img_t, alpha_ssim).reshape(B, n, H, W)
+
+        cost[k, :, tgt] = torch.where(val, pe, torch.full_like(pe, inf))
+        ident[k, :, tgt] = pe_id
+        ok[k, :, tgt] = val
+
+    best, _ = cost.min(dim=0)                                   # (B, S, H, W)
+    keep = ok.any(dim=0)
+    if auto_mask and mask_mode == "auto":
+        keep = keep & (best < ident.min(dim=0).values)
+    keep = keep.detach()
+
+    n_keep = keep.sum()
+    disp_mean = (1.0 / depth.detach()).mean()
+    valid_frac = n_keep.to(images.dtype) / float(B * S * H * W)
+    diag = {"disp_mean": disp_mean, "photo_valid_frac": valid_frac.detach()}
+
+    if "extrinsics" in batch:
+        with torch.no_grad():
+            def path_len(Rm, Tm):
+                c = -torch.matmul(Rm.transpose(-1, -2), Tm[..., None])[..., 0]   # (B,S,3)
+                return (c[:, 1:] - c[:, :-1]).norm(dim=-1).sum(dim=-1)           # (B,)
+            gt = batch["extrinsics"]
+            l_pred = path_len(R, extrinsics[..., :3, 3])
+            l_gt = path_len(gt[..., :3, :3], gt[..., :3, 3])
+            diag["traj_len_ratio"] = (l_pred / l_gt.clamp(min=1e-8)).mean()
+
+    if n_keep < min_valid:
+        diag["loss_self_photo"] = (0.0 * pose_enc).mean()
+        return diag
+
+    err = check_and_fix_inf_nan(best[keep], "self_photo_err")
+    if conf_alpha is not None and "depth_conf" in predictions:
+        conf = predictions["depth_conf"][keep].clamp(min=1e-6)     # expp1 head: >= 1
+        weighted = (conf * err - float(conf_alpha) * torch.log(conf)).mean()
+        diag["loss_self_photo"] = float(conf_mix) * weighted + (1.0 - float(conf_mix)) * err.mean()
+        diag["photo_conf_mean"] = conf.detach().mean()
+    else:
+        diag["loss_self_photo"] = err.mean()
+    return diag
+
+
+def compute_flow_geom_loss(predictions, batch, src_offsets=(-1, 1), flow_proc=256,
+                           occ_thresh=0.95, min_valid=100, **kwargs):
+    """Cross-frame 3D consistency through optical-flow correspondence (ColonAdapter's
+    `geometry_loss`, reference/ColonAdapter/trainer.py:579-602, re-expressed for VGGT).
+
+    For a target pixel p in frame t and its RAFT correspondence p' = p + flow(p) in frame s, the
+    world point the model places at p (from depth_t + pose_t) and the world point it places at p'
+    (from depth_s + pose_s) are the same physical surface point, so they must coincide:
+
+        L = mean_{p visible in s}  || X_t(p) - X_s(p + flow_{t->s}(p)) ||_1
+
+    WHY THIS TERM. scared_selfsup's photometric loss only ever compares colours between adjacent
+    frames, so nothing forces frame 5 and frame 50 to put a surface at the same depth -- and the
+    measured failure matched that: per-frame RPE improved while full-sequence ATE and depth got
+    worse. This is the one term that ties different frames' GEOMETRY to each other directly.
+
+    WHAT IT DOES NOT DO. It penalises disagreement, not error: if every frame is wrong in the same
+    way the loss is zero. ColonAdapter pairs it with a point-map/pose term (weight 1.0) that this
+    port deliberately leaves out (no second model, no point head -- see
+    configs/scared_selfsup_ca3.yaml), so here nothing anchors the geometry to an external value.
+
+    DIFFERENCES FROM COLONADAPTER, both forced by VGGT's outputs:
+      * ColonAdapter compares its point head against DUSt3R's `pts3d_in_other_view`. VGGT has no
+        such dual output, so both sides here are built from depth + camera instead; the point
+        head is not involved (and stays disabled).
+      * Flow is RAFT (frozen, no_grad), not a jointly-trained flow network.
+
+    Gauge: points are divided by the window's mean depth, the same normalisation as
+    compute_self_photo_loss, so the loss is invariant to global scale and cannot be lowered by
+    shrinking the scene. Gradient reaches depth and pose of BOTH frames; flow and the visibility
+    mask are constants.
+    """
+    pose_enc = predictions["pose_enc_list"][-1]
+    images = batch["images"]
+    intr = batch["intrinsics"]
+    B, S, _, H, W = images.shape
+    offsets = [int(o) for o in src_offsets if int(o) != 0]
+    zero = {"loss_flow_geom": (0.0 * pose_enc).mean()}
+    if S < 2 or not offsets:
+        return zero
+
+    depth = check_and_fix_inf_nan(predictions["depth"][..., 0], "flow_geom_depth").clamp(min=1e-6)
+    scale = depth.mean(dim=(1, 2, 3), keepdim=True).clamp(min=1e-6)           # (B,1,1,1)
+    extrinsics, _ = pose_encoding_to_extri_intri(pose_enc, (H, W), build_intrinsics=False)
+    R = extrinsics[..., :3, :3]                                                 # (B,S,3,3)
+    T = extrinsics[..., :3, 3]                                                  # (B,S,3)
+
+    yy, xx = torch.meshgrid(torch.arange(H, device=images.device, dtype=images.dtype),
+                            torch.arange(W, device=images.device, dtype=images.dtype), indexing="ij")
+    fx = intr[..., 0, 0][..., None, None]; cx = intr[..., 0, 2][..., None, None]
+    fy = intr[..., 1, 1][..., None, None]; cy = intr[..., 1, 2][..., None, None]
+    Xc = torch.stack([(xx - cx) / fx * depth, (yy - cy) / fy * depth, depth], dim=-1)  # (B,S,H,W,3)
+    # world = R^T (X_cam - T); row-vector form (X - T) @ R
+    Xw = torch.matmul((Xc - T[:, :, None, None, :]).reshape(B, S, H * W, 3), R)
+    Xw = Xw.reshape(B, S, H, W, 3) / scale[..., None]
+
+    flows = pair_flows(batch, offsets, proc=flow_proc, occ_thresh=occ_thresh)
+    total = images.new_tensor(0.0)
+    n_terms, n_used, n_all = 0, 0, 0
+    for off, (tgt, flow, visible) in flows.items():
+        n = tgt.numel()
+        src = tgt + off
+        X_t = Xw[:, tgt]                                                        # (B,n,H,W,3)
+        X_s = Xw[:, src].permute(0, 1, 4, 2, 3).reshape(B * n, 3, H, W)
+        u = xx + flow[:, :, 0]
+        v = yy + flow[:, :, 1]
+        grid = torch.stack([2.0 * u / (W - 1) - 1.0, 2.0 * v / (H - 1) - 1.0], dim=-1)  # (B,n,H,W,2)
+        inb = (grid.abs() <= 1).all(dim=-1)
+        X_s = F.grid_sample(X_s, grid.reshape(B * n, H, W, 2), mode="bilinear",
+                            align_corners=True, padding_mode="border")
+        X_s = X_s.reshape(B, n, 3, H, W).permute(0, 1, 3, 4, 2)
+        m = (visible & inb).detach()
+        n_all += m.numel()
+        if m.sum() < min_valid:
+            continue
+        d = check_and_fix_inf_nan((X_t - X_s).abs().sum(dim=-1)[m], "flow_geom_err")
+        total = total + d.mean()
+        n_terms += 1
+        n_used += int(m.sum())
+
+    if n_terms == 0:
+        return zero
+    return {"loss_flow_geom": total / n_terms,
+            "flow_geom_valid_frac": images.new_tensor(n_used / max(n_all, 1))}
+
+
+def compute_smooth_loss(predictions, batch, **kwargs):
+    """Edge-aware first-order smoothness on MEAN-NORMALISED disparity (Monodepth2 eq. 3).
+
+    The mean normalisation is load-bearing, not cosmetic: on raw disparity this term is
+    minimised by shrinking disparity globally, i.e. depth -> infinity, which degenerates the
+    photometric warp into a pure rotation. Small-parallax endoscopy sits close to that
+    degenerate solution already.
+    """
+    depth = predictions["depth"][..., 0].clamp(min=1e-6)        # (B, S, H, W)
+    B, S, H, W = depth.shape
+    disp = (1.0 / depth).reshape(B * S, 1, H, W)
+    disp = disp / (disp.mean(dim=(2, 3), keepdim=True) + 1e-8)
+    img = batch["images"].reshape(B * S, -1, H, W)
+
+    dx = (disp[..., :, :-1] - disp[..., :, 1:]).abs()
+    dy = (disp[..., :-1, :] - disp[..., 1:, :]).abs()
+    ix = (img[..., :, :-1] - img[..., :, 1:]).abs().mean(1, keepdim=True)
+    iy = (img[..., :-1, :] - img[..., 1:, :]).abs().mean(1, keepdim=True)
+    loss = (dx * torch.exp(-ix)).mean() + (dy * torch.exp(-iy)).mean()
+    return {"loss_smooth": check_and_fix_inf_nan(loss, "smooth")}
 
 
 def compute_ego_flow_loss(predictions, batch, beta=1.0, per_pixel_thre=50.0, dyn_thresh=0.5,

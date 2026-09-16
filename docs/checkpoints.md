@@ -20,7 +20,7 @@
 
 ## 1. 登記表
 
-### 1.1 現役 —— `training/checkpoints/`（weights-only，~4.7 G，可 warm-start / eval，**不能 resume**）
+### 1.1 現役 —— `checkpoints/`（weights-only，~4.7 G，可 warm-start / eval，**不能 resume**）
 
 | 權重 | 世代 | 做了什麼 | Sintel ATE | ATE(12) | RPE-t | RPE-r | AbsRel | SCARED ATE (mm) |
 |---|---|---|---|---|---|---|---|---|
@@ -64,7 +64,7 @@
 > 照常載入，pose/depth 評測不受影響。真正失去的只有 v1 的 scene-flow / motion 輸出本身，
 > 而那正是被診斷否決的部分。要拿回來需 `git revert` 那次 commit。
 
-### 1.3 訓練 run —— `training/logs/<run>/ckpts/`（含 optimizer state，6.5–9.2 G，可 resume）
+### 1.3 訓練 run —— `logs/<run>/ckpts/`（含 optimizer state，6.5–9.2 G，可 resume）
 
 > **2026-08-20 清理**：45 個 checkpoint 共 313 GB 刪除。已判陰性或棄用的線（egoflow ×3、
 > `photo_smooth_temporal`、`smooth_temporal_photo`）**只留 `best_ate.pt`**；4 個 smoke run 的
@@ -91,6 +91,48 @@
 | `scared_cam_b16_gg` | v3-clean | b16 + `gate_pose_grad`（讓 pose loss 教 gate） | ep8 | 0.9464 mm | 全 4 支 | 中斷於 ep8/10 |
 | `scared_cam_b16_gg_smooth_temporal` | v3-clean | b16_gg + temporal + camera_smooth | ep8 | **0.9108 mm** | 全 4 支 | **2026-08-20 訓練中**，尚未收斂 |
 | smoke ×4 | — | wiring 驗證用（`egoflow_smoke`、`egoflow_gt_smoke`、`scared_cam_smoke`、`scared_cam_smoke_prev_0800`） | — | — | **無** | 目的是「跑不跑得起來」，權重無保留價值 |
+
+### 1.3b 2026-09-09 清理：現存 ckpt 的 epoch 身分
+
+`logs/` 從 611 G 降到 190 G，刪掉 54 支共 452 GB。原則是**每個 run 只留 `best_ate.pt`**，
+三個例外：`inst_gts` 改留 `epoch_30.pt`（`best.pt` 是 windowed 選出的 ep17、0.1651，不可用）；
+三條當時進行中的線（`inst_gts_sbias`、`inst_gts_sbias_lr`、`c3vd_cam_vanilla_msr`）多留 `last.pt`
+以保住 `--resume`；`scared_cam_b2` 完全不動（見 §1.4）。
+
+其餘 18 個 run 失去 `last.pt`，**不能直接 `--resume`** —— 要續訓得從 `best_ate.pt` 那個 epoch 接
+（optimizer state 仍在檔內）。中間 epoch 的權重回不來，但逐 epoch 數字都在
+`logs/<run>/pose_eval/epoch_*/results.json`。
+
+下表在刪除**之前**從 `log.txt` 的 `New best pose ATE ... at epoch N -> saving best_ate.pt`
+取最後一筆，補上檔名說不出來的 epoch 身分。⚠️ **epoch 是 0-indexed**（log 的 `epoch 14`
+= 本文件其他地方寫的 ep15）。ATE 單位依資料集：`inst_*` 是 Sintel 協定，`scared_*` / `c3vd_*` 是 mm。
+
+| run | 保留的 ckpt | epoch (0-idx) | 該點 ATE |
+|---|---|---|---|
+| `inst_g` | `best.pt` | 14 | 0.1533 |
+| `inst_gts` | `epoch_30.pt` | 30 † | 0.1343 |
+| `inst_gts_o1` | `best_ate.pt` | 3 | 0.1371 |
+| `inst_gts_photo` | `best_ate.pt` | 2 | 0.1413 |
+| `inst_gtsp_buginit` | `best_ate.pt` | 15 | 0.1534 |
+| `inst_gts_egoflow` | `best_ate.pt` | 3 | 0.1340 |
+| `inst_gts_egoflow_gt` | `best_ate.pt` | 3 | 0.1346 |
+| `inst_gts_egoflow_gt_nomask` | `best_ate.pt` | 3 | 0.1325 |
+| `inst_gts_sbias` | `best_ate.pt` + `last.pt` | 0 | 0.1353 |
+| `inst_gts_sbias_lr` | `best_ate.pt` + `last.pt` | 9 | 0.1171 |
+| `scared_cam_b2` | `best_loss.pt` + `last.pt` | — | 無 eval 數字 |
+| `scared_cam_b16` | `best_ate.pt` | 7 | 0.9814 |
+| `scared_cam_b16_gg` | `best_ate.pt` | 7 | 0.9464 |
+| `scared_cam_b16_gg_smooth_temporal` | `best_ate.pt` | 7 | 0.9108 |
+| `scared_cam_b16_gg_smooth_temporal_depth` | `best_ate.pt` | 6 | 0.8566 |
+| `scared_cam_b16_gg_smooth_temporal_wide` | `best_ate.pt` | 7 | 0.8150 |
+| `scared_cam_vanilla` | `best_ate.pt` | 3 | 0.9705 |
+| `scared_selfsup_ca3`（Colon版） | `best_ate.pt` | 6 | 1.8062 |
+| `scared_point_inf` | `best_ate.pt` | 1 | 2.0315 |
+| `c3vd_cam_gts` | `best_ate.pt` | 0 | 0.3589 |
+| `c3vd_cam_vanilla` | `best_ate.pt` | 0 | 0.4021 |
+| `c3vd_cam_vanilla_msr` | `best_ate.pt` + `last.pt` | 2 | 0.3175 |
+
+† `inst_gts` 的 epoch 直接來自檔名，非 log 推得；ATE 來自 §1.1。
 
 ### 1.4 為什麼 `s1a` / `s1_full` / `scared_cam_b2` 先不刪
 

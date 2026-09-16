@@ -1,6 +1,6 @@
 # SCARED — 資料規格（寫 `data/datasets/scared.py` 用）
 
-內視鏡立體資料集，2026-08-17 由 `training/data/preprocess/scared_convert.py` 從官方原始發佈轉成本 repo 可讀的形式。這份文件寫的是**轉檔後**的規格；原始發佈的種種怪癖都已在轉檔時吸收掉，寫 loader 時不需要知道它們（但第 7 節列出仍會外洩的部分）。
+內視鏡立體資料集，2026-08-17 由 `pipeline/data/preprocess/scared_convert.py` 從官方原始發佈轉成本 repo 可讀的形式。這份文件寫的是**轉檔後**的規格；原始發佈的種種怪癖都已在轉檔時吸收掉，寫 loader 時不需要知道它們（但第 7 節列出仍會外洩的部分）。
 
 規模：**35 個 keyframe、17,824 幀、48 GB**。
 
@@ -12,10 +12,12 @@
 
 ```
 scared/
-├── train/  22 keyframes, 15,568 幀
-├── val/     6 keyframes,  1,705 幀
-├── test/    7 keyframes,    551 幀
-│   └── dataset{n}/keyframe{m}/
+├── train/        22 keyframes, 15,568 幀        連續
+├── val/           6 keyframes,  1,705 幀        連續（fid 從 2 起）
+├── test/
+│   ├── depth/     7 keyframes,    551 幀        官方稀疏抽樣，depth benchmark
+│   └── pose/      2 keyframes,  1,245 幀        連續，pose benchmark，無 depth_left/
+│       └── dataset{n}/keyframe{m}/              （以上每個 split 底下都是這層）
 │       ├── image_left/{fid:06d}.png     RGB, 1280×1024 (W×H), 8-bit
 │       ├── depth_left/{fid:06d}.png     深度, 1280×1024, uint16 單通道
 │       ├── cam_data/
@@ -27,8 +29,18 @@ scared/
 │       ├── rgb.mp4                      完整原始影片（見 §6）
 │       └── meta.json                    來源、幀數、連續性、量化參數
 ├── split/                               官方原始清單（保留供回溯，loader 不需要讀）
-└── dataset_1..9/                        原始發佈殘留（**不要讀**，見 §7）
+├── sample/                              抽樣副本與 stride-1 探測片段，只供視覺化/探測
+├── dataset_3,5,8,9/  test_dataset_8,9/  原始發佈殘留（**不要讀**，見 §7）
+└── scared.zip                           原始壓縮檔
 ```
+
+`split` 參數（`eval_scared.py --split`、`datasets/scared.py`）直接就是上面的相對路徑：`val`、`train`、`test/depth`、`test/pose`。舊名 `test`、`pose_seq` 在 2026-09-14 退役，`outputs/eval_scared/` 下的結果目錄同步改名為 `test_depth_*`、`test_pose_*`。
+
+⚠️ `test/depth/dataset3/keyframe4`（79 幀）和 `test/pose/dataset3/keyframe4`（834 幀）**同名不同物**：前者是後者那段影片的稀疏子集。引用序列時一律帶完整 split。
+
+`test/pose/` 由 `scared_convert.py --keyframes dataset5/keyframe4 dataset3/keyframe4 --frames all --out_split test/pose --no_depth --no_video` 產生，對應 AF-SfMLearner / EndoSfM3D 的 `test_files_sequence1/2.txt`。因為 `--no_depth`，底下沒有 `depth_left/`，`valid_frac.txt` 只有 header。
+
+同層的 `data/train/scared_msr/` 是另一份預處理變體，目錄結構相同，但只有 `train/`、`val/`、`test/depth/`，沒有 `test/pose/`。
 
 `{fid}` 是**原始 frame index**，不是 0..N-1 的序號。`cam_data/*.txt` 的第 k 列 ⟷ `frames.txt` 的第 k 個 fid ⟷ `image_left/{fid:06d}.png`。三者順序一致且遞增。
 
@@ -113,9 +125,13 @@ extri_opencv = E[k].astype(np.float32)     # 直接就是 VGGT 要的格式
 - val 6/6 連續，但**從 fid=2 起算**，不是從 0。所以 `ids` 必須是「`frames.txt` 的索引位置」而不是 fid 本身，否則會越界。
 - 兩者都可以安全使用 `common_conf.get_nearby` / `get_nearby_ids`。
 
-### test：**不可**當影片
+### test/depth：**不可**當影片
 
-7 個 test keyframe 是官方跨全序列的稀疏抽樣，stride 8–38。`get_nearby_ids` 取的是**清單位置**而非時間，對 test 使用會靜默地取到時間上相距數十幀的畫面。test 應該把列出的幀當一組 multi-view 直接餵入。
+7 個 keyframe 是官方跨全序列的稀疏抽樣，幀距不固定（1–296 幀）。`get_nearby_ids` 取的是**清單位置**而非時間，對 test/depth 使用會靜默地取到時間上相距數十幀的畫面。應該把列出的幀當一組 multi-view 直接餵入。snippet ATE 在這裡沒有意義，`eval_scared.py` 會記 `snippet_skipped`。
+
+### test/pose：連續，但沒有深度
+
+2 條序列（`dataset5/keyframe4` 411 幀、`dataset3/keyframe4` 834 幀），fid 從 0 起、無缺號，可以當影片。只有影像與 pose，不能跑 depth 評測，也不能當訓練資料（與 test/depth 同一段影片）。
 
 ### 空深度幀必須避開當 anchor
 
@@ -151,7 +167,8 @@ anchor_pool = np.nonzero(vf > 0.05)[0]      # 只從足夠稠密的幀挑 anchor
 每個 keyframe 都附完整的原始影片（35 支共 3.4 GB）。**loader 不需要讀它**，它是給人看的。
 
 - train：影片長度 = 圖片數（因為存了全幀）。
-- val / test：影片是完整序列，比存下來的圖片長（val 407 vs 284、test 348 vs 76）。
+- test/pose：`--no_video` 轉檔，沒有 `rgb.mp4`。
+- val / test/depth：影片是完整序列，比存下來的圖片長（val 407 vs 284、test 348 vs 76）。
 - 影片的幀號與圖片檔名是**同一套編號**（已驗證 `mp4 第 N 幀` 與 `{N:06d}.png` 位元相同），所以可以用檔名直接去影片裡查任一幀，包括被 split 跳過的那些。
 
 ---
@@ -166,7 +183,7 @@ anchor_pool = np.nonzero(vf > 0.05)[0]      # 只從足夠稠密的幀挑 anchor
 4. 原始 `left_depth_map.tiff` 用 **NaN** 標無效，而 `scene_points` 用 **0** —— 兩者混用時遮罩要同時排除。
 5. `dataset_2/keyframe_1` 的 `left_depth_map.tiff` 與自己的 scene points 對不上（反向比對最佳落在 ds7/kf3），該檔不可信。轉檔後的 `depth_left/` 來自 scene points，不受影響。
 
-轉檔後仍需注意的只有一項：**`dataset_1..9/` 原始目錄還在碟上（842 GB 的 `scene_points*.tiff`）**，loader 絕對不要碰它。它會在確認訓練跑得起來之後刪除。
+轉檔後仍需注意的只有一項：**部分原始目錄還在碟上**，loader 絕對不要碰它們。2026-09-14 實查剩 `dataset_3/`（5.9 G）、`dataset_5/`（4.7 G，兩者是 test/pose 的來源，scene_points tarball 未解）、`dataset_8/`（94 G）、`dataset_9/`（82 G），以及 `test_dataset_8/`、`test_dataset_9/`（官方額外 test，只有影像與標定）；`dataset_1,2,4,6,7` 已不在碟上。
 
 ---
 

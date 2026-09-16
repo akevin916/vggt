@@ -253,7 +253,7 @@ L_gate = BCE( σ(g), m*_patch )      # gate_logits 不 detach → 梯度回流 p
 
 - **`m*_inst`**（`dynmask_inst/`）：用 GT world track（`trajs_3d`）判斷每個 instance
   連通塊是否在動，動則整塊填滿。**最穩**——靜態世界點位移恆為 0，無 RAFT 的背景灌爆與快慢兩難。
-  `training/data/preprocess/po_instance_dynmask.py`；dataset 以 `dynamic_source="instance"` 載入。
+  `pipeline/data/preprocess/po_instance_dynmask.py`；dataset 以 `dynamic_source="instance"` 載入。
 - **`m_geo`**：`‖f^gt − f^cam(GT depth+pose 重投影)‖ > bar`。純幾何、無需 GT track。
   Sintel 用 GT `.flo` 光流（`data/motion_mask.py`，落盤快取到 `<sintel_root>/mask/`）；
   其他測試集用 RAFT 估計光流。Sintel 端用**相對門檻** `bar = max(abs, α·‖f^gt‖)`
@@ -352,7 +352,7 @@ patch token，而架構裡沒有任何地方能表達「這個 view 不可信」
 
 ### 5.2 Photometric Corruption
 
-`training/data/photometric_corruption.py`。**唯一的硬規則：幾何永遠不動。**
+`pipeline/data/photometric_corruption.py`。**唯一的硬規則：幾何永遠不動。**
 沒有 warp、crop、resize、flip、shift——只有 per-pixel 的值映射。
 因為 §5.3 要逐像素比較兩次前向，兩者必須保持 pixel-aligned；
 這也正是讓 L_inf 的有限差分**只張成外觀方向**的原因。
@@ -549,7 +549,7 @@ run 1 的 24 個 epoch（channel B）：`mean=0.1752, std=0.0149`。
 
 **任何跨幀指標都必須整段一次 forward（`chunk_size=0`）。**
 獨立 chunk 拼接會讓接縫主宰 ATE 且數字不再隨模型變化。
-權威說明在 `eval_utils/vggt_infer.infer_sequence_chunked` 的 docstring。
+權威說明在 `pipeline/eval/vggt_infer.infer_sequence_chunked` 的 docstring。
 
 **推論：SCARED 的全序列 evo ATE 我們不報。** VGGT 單次上限 80 幀，Sim3 拼接讓 ATE
 擺動 −1%~+32% 且與 seam 數無關、不可預測。**是不估，不是估錯**——代價是
@@ -574,25 +574,25 @@ raw ATE 直接對打是拿一次前向打一個最佳化迴圈。成本軸的實
 | bias 參考點變體 | `model.gate_leaky`、`model.gate_bias_zero_ref` | `aggregator.py`：`Aggregator.__init__` + bias 計算處 |
 | gate 讓 pose loss 訓練 | `model.gate_pose_grad` | `aggregator.py` |
 | gate 輸出與 override | — | `vggt/models/vggt.py`：`predictions["gate_logits"]`、`gate_logits_override` |
-| `L_gate` | `loss.gate` | `training/loss.py`：`compute_gate_loss` |
-| oracle mask → override | — | `training/loss.py`：`oracle_gate_logits_from_mask` |
+| `L_gate` | `loss.gate` | `pipeline/training/loss.py`：`compute_gate_loss` |
+| oracle mask → override | — | `pipeline/training/loss.py`：`oracle_gate_logits_from_mask` |
 | Temporal attention | `model.enable_temporal`、`temporal_every` | `aggregator.py`：`_process_temporal_attention`、`temporal_blocks` |
-| `L_camera_smooth` | `loss.camera_smooth` | `training/loss.py`：`compute_camera_smooth_loss` |
-| Photometric corruption | `corruption.*` | `training/data/photometric_corruption.py`：`corrupt_batch` |
-| `L_inf` | `loss.influence` | `training/loss.py`：`compute_influence_loss` |
-| 雙前向（teacher/student） | `corruption.enabled`、`corruption.warmup_steps` | `training/trainer.py`：`_step` |
-| 動態標籤產生 | `dynamic_source=` | `training/data/preprocess/po_*.py`、`training/data/motion_mask.py` |
-| SCARED 抽樣窗 | `nearby_expand_range` | `training/data/datasets/scared.py` |
+| `L_camera_smooth` | `loss.camera_smooth` | `pipeline/training/loss.py`：`compute_camera_smooth_loss` |
+| Photometric corruption | `corruption.*` | `pipeline/data/photometric_corruption.py`：`corrupt_batch` |
+| `L_inf` | `loss.influence` | `pipeline/training/loss.py`：`compute_influence_loss` |
+| 雙前向（teacher/student） | `corruption.enabled`、`corruption.warmup_steps` | `pipeline/training/trainer.py`：`_step` |
+| 動態標籤產生 | `dynamic_source=` | `pipeline/data/preprocess/po_*.py`、`pipeline/data/motion_mask.py` |
+| SCARED 抽樣窗 | `nearby_expand_range` | `pipeline/data/datasets/scared.py` |
 
 **評估入口**（契約要穩定，別亂改名）：
 
 | 目的 | 入口 |
 |---|---|
-| gate 的**唯一**評估入口（quality + pose ablation） | `training/diag/gate_eval.py` |
-| Sintel pose + depth 主表 | `training/benchmark/eval_sintel.py` |
-| SCARED（對齊 EndoSfM3D / AF 協定） | `training/benchmark/eval_scared.py` |
-| 私人資料集 | `training/benchmark/eval_lesion.py` / `eval_gastric.py` |
-| MonST3R 對照 | `training/benchmark/eval_monst3r_*.py` |
-| 拼接誤差本身 | `training/diag/stitch_error.py` |
-| L_inf 尺度診斷 | `training/diag/influence_scale_probe.py` |
-| specular 佔多少可匹配紋理 | `training/diag/specular_texture_probe.py` |
+| gate 的**唯一**評估入口（quality + pose ablation） | `pipeline/diag/gate_eval.py` |
+| Sintel pose + depth 主表 | `pipeline/benchmark/eval_sintel.py` |
+| SCARED（對齊 EndoSfM3D / AF 協定） | `pipeline/benchmark/eval_scared.py` |
+| 私人資料集 | `pipeline/benchmark/eval_lesion.py` / `eval_gastric.py` |
+| MonST3R 對照 | `pipeline/benchmark/eval_monst3r_*.py` |
+| 拼接誤差本身 | `pipeline/diag/stitch_error.py` |
+| L_inf 尺度診斷 | `pipeline/diag/influence_scale_probe.py` |
+| specular 佔多少可匹配紋理 | `pipeline/diag/specular_texture_probe.py` |

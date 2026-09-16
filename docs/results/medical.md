@@ -25,16 +25,16 @@
 
 | AF 的檔案 | 用途 | 我們的 | 驗證 |
 |---|---|---|---|
-| `test_files.txt`（550 幀 / 7 序列） | depth | `test/` | 幀數與幀號**完全相同** |
-| `test_files_sequence1/2.txt` | pose | `pose_seq/dataset{5,3}/keyframe4`（411 / 834 幀） | 同序列，我們多存 frame 0 |
+| `test_files.txt`（550 幀 / 7 序列） | depth | `test/depth/` | 幀數與幀號**完全相同** |
+| `test_files_sequence1/2.txt` | pose | `test/pose/dataset{5,3}/keyframe4`（411 / 834 幀） | 同序列，我們多存 frame 0 |
 
-`pose_seq` 是同一段影片逐幀重抽（連續），`test/` 是官方稀疏抽樣（間隔 1–296 幀）。
+`test/pose` 是同一段影片逐幀重抽（連續），`test/depth` 是官方稀疏抽樣（間隔 1–296 幀）。
 兩者都屬 keyframe4 = test，**沒進訓練**（train 用 keyframe1/2，val 用 keyframe3）。
-⚠️ `test/dataset3/keyframe4`（79 幀）和 `pose_seq/dataset3/keyframe4`（834 幀）**同名不同物**，引用要帶 split。
+⚠️ `test/depth/dataset3/keyframe4`（79 幀）和 `test/pose/dataset3/keyframe4`（834 幀）**同名不同物**，引用要帶 split。
 
-### 1.1 Depth（test split，afsfm 協定）
+### 1.1 Depth（test/depth split，afsfm 協定）
 
-來源 `outputs/eval_scared/test_0f{,_single}_afsfm/`｜08-25 重跑
+來源 `outputs/eval_scared/test_depth_0f{,_single}_afsfm/`｜08-25 重跑；Colon版 09-14（同批重跑 `VGGT-1B` / `vanilla` 與 08-25 值一致到小數第四位）
 
 | ckpt | 單張輸入 | 多張輸入 |
 |---|---|---|
@@ -44,6 +44,7 @@
 | `b16_gg` | 0.0550 | 0.0449 |
 | `smooth_temporal` | **0.0537** | 0.0434 |
 | `wide` | 0.0550 | **0.0419** |
+| Colon版（自監督，`scared_selfsup_ca3` best） | 0.0623 | 0.0489 |
 
 （AbsRel。單張 = `--single_view`，**只有這欄能跟論文的單目表比**；多張 = `chunk_size 64 / overlap 16`。）
 
@@ -57,10 +58,11 @@
 | `b16_gg` | 0.4440 / 4.9193 / 0.0785 / 0.9757 | 0.3176 / 4.2263 / 0.0663 / 0.9852 |
 | `smooth_temporal` | 0.4256 / 4.7842 / 0.0767 / 0.9779 | 0.3089 / 4.0898 / 0.0647 / 0.9855 |
 | `wide` | 0.4544 / 4.8946 / 0.0789 / 0.9739 | 0.3219 / 4.1107 / 0.0658 / 0.9841 |
+| Colon版 | 0.5548 / 5.5922 / 0.0889 / 0.9700 | 0.3908 / 4.6496 / 0.0725 / 0.9799 |
 
 </details>
 
-### 1.2 Pose（pose_seq split，snippet ATE）
+### 1.2 Pose（test/pose split，snippet ATE）
 
 AF 的 5-frame snippet 協定。**只能跟 AF-SfMLearner 的表比**——EndoSfM3D 那系用全序列 evo ATE，
 我們產不出（VGGT 單次上限 80 幀，Sim3 拼接讓 ATE 擺動 −1%~+32%，`diag/stitch_error.py`）。是不估，不是估錯。
@@ -68,7 +70,7 @@ AF 的 5-frame snippet 協定。**只能跟 AF-SfMLearner 的表比**——EndoS
 chunk 64 和 chunk 5 分開記：兩者算指標的方式相同，但**預測本身不同**——
 chunk 64 每個窗的位姿來自 64 幀 context，chunk 5 則 context 就是那 5 幀（更貼近 AF）。不可互相取代。
 
-**chunk 64 / overlap 16**（`pose_seq_0f/`，08-25 10:28）
+**chunk 64 / overlap 16**（`test_pose_0f/`，08-25 10:28）
 
 | ckpt | ds3 | ds5 | **mean** |
 |---|---|---|---|
@@ -78,8 +80,9 @@ chunk 64 每個窗的位姿來自 64 幀 context，chunk 5 則 context 就是那
 | `b16_gg` | 0.0565 | 0.0832 | 0.0699 |
 | `smooth_temporal` | 0.0478 | 0.0716 | **0.0597** |
 | `wide` | 0.0585 | 0.0825 | 0.0705 |
+| Colon版（自監督，09-14） | 0.0509 | 0.0854 | 0.0682 |
 
-**chunk 5 / overlap 4**（`pose_seq_0f_chunk5/`，08-25 11:25）
+**chunk 5 / overlap 4**（`test_pose_0f_chunk5/`，08-25 11:25）
 
 | ckpt | ds3 | ds5 | **mean** |
 |---|---|---|---|
@@ -89,6 +92,7 @@ chunk 64 每個窗的位姿來自 64 幀 context，chunk 5 則 context 就是那
 | `b16_gg` | 0.0663 | 0.0956 | 0.0810 |
 | `smooth_temporal` | 0.0567 | 0.0844 | **0.0705** |
 | `wide` | 0.0723 | 0.1007 | 0.0865 |
+| Colon版（自監督，09-14） | 0.0562 | 0.0972 | 0.0767 |
 
 > ✅ `b16_gg` 這列與 08-19 舊值（0.0663 / 0.0956 / 0.0810）**一位不差**，確認舊那筆是 chunk 5，
 > 也驗證 pipeline 沒有漂移。
@@ -106,7 +110,7 @@ context 從 5 幀放大到 64 幀對每個 arm 都有幫助。排名大致相同
 | `smooth_temporal` | 0.0705 | 0.0597 | −15% |
 | `wide` | 0.0865 | 0.0705 | −19% |
 
-⚠️ **test split 不能算 snippet ATE**（幀不連續，`eval_scared.py:168` 會 skip）。
+⚠️ **test/depth split 不能算 snippet ATE**（幀不連續，`eval_scared.py:168` 會 skip）。
 舊 `test_0f/results.json` 裡 `b16` 的 **0.6148 是守衛加入前的失效值，不要用**。
 
 ### 1.3 選 ckpt 的指標跟 test 不一致
@@ -198,7 +202,7 @@ test 也同向：ep0 0.4329 < ep5 0.4642 < best_loss 0.4689。訓練在 ep6 之�
 |---|---|
 | 「最好的版本」沒有單一答案 | channel B 選 `wide`，test 上 `smooth_temporal` 較好（§1.3）。報告要先決定用哪個指標敘事 |
 | `results/sota.md` §3.3 的 0.0550 出處未定 | `b16_gg` 與 `wide` 都是 0.0550，無法回推。該文件**未修改** |
-| `eval_scared.py` docstring 第 10 行 | 寫 test split「stride 8-38」，實測 1–296。**未修改** |
+| `eval_scared.py` docstring 第 10 行 | 寫 test split「stride 8-38」，實測 1–296。**2026-09-14 已修正** |
 | SCARED 全序列 evo ATE | 不報（拼接誤差）。EndoSfM3D 系的 pose 欄因此填不了 |
 | C3VD MonST3R 對照 | **已決定不做** |
 | C3VD `best_loss.pt` 已被 ep6 覆寫 | 表上該列重跑不可復現 |

@@ -15,11 +15,11 @@
 
 協定完全依照 AF-SfMLearner / EndoSfM3D，**逐幀核對過**：
 
-- **depth**：`test_files.txt` 550 幀（幀數與幀號與我們的 `test/` 完全相同）、per-frame `np.median`
+- **depth**：`test_files.txt` 550 幀（幀數與幀號與我們的 `test/depth/` 完全相同）、per-frame `np.median`
 scaling、範圍 (0.01, 150] mm、scaling 後 clip 回範圍、per-frame 指標**無權重平均**。
-- **pose**：`test_files_sequence{1,2}.txt` → `pose_seq/dataset{5,3}/keyframe4`（411 / 834 幀，連續）、
+- **pose**：`test_files_sequence{1,2}.txt` → `test/pose/dataset{5,3}/keyframe4`（411 / 834 幀，連續）、
 滑動 5-frame 窗、每窗獨立平移對齊 + 最小二乘 scale、誤差除以 N 而非 sqrt(N)。
-- 程式：`training/benchmark/eval_scared.py --depth_protocol afsfm`。
+- 程式：`pipeline/benchmark/eval_scared.py --depth_protocol afsfm`。
 
 ⚠️ **輸入張數欄不能省**。published 方法都是單目（一次一張）；我們有些數字讓模型一次看很多張，
 那不是同一個設定。詳見 §3.2。
@@ -164,8 +164,8 @@ gate 凍結 ≈ 原版架構）可以拆開：pose 64 幀 Seq.2 = 0.0626 → 0.0
 代價是 EndoSfM3D / DARES / Endo-FASt3r 那一系的 pose 欄我們填不了——本表的 pose 只對得上
 AF-SfMLearner 的 snippet 協定。
 
-**test split 的 snippet ATE**：算不了。`eval_scared.py:168` 檢查幀是否 stride-1，
-test split 間隔 1–296 幀，守衛會 skip。pose 只能用 `pose_seq`。
+**test/depth split 的 snippet ATE**：算不了。`eval_scared.py:168` 檢查幀是否 stride-1，
+test/depth split 間隔 1–296 幀，守衛會 skip。pose 只能用 `test/pose`。
 
 **EndoSfM3D pose 那一列存疑**：其論文引用的 baseline 確定是 snippet 協定（AF Table 10 明文），
 但其釋出的 `dares/evaluate_pose_and_intrinsics.py` 算的是全序列 evo ATE，論文未說明自己那列用哪個。
@@ -183,20 +183,20 @@ O=logs/scared_cam_b16_gg_smooth_temporal/ckpts/best_ate.pt   # 本期
 B=logs/scared_cam_vanilla/ckpts/best_ate.pt                  # baseline
 
 # depth, 單張輸入（公平設定）
-python benchmark/eval_scared.py --ckpts $O $B --split test --n_frames 0 \
+python pipeline/benchmark/eval_scared.py --ckpts $O $B --split test/depth --n_frames 0 \
   --single_view --depth_protocol afsfm
 
 # depth, 全序列 multi-view
-python benchmark/eval_scared.py --ckpts $O $B --split test --n_frames 0 \
+python pipeline/benchmark/eval_scared.py --ckpts $O $B --split test/depth --n_frames 0 \
   --chunk_size 64 --overlap 16 --depth_protocol afsfm
 
 # pose, snippet ATE, 5 幀 context（公平設定）—— 必須給 --out_dir，否則蓋掉 64 幀那份
-python benchmark/eval_scared.py --ckpts $O $B --split pose_seq --n_frames 0 \
+python pipeline/benchmark/eval_scared.py --ckpts $O $B --split test/pose --n_frames 0 \
   --chunk_size 5 --overlap 4 --no_depth \
-  --out_dir ../outputs/eval_scared/pose_seq_0f_chunk5
+  --out_dir ../outputs/eval_scared/test_pose_0f_chunk5
 
 # pose, snippet ATE, 64 幀 context
-python benchmark/eval_scared.py --ckpts $O $B --split pose_seq --n_frames 0 \
+python pipeline/benchmark/eval_scared.py --ckpts $O $B --split test/pose --n_frames 0 \
   --chunk_size 64 --overlap 16 --no_depth
 ```
 

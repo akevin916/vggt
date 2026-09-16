@@ -6,8 +6,14 @@ trainer now calls this module as its channel-B metric for SCARED runs (see
 trainer.run_pose_eval), so the entry-point contract has to stay stable.
 
 Protocol notes:
-  * Sequences come from the val split: 6 keyframes x ~284 CONTIGUOUS frames. The test split
-    is the official sparse sampling (stride 8-38) and must not be treated as video.
+  * Splits (docs/topics/scared_dataset.md #1, #5):
+      - ``val``        6 keyframes x ~284 CONTIGUOUS frames, with depth. Default; channel B.
+      - ``test/depth`` the official sparse depth test sampling (7 keyframes x 71-87 frames,
+                       irregular gaps of 1-296 frames). Depth benchmark; must not be treated
+                       as video, so snippet ATE is skipped there.
+      - ``test/pose``  the two contiguous AF/EndoSfM3D pose trajectories (dataset5/keyframe4
+                       411 frames, dataset3/keyframe4 834 frames), images+poses, NO depth.
+    test/depth and test/pose share keyframe names but are different frame sets.
   * ``--n_frames`` frames are taken evenly across each keyframe in ONE forward pass. Chunked
     inference would split the sequence into independent passes and inflate ATE, so the frame
     count is capped instead (same frames for every checkpoint -> comparable).
@@ -78,6 +84,14 @@ def resolve_max_depth(args) -> float:
     return AFSFM_MAX_DEPTH if getattr(args, "depth_protocol", "monst3r") == "afsfm" else 200.0
 
 
+SPLITS = ("val", "train", "test/depth", "test/pose")
+
+
+def split_tag(split: str) -> str:
+    """Split name as it appears in an output dir name: test/depth -> test_depth."""
+    return split.replace("/", "_")
+
+
 def list_sequences(root: str, split: str):
     out = []
     split_dir = os.path.join(root, split)
@@ -91,7 +105,7 @@ def list_sequences(root: str, split: str):
 def load_sequence(seq_dir: str, n_frames: int):
     fids = np.loadtxt(os.path.join(seq_dir, "cam_data", "frames.txt"), dtype=np.int64, ndmin=1)
     E = np.loadtxt(os.path.join(seq_dir, "cam_data", "extrinsics.txt")).reshape(-1, 3, 4)
-    # pose_seq is converted with --no_depth, so valid_frac.txt is header-only there.
+    # test/pose is converted with --no_depth, so valid_frac.txt is header-only there.
     vf_path = os.path.join(seq_dir, "cam_data", "valid_frac.txt")
     with warnings.catch_warnings():           # empty file -> "input contained no data"
         warnings.simplefilter("ignore", UserWarning)
@@ -158,7 +172,7 @@ def eval_ckpt(ckpt, root, split, seqs, args, model=None):
                 n_patch = (args.img_size // 14) * (_h // 14)
                 override = _t.zeros(1, len(paths), n_patch, device=args.device)
             # Snippet ATE is only meaningful on stride-1 frames: its 5-frame windows are
-            # supposed to span ~5 video frames. On the depth test split (stride 3-296) or any
+            # supposed to span ~5 video frames. On test/depth (gaps of 1-296 frames) or any
             # subsampled run they span hundreds, and the metric silently returns a large,
             # meaningless number instead of failing. Gate it on the frames actually selected.
             sel_fids = np.array([int(os.path.basename(p)[:-4]) for p in paths])
@@ -281,7 +295,7 @@ def evaluate(args, model=None):
     seqs = [str(x) for x in seqs]   # config-supplied lists may be OmegaConf nodes (not JSON-able)
     suffix = "" if getattr(args, "gate_mode", "predicted") == "predicted" else f"_gate{args.gate_mode}"
     args.out_dir = getattr(args, "out_dir", None) or output_dir_for_exp(
-        f"{args.split}_{args.n_frames}f{suffix}", TOOL)
+        f"{split_tag(args.split)}_{args.n_frames}f{suffix}", TOOL)
     os.makedirs(args.out_dir, exist_ok=True)
 
     results = eval_ckpt(args.ckpt, args.scared_root, args.split, seqs, args, model=model)
@@ -304,9 +318,11 @@ def main():
                                                   "checkpoints/inst_gts.pt"])
     ap.add_argument("--scared_root", default=data_path("train", "scared"))
     ap.add_argument("--split", default="val",
-                    choices=["val", "test", "train", "pose_seq"],
-                    help="pose_seq = the two contiguous AF/EndoSfM3D pose trajectories "
-                         "(411 and 834 frames, images+poses only, no depth)")
+                    choices=SPLITS,
+                    help="test/depth = official sparse depth test frames (not video); "
+                         "test/pose = the two contiguous AF/EndoSfM3D pose trajectories "
+                         "(411 and 834 frames, images+poses only, no depth). The old names "
+                         "'test' and 'pose_seq' were retired on 2026-09-14.")
     ap.add_argument("--seqs", nargs="*", default=None)
     ap.add_argument("--n_frames", type=int, default=50,
                     help="frames per sequence, evenly sampled, in ONE pass. "
@@ -339,7 +355,8 @@ def main():
         suffix += "_single"
     if args.depth_protocol == "afsfm":
         suffix += "_afsfm"
-    base_out = args.out_dir or output_dir_for_exp(f"{args.split}_{args.n_frames}f{suffix}", TOOL)
+    base_out = args.out_dir or output_dir_for_exp(
+        f"{split_tag(args.split)}_{args.n_frames}f{suffix}", TOOL)
     print(f"{len(args.ckpts)} ckpts x {len(seqs)} sequences ({args.split}), "
           f"{args.n_frames} frames each -> {base_out}")
 
@@ -358,7 +375,7 @@ def main():
         args.ckpt, args.seqs = ckpt, seqs
         # Always one sub-dir per ckpt. Keying it on len(ckpts) > 1 meant two single-ckpt runs
         # with the same split/flags wrote to the same results.json, and the second silently
-        # destroyed the first -- which is exactly what happened when the VGGT-1B pose_seq run
+        # destroyed the first -- which is exactly what happened when the VGGT-1B test/pose run
         # landed on top of the fine-tuned one.
         args.out_dir = os.path.join(base_out, name)
         results[name] = evaluate(args)

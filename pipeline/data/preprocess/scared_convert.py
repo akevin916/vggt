@@ -32,9 +32,14 @@ Frame selection (option B):
            directly, the way TartanAir does.
   val/test -- only the frames the split lists. The remaining frames of those keyframes
            belong to held-out scenes; training on them would leak. test is deliberately
-           left non-contiguous (stride 8-38): that sparsity is the benchmark's design,
-           so filenames carry the ORIGINAL frame index and callers must not run
+           left non-contiguous (gaps of 1-296 frames): that sparsity is the benchmark's
+           design, so filenames carry the ORIGINAL frame index and callers must not run
            get_nearby over it as if it were a video.
+
+Output split directories: the official test list is the DEPTH benchmark and lands in
+``test/depth/``. The contiguous pose-benchmark trajectories are a separate re-extraction:
+  --keyframes dataset5/keyframe4 dataset3/keyframe4 --frames all --out_split test/pose \\
+  --no_depth --no_video --out_dir <scared_dir>
 """
 from __future__ import annotations
 
@@ -57,6 +62,8 @@ from pipeline.data.paths import data_path
 DEPTH_SCALE = 100.0                      # uint16 counts per mm -> 0.01 mm resolution
 DEPTH_MAX_MM = 65535 / DEPTH_SCALE       # 655.35 mm; beyond this we mark invalid
 LEFT_ROWS = 1024                         # top half of the stacked frame is the left view
+# official split -> output subdirectory; test is split by benchmark into test/depth, test/pose
+OUT_SPLIT_DIR = {"train": "train", "val": "val", "test": "test/depth"}
 
 
 def resolve_source(split_name: str) -> str:
@@ -102,7 +109,8 @@ def convert_one(root: str, split_name: str, split: str, ids: list[int], out_root
                 out_split: str | None = None, note: str | None = None,
                 no_depth: bool = False) -> dict:
     src = osp.join(root, resolve_source(split_name))
-    dst = osp.join(out_root, out_split or split, split_name)
+    out_split = out_split or OUT_SPLIT_DIR[split]
+    dst = osp.join(out_root, out_split, split_name)
     img_dir, dep_dir, cam_dir = (osp.join(dst, d) for d in ("image_left", "depth_left", "cam_data"))
     for d in (img_dir, cam_dir) if no_depth else (img_dir, dep_dir, cam_dir):
         os.makedirs(d, exist_ok=True)
@@ -182,7 +190,7 @@ def convert_one(root: str, split_name: str, split: str, ids: list[int], out_root
     # "contiguous" means consecutive frames, not that the run starts at 0: val is frames
     # 2..285, which is a gapless clip and safe for nearby-frame sampling.
     contiguous = bool(len(ids) > 1 and np.all(np.diff(ids) == 1))
-    meta = dict(split_name=split_name, split=split, source=resolve_source(split_name),
+    meta = dict(split_name=split_name, split=out_split, source=resolve_source(split_name),
                 source_frames=n_sp, stored_frames=len(ids), contiguous=contiguous,
                 starts_at_zero=bool(ids[0] == 0),
                 frame_range=[int(ids[0]), int(ids[-1])], depth_scale=DEPTH_SCALE,
@@ -215,9 +223,10 @@ def main():
                          "split held out, so the result is probe/visualisation material only "
                          "-- never training data. Pair it with --out_split.")
     ap.add_argument("--out_split", default=None,
-                    help="name of the split subdirectory to write into (default: the "
-                         "keyframe's own split), so a --frames re-extraction does not "
-                         "overwrite the canonical conversion.")
+                    help="split subdirectory to write into (default: train, val, or "
+                         "test/depth by the keyframe's official split), so a --frames "
+                         "re-extraction does not overwrite the canonical conversion. The pose "
+                         "benchmark trajectories use test/pose.")
     ap.add_argument("--no_depth", action="store_true",
                     help="skip scene_points entirely (leaves the tarballs packed) and write "
                          "images + poses only. For the pose-eval sequences, whose ATE never "
@@ -250,7 +259,7 @@ def main():
             continue
         split, ids = split_map[name]
         if args.skip_existing and osp.isfile(
-                osp.join(out_root, args.out_split or split, name, "meta.json")):
+                osp.join(out_root, args.out_split or OUT_SPLIT_DIR[split], name, "meta.json")):
             print(f"[{i}/{len(names)}] SKIP done: {name}", flush=True)
             continue
         t1 = time.time()

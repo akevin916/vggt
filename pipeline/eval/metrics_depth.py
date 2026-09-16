@@ -202,3 +202,29 @@ def average_depth_results(per_seq: Dict[str, Dict[str, float]],
         return {k: 0.0 for k in METRIC_KEYS}
     weights = np.array([v[weight_key] for v in valid], dtype=np.float64)
     return {k: float(np.average([v[k] for v in valid], weights=weights)) for k in METRIC_KEYS}
+
+
+def global_median_scale(pred_depths: List[np.ndarray], gt_depths: List[np.ndarray],
+                        min_depth: float = 0.0, max_depth: float = 1e9) -> float:
+    """One scale for a whole sequence: ``median(gt) / median(pred)`` over every valid pixel
+    pooled across all frames, not fit per frame.
+
+    Per-frame median scaling (the ``depth_evaluation(align_with_lad2=False)`` default) absorbs
+    any frame-to-frame drift into the alignment before a caller ever sees it, which is exactly
+    what a cross-frame check needs left IN. diag/washout_impact.py and diag/vis/point_track_glare.py
+    both need this single-scale regime, for the same reason: they exist to see whether the SAME
+    surface, reconstructed from different frames, lands in the same place -- a question a
+    per-frame fit is constructed to hide.
+    """
+    gts, prs = [], []
+    for p, g in zip(pred_depths, gt_depths):
+        m = (g > min_depth) & (g < max_depth)
+        if m.sum() == 0:
+            continue
+        gts.append(g[m])
+        prs.append(p[m])
+    if not gts:
+        return 1.0
+    gt_all, pr_all = np.concatenate(gts), np.concatenate(prs)
+    pr_med = float(np.median(pr_all))
+    return float(np.median(gt_all) / pr_med) if pr_med > 0 else 1.0

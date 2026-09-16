@@ -75,6 +75,7 @@ train = keyframe1/2、val = keyframe3、test = keyframe4。`val ATE` = channel B
 | **`wide`（arm 3）** | `..._wide` | 唯一 delta：`nearby_expand_range: 120` | **0.8150** / 0.8240 | ✅ 完成。**val ATE 與 depth 多張最佳** |
 | `depth` | `..._depth` | `loss.depth` 開 + `depth_head` 解凍 | 0.8566 / 0.9246 | ❌ **負結果**（見 §6.4） |
 | `depth_lowalpha` | `..._depth_lowalpha` | 同上但 `alpha: 0.2 → 0.02` | — | ⬜ **尚未跑** |
+| **Colon版** | `scared_selfsup_ca3` | **無 GT 監督**（`camera: null`）：photometric + ColonAdapter 式光流跨幀 3D 一致性、光流遮擋遮罩、conf 加權；warm start `VGGT-1B`、`depth_head` 解凍 | 1.8062（best） | ✅ 完成。自監督線代表版，test 數字見 [results/medical.md](results/medical.md) §1 |
 
 **逐 epoch val ATE**（channel B，full-seq SCARED）：
 

@@ -9,7 +9,7 @@
 
 ## 1. 這條線做了什麼
 
-[monst3r_design.md](monst3r_design.md) 記錄了前兩次移植 MonST3R 的失敗（`static_photo` 完全無效、`camera_smooth` 有效但不足）。這是第三次，也是唯一一次把**幾何式子逐行搬對**的：MonST3R 的視差形式 ego-flow（[ego_flow.py](../../training/ego_flow.py)）、smooth-L1、逐像素離群丟棄。
+[monst3r_design.md](monst3r_design.md) 記錄了前兩次移植 MonST3R 的失敗（`static_photo` 完全無效、`camera_smooth` 有效但不足）。這是第三次，也是唯一一次把**幾何式子逐行搬對**的：MonST3R 的視差形式 ego-flow（[ego_flow.py](../../pipeline/training/ego_flow.py)）、smooth-L1、逐像素離群丟棄。
 
 **但 target 換成 GT 導出的 ego-flow，不是 RAFT。** 這個替換不是細節：MonST3R 的 RAFT target 有價值正是因為它**不知道 GT**，那是無標註優化下唯一的外部錨。換成 GT 導出之後，這是一個**像素空間、按視差加權的 reprojection loss**，不是 MonST3R flow loss 的移植——論文不得如此宣稱。
 
@@ -177,11 +177,11 @@ run 2 完全沒有訓練深度，退化幅度卻與 run 1 相當。原因是解�
 
 | 檔案 | 角色 |
 |---|---|
-| [`training/ego_flow.py`](../../training/ego_flow.py) | 可微分視差形式 ego-flow（MonST3R `goem_opt.py:196` 移植），額外回傳 z 供 z≤0 遮罩 |
-| [`training/loss.py`](../../training/loss.py) `compute_ego_flow_loss` | loss 本體。`use_gt_depth` / `target_from_pose_encoding` / `max_depth_ratio` 三個開關與其理由都寫在 docstring |
-| ~~`training/diag/ego_flow_selftest.py`~~ | 恆等 / 擾動 / 重複幀三項檢查 + 地板分解。⚠️ **已於 2026-08-19 的 diag 整理中刪除**，本文的數字是它留下的唯一產物 |
-| ~~`training/diag/ego_flow_residual.py`~~ | 量這個 loss 真正最小化的殘差（直接呼叫 loss 本身，不重寫幾何）。⚠️ **已於 2026-08-19 的 diag 整理中刪除** |
-| ~~`training/diag/train_health.py`~~ | 訓練健康紅綠燈（四關），只讀 `log.txt` 與 `pose_eval/`。⚠️ **已於 2026-08-19 的 diag 整理中刪除**，`diag/vis/train_curves.py` 讀同一份 `log.txt` |
+| [`pipeline/training/ego_flow.py`](../../pipeline/training/ego_flow.py) | 可微分視差形式 ego-flow（MonST3R `goem_opt.py:196` 移植），額外回傳 z 供 z≤0 遮罩 |
+| [`pipeline/training/loss.py`](../../pipeline/training/loss.py) `compute_ego_flow_loss` | loss 本體。`use_gt_depth` / `target_from_pose_encoding` / `max_depth_ratio` 三個開關與其理由都寫在 docstring |
+| ~~`pipeline/diag/ego_flow_selftest.py`~~ | 恆等 / 擾動 / 重複幀三項檢查 + 地板分解。⚠️ **已於 2026-08-19 的 diag 整理中刪除**，本文的數字是它留下的唯一產物 |
+| ~~`pipeline/diag/ego_flow_residual.py`~~ | 量這個 loss 真正最小化的殘差（直接呼叫 loss 本身，不重寫幾何）。⚠️ **已於 2026-08-19 的 diag 整理中刪除** |
+| ~~`pipeline/diag/train_health.py`~~ | 訓練健康紅綠燈（四關），只讀 `log.txt` 與 `pose_eval/`。⚠️ **已於 2026-08-19 的 diag 整理中刪除**，`diag/vis/train_curves.py` 讀同一份 `log.txt` |
 | `config/inst_gts_egoflow{,_gt,_gt_mask}.yaml` | 三個 run 的 config，header 記錄各自的證據狀態 |
 
 ### 兩個被實測否證、但程式保留的想法
@@ -207,7 +207,7 @@ run 2 完全沒有訓練深度，退化幅度卻與 run 1 相當。原因是解�
 
 | 項目 | 值 |
 |---|---|
-| script | `training/diag/flow_loss_probe.py --dataset po` ⚠️ 已於 2026-08-19 刪除，此表不可重跑 |
+| script | `pipeline/diag/flow_loss_probe.py --dataset po` ⚠️ 已於 2026-08-19 刪除，此表不可重跑 |
 | ckpt | `logs/inst_gts/ckpts/epoch_40.pt` |
 | 資料 | PointOdyssey **train** split，20 clips × 16 幀，`dynamic_source=instance` |
 | 幀對 | clip 內相鄰對，**Δt ≤ 5**（對齊 `dynmask_inst` 的 gap-5 基準），雙向，n = 388 rows |
@@ -312,7 +312,7 @@ NaN 率 0.0%;`per_pixel_thre=50` 的保留率 99.4~99.8%。
 
 | 項目 | 值 |
 |---|---|
-| script | `training/diag/flow_pose_headroom.py` ⚠️ 已於 2026-08-19 刪除，此表不可重跑 |
+| script | `pipeline/diag/flow_pose_headroom.py` ⚠️ 已於 2026-08-19 刪除，此表不可重跑 |
 | ckpt | `logs/inst_gts/ckpts/epoch_30.pt`(ATE 0.1343) |
 | 做什麼 | **網路凍結**，只把它輸出的 pose 當變數微調(每幀 6 個數，初值 0)，最小化對 RAFT 的 flow 殘差 |
 | 序列 | Sintel 14 seq，每序列前 50 幀，**Δt=1** |
@@ -368,7 +368,7 @@ NaN 率 0.0%;`per_pixel_thre=50` 的保留率 99.4~99.8%。
 
 | 項目 | 值 |
 |---|---|
-| script | `training/diag/flow_observability.py` ⚠️ 已於 2026-08-19 刪除，此表不可重跑 |
+| script | `pipeline/diag/flow_observability.py` ⚠️ 已於 2026-08-19 刪除，此表不可重跑 |
 | ckpt | 同表 6(`epoch_30`) |
 | 做什麼 | 擾動預測位姿，量 **ego_flow 變了多少**(px)。旋轉與平移分開擾動 |
 | 擾動幅度 | 旋轉 0.005 rad/幀；平移 = **軌跡長度的 1%**/幀。隨機方向 20 次取平均 |

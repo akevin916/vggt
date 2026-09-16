@@ -49,7 +49,7 @@ def gt_tum(E: np.ndarray, fids: np.ndarray):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="logs/scared_cam_b16_gg/ckpts/best_ate.pt")
-    ap.add_argument("--seq", default="pose_seq/dataset3/keyframe4")
+    ap.add_argument("--seq", default="test/pose/dataset3/keyframe4")
     ap.add_argument("--scared_root", default=data_path("train", "scared"))
     ap.add_argument("--n_frames", type=int, default=80, help="contiguous window, one pass")
     ap.add_argument("--start", type=int, default=0)

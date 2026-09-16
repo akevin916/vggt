@@ -29,6 +29,9 @@ def load_vggt_for_eval(
     force_point: bool = False,
     gate_leaky: float = 0.0,
     gate_bias_zero_ref: bool = False,
+    gate_bias_scale: float | None = None,
+    gate_bias_a: float = 1.0,
+    gate_bias_tau: float = 0.0,
     verbose: bool = True,
 ) -> VGGT:
     """Build VGGT with architecture inferred from checkpoint keys.
@@ -65,6 +68,9 @@ def load_vggt_for_eval(
         gate_block_iter=gate_block_iter,
         gate_leaky=gate_leaky,
         gate_bias_zero_ref=gate_bias_zero_ref,
+        gate_bias_scale=gate_bias_scale,
+        gate_bias_a=gate_bias_a,
+        gate_bias_tau=gate_bias_tau,
     )
     miss, unexp = model.load_state_dict(sd, strict=False)
     if verbose:
@@ -251,12 +257,21 @@ def infer_sequence_stitched(
     chunk_size: int = 64,
     overlap: int = 16,
     gate_logits_override: Optional[torch.Tensor] = None,
+    want_depth: bool = False,
 ) -> Dict[str, np.ndarray]:
     """Whole-sequence poses from overlapping chunks joined by a per-seam Sim3.
 
     Returns ``extrinsic`` (S,3,4) in one common frame plus ``intrinsic``/``pose_enc`` and
-    ``chunk_seams`` / ``stitch_scales`` for diagnostics. Depth is NOT returned: each chunk
-    carries its own scale, and rescaling depth by the seam factor would quietly mix regimes.
+    ``chunk_seams`` / ``stitch_scales`` for diagnostics.
+
+    ``want_depth`` additionally returns each frame's depth multiplied by its own chunk's
+    seam scale. That is exactly the transform the poses already got -- unprojection is
+    linear in depth and the chunk's c2w has been rotated and translated by the same Sim3,
+    so ``depth * s`` with the stitched extrinsic puts every chunk's surface in the ONE
+    frame the poses live in. It is what a long-sequence point cloud needs and it is off by
+    default anyway, because the resulting depth is expressed in chunk 0's arbitrary units
+    with every later chunk rescaled into them: FOR VIEWING AND FUSION ONLY, never for a
+    depth metric, which must come from a single unstitched forward pass.
     """
     n = len(image_paths)
     if chunk_size <= 0 or n <= chunk_size:
@@ -273,6 +288,7 @@ def infer_sequence_stitched(
     c2w_out = np.zeros((n, 4, 4))
     intr_out = [None] * n
     penc_out = [None] * n
+    depth_out = None
     filled = np.zeros(n, dtype=bool)
     scales, seams = [], []
 
@@ -281,6 +297,7 @@ def infer_sequence_stitched(
         ov = (gate_logits_override[:, sl] if gate_logits_override is not None else None)
         pred = infer_sequence(model, image_paths[sl], device=device, gate_logits_override=ov)
         c2w = _extrinsic_to_c2w(pred["extrinsic"])
+        s_chunk = 1.0
 
         if ci > 0:
             shared = np.arange(sl.start, sl.stop)[filled[sl]]
@@ -293,7 +310,8 @@ def infer_sequence_stitched(
             T[:3, :3], T[:3, 3] = R, t
             c2w[:, :3, 3] = (s * (R @ c2w[:, :3, 3].T)).T + t   # centres: scaled+rotated
             c2w[:, :3, :3] = R @ c2w[:, :3, :3]                  # orientations: rotated only
-            scales.append(float(s))
+            s_chunk = float(s)
+            scales.append(s_chunk)
             seams.append(int(sl.start))
 
         # Keep the earlier chunk's estimate on shared frames: it was fitted, not extrapolated.
@@ -302,12 +320,19 @@ def infer_sequence_stitched(
         for j in new:
             intr_out[j] = pred["intrinsic"][j - sl.start]
             penc_out[j] = pred["pose_enc"][j - sl.start]
+        if want_depth:
+            if "depth" not in pred:
+                raise RuntimeError("want_depth=True but the model has no depth head")
+            d = pred["depth"]
+            if depth_out is None:
+                depth_out = np.zeros((n,) + d.shape[1:], dtype=np.float32)
+            depth_out[new] = d[new - sl.start] * s_chunk
         filled[sl] = True
 
     if not filled.all():
         raise RuntimeError(f"{int((~filled).sum())} frames never covered by a chunk")
 
-    return {
+    out = {
         "extrinsic": _c2w_to_extrinsic(c2w_out).astype(np.float32),
         "intrinsic": np.stack(intr_out),
         "pose_enc": np.stack(penc_out),
@@ -316,3 +341,7 @@ def infer_sequence_stitched(
         "chunk_seams": np.array(seams, dtype=np.int32),
         "stitch_scales": np.array(scales, dtype=np.float64),
     }
+    if want_depth:
+        out["depth"] = depth_out
+        out["input_hw"] = np.array(depth_out.shape[1:3], dtype=np.int32)
+    return out
