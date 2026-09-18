@@ -32,6 +32,8 @@ def load_vggt_for_eval(
     gate_bias_scale: float | None = None,
     gate_bias_a: float = 1.0,
     gate_bias_tau: float = 0.0,
+    dual_stream_scope: str = "camera",
+    dual_stream_start: int = 8,
     verbose: bool = True,
 ) -> VGGT:
     """Build VGGT with architecture inferred from checkpoint keys.
@@ -53,6 +55,13 @@ def load_vggt_for_eval(
     # (method §7.2). The head is then random-init and only useful once real weights are
     # grafted in -- see graft_point_head.
     has_point = any(k.startswith("point_head") for k in keys) or force_point
+    # Dual-stream bias: its only weight is aggregator.dual_stream_p. Without this detection the
+    # key is dropped as "unexpected" under strict=False and the checkpoint is silently scored
+    # with the bias OFF. Scope/start are NOT stored in weights -- defaults match scared_cam_dual.
+    has_dual = "aggregator.dual_stream_p" in sd
+    # Illumination token: it shifts patch_start_idx by one, so loading an illu checkpoint without
+    # it would not merely drop a head -- every head would read the token grid off by one slot.
+    has_illu = "aggregator.illu_token" in sd
 
     if require_gate and not has_gate:
         raise SystemExit(f"checkpoint has no gate_predictor weights: {ckpt}")
@@ -71,8 +80,14 @@ def load_vggt_for_eval(
         gate_bias_scale=gate_bias_scale,
         gate_bias_a=gate_bias_a,
         gate_bias_tau=gate_bias_tau,
+        enable_dual_stream=has_dual,
+        dual_stream_scope=dual_stream_scope,
+        dual_stream_start=dual_stream_start,
+        enable_illu=has_illu,
     )
     miss, unexp = model.load_state_dict(sd, strict=False)
+    if verbose and has_dual:
+        print(f"dual-stream ON: scope={dual_stream_scope} start={dual_stream_start} (not stored in ckpt)")
     if verbose:
         if has_gate:
             n_gate = sum(1 for k in sd if "gate_predictor" in k)

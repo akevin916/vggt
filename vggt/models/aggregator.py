@@ -134,6 +134,9 @@ class Aggregator(nn.Module):
         dual_stream_scope: str = "camera",  # "camera": camera/register queries only; "all": every query
         dual_stream_start: int = 8,         # global blocks [start, depth) get the bias
         dual_stream_init: float = 0.01,     # |p| init; exactly 0 would sit on abs()'s zero-gradient point
+        dual_stream_signal: str = "dino",   # "dino": patch-embed cosine; "gap": -|i-j| frame-order prior
+        # illumination token (IlluVGGT minimal version): one extra special token per frame
+        enable_illu: bool = False,
     ):
         super().__init__()
 
@@ -301,20 +304,37 @@ class Aggregator(nn.Module):
         self.enable_dual_stream = enable_dual_stream
         self.dual_stream_scope = dual_stream_scope
         self.dual_stream_start = int(dual_stream_start)
+        if dual_stream_signal not in ("dino", "gap"):
+            raise ValueError(f"dual_stream_signal must be 'dino' or 'gap', got {dual_stream_signal}")
         if enable_dual_stream:
             self.dual_stream_p = nn.Parameter(torch.full((depth,), float(dual_stream_init)))
+            # Signal id lives in the state_dict (0 = dino, 1 = gap) so a checkpoint carries it: an eval
+            # loader that builds the model with the default "dino" still scores a gap run correctly.
+            # Older dual checkpoints lack the key and keep the constructed value (dino).
+            self.register_buffer("dual_stream_signal_id",
+                                 torch.tensor(int(dual_stream_signal == "gap")), persistent=True)
 
         # Note: We have two camera tokens, one for the first frame and one for the rest
         # The same applies for register tokens
         self.camera_token = nn.Parameter(torch.randn(1, 2, 1, embed_dim))
         self.register_token = nn.Parameter(torch.randn(1, 2, num_register_tokens, embed_dim))
 
-        # The patch tokens start after the camera and register tokens
-        self.patch_start_idx = 1 + num_register_tokens
+        # Illumination token: sits right after the register tokens, so the per-frame layout becomes
+        # [camera, register x4, illu, patch x P]. One slot shared by every frame -- unlike the
+        # camera token there is no reason to single out the reference frame. With the flag off no
+        # parameter is built and patch_start_idx is unchanged, so pretrained loading is untouched.
+        # Every consumer reads patch_start_idx dynamically, so the shift propagates by itself.
+        self.enable_illu = enable_illu
+        self.illu_token = nn.Parameter(torch.randn(1, 1, 1, embed_dim)) if enable_illu else None
+
+        # The patch tokens start after the camera, register (and illumination) tokens
+        self.patch_start_idx = 1 + num_register_tokens + int(enable_illu)
 
         # Initialize parameters with small values
         nn.init.normal_(self.camera_token, std=1e-6)
         nn.init.normal_(self.register_token, std=1e-6)
+        if self.illu_token is not None:
+            nn.init.normal_(self.illu_token, std=1e-6)
 
         # Register normalization constants as buffers
         for name, value in (("_resnet_mean", _RESNET_MEAN), ("_resnet_std", _RESNET_STD)):
@@ -405,7 +425,10 @@ class Aggregator(nn.Module):
         register_token = slice_expand_and_flatten(self.register_token, B, S)
 
         # Concatenate special tokens with patch tokens
-        tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
+        special = [camera_token, register_token]
+        if self.illu_token is not None:
+            special.append(self.illu_token.reshape(1, 1, C).expand(B * S, 1, C))
+        tokens = torch.cat(special + [patch_tokens], dim=1)
 
         pos = None
         if self.rope is not None:
@@ -507,10 +530,16 @@ class Aggregator(nn.Module):
         return tokens, frame_idx, intermediates
 
     def _dual_stream_similarity(self, patch_tokens, B, S):
-        """Row-standardised frame-pair DINO similarity z [B, S, S] (no grad; patch_embed is frozen)."""
+        """Row-standardised frame-pair similarity z [B, S, S] (no grad; patch_embed is frozen).
+        signal id 0: DINO cosine. 1: -|i-j| over frame ORDER (batches are time-sorted), the
+        content-free control for "is DINO more than a temporal-distance prior"."""
         with torch.no_grad():
-            f = F.normalize(patch_tokens.float().mean(dim=1).view(B, S, -1), dim=-1)
-            sim = f @ f.transpose(1, 2)                                    # [B, S, S]
+            if int(self.dual_stream_signal_id) == 1:
+                t = torch.arange(S, device=patch_tokens.device, dtype=torch.float32)
+                sim = -(t[:, None] - t[None]).abs().expand(B, S, S)
+            else:
+                f = F.normalize(patch_tokens.float().mean(dim=1).view(B, S, -1), dim=-1)
+                sim = f @ f.transpose(1, 2)                                # [B, S, S]
             eye = torch.eye(S, dtype=torch.bool, device=sim.device)
             off = sim.masked_fill(eye, float("nan"))
             med = off.nanmedian(dim=-1, keepdim=True).values

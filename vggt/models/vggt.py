@@ -12,6 +12,7 @@ from vggt.models.aggregator import Aggregator
 from vggt.heads.camera_head import CameraHead
 from vggt.heads.dpt_head import DPTHead
 from vggt.heads.track_head import TrackHead
+from vggt.heads.illu_head import IlluminationHead
 
 
 class VGGT(nn.Module, PyTorchModelHubMixin):
@@ -26,7 +27,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                  gate_bias_zero_ref=False,
                  gate_bias_scale=None, gate_bias_a=1.0, gate_bias_tau=0.0, gate_bias_learn=False,
                  enable_dual_stream=False, dual_stream_scope="camera", dual_stream_start=8,
-                 dual_stream_init=0.01):
+                 dual_stream_init=0.01, dual_stream_signal="dino",
+                 enable_illu=False):
         super().__init__()
 
         # NEW: enable_temporal injects temporal attention into the aggregator (aa_order gains "temporal").
@@ -40,12 +42,16 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             gate_bias_learn=gate_bias_learn,
             enable_dual_stream=enable_dual_stream, dual_stream_scope=dual_stream_scope,
             dual_stream_start=dual_stream_start, dual_stream_init=dual_stream_init,
+            dual_stream_signal=dual_stream_signal,
+            enable_illu=enable_illu,
         )
 
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None
         self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1") if enable_point else None
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1") if enable_depth else None
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size) if enable_track else None
+        # illumination head: reads the aggregator's illumination token (enable_illu)
+        self.illu_head = IlluminationHead(dim_in=2 * embed_dim) if enable_illu else None
 
         # The v1/v2 motion_head (per-pixel dynamic probability) and flow_head (scene flow Δ) were
         # REMOVED 2026-08-31 together with the losses that consumed them: both lines were
@@ -120,6 +126,15 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 )
                 predictions["world_points"] = pts3d
                 predictions["world_points_conf"] = pts3d_conf
+
+            if self.illu_head is not None:
+                # the illumination token is the last special token, right before the patches
+                illu_tok = aggregated_tokens_list[-1][:, :, patch_start_idx - 1].float()
+                predictions["illu_log16"] = self.illu_head(illu_tok)  # [B, S, 16, 16], log
+                if not self.training:
+                    predictions["illu_map"] = IlluminationHead.upsample(
+                        predictions["illu_log16"], images.shape[-2], images.shape[-1]
+                    )
 
         if self.track_head is not None and query_points is not None:
             track_list, vis, conf = self.track_head(

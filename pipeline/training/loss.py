@@ -39,6 +39,7 @@ class MultitaskLoss(torch.nn.Module):
                  camera_smooth=None,  # Extension: camera-trajectory smoothness regularizer
                  ego_flow=None,       # Extension: pixel-space ego-flow reprojection consistency
                  influence=None,      # illumination robustness: cross-view appearance influence loss
+                 illu=None,           # illumination-token supervision (IlluVGGT minimal version)
                  **kwargs):
         super().__init__()
         # Loss configuration dictionaries for each task
@@ -54,6 +55,7 @@ class MultitaskLoss(torch.nn.Module):
         self.camera_smooth = camera_smooth  # Extension: camera-trajectory smoothness regularizer
         self.ego_flow = ego_flow  # Extension: ego-flow reprojection consistency (MonST3R geometry, GT target)
         self.influence = influence  # L_inf -- bound one view's appearance influence on the others
+        self.illu = illu            # L_illu -- illumination head vs GT-depth shading
 
     def forward(self, predictions, batch) -> torch.Tensor:
         """
@@ -167,6 +169,15 @@ class MultitaskLoss(torch.nn.Module):
             total_loss = total_loss + inf_loss * self.influence.get("weight", 1.0)
             loss_dict.update(inf_dict)
             loss_dict["loss_influence"] = inf_loss
+
+        # Illumination token supervision: the head's coarse log map against a shading target
+        # derived from GT depth. weight 0 is a real arm (token capacity only), and the term is
+        # still computed there so the head stays in the graph -- DDP runs with
+        # find_unused_parameters=False and would otherwise fail on the unused head.
+        if self.illu is not None and "illu_log16" in predictions:
+            illu_dict = compute_illu_loss(predictions, batch, **self.illu)
+            total_loss = total_loss + illu_dict["loss_illu"] * self.illu.get("weight", 1.0)
+            loss_dict.update(illu_dict)
 
         # Tracking loss - not cleaned yet, dirty code is at the bottom of this file
         if "track" in predictions:
@@ -1241,6 +1252,115 @@ def compute_gate_loss(predictions, batch, patch_size=14, alpha_m=10.0, beta_m=0.
         )
     loss = check_and_fix_inf_nan(loss, "loss_gate")
     return {"loss_gate": loss}
+
+
+def _gaussian_blur_nc(x, sigma):
+    """Separable Gaussian blur of [N,1,H,W], replicate-padded."""
+    rad = max(1, int(ceil(3 * sigma)))
+    t = torch.arange(-rad, rad + 1, device=x.device, dtype=x.dtype)
+    k = torch.exp(-0.5 * (t / sigma) ** 2)
+    k = k / k.sum()
+    x = F.conv2d(F.pad(x, (rad, rad, 0, 0), mode="replicate"), k.view(1, 1, 1, -1))
+    return F.conv2d(F.pad(x, (0, 0, rad, rad), mode="replicate"), k.view(1, 1, -1, 1))
+
+
+def illu_shading_target(depths, intrinsics, valid, target="phys", smooth_sigma=1.0):
+    """Log near-field shading from depth, per pixel. The light is assumed at the camera centre.
+
+      phys:  log( |n . v| / r^2 )   n = surface normal, v = unit direction to the camera
+      invr2: log( 1 / r^2 )         the distance term alone -- the control that separates
+                                    "illumination supervision" from "depth supervision in disguise"
+
+    depths [N,H,W], intrinsics [N,3,3], valid [N,H,W] bool -> (log_s [N,H,W], valid [N,H,W]).
+    Depth is smoothed first by NORMALIZED convolution (invalid pixels neither contribute nor get
+    averaged in as zeros); raw depth quantisation otherwise dominates the finite-difference normals.
+    Absolute depth scale only shifts log_s by a constant, which the loss removes per frame.
+    """
+    N, H, W = depths.shape
+    m = valid.float().unsqueeze(1)
+    d = depths.unsqueeze(1) * m
+    if smooth_sigma > 0:
+        den = _gaussian_blur_nc(m, smooth_sigma)
+        d = _gaussian_blur_nc(d, smooth_sigma) / den.clamp_min(1e-3)
+        m = m * (den > 1e-3).float()
+    d = d[:, 0]
+    valid = (m[:, 0] > 0) & (d > 0)
+
+    fx, fy = intrinsics[:, 0, 0].view(N, 1, 1), intrinsics[:, 1, 1].view(N, 1, 1)
+    cx, cy = intrinsics[:, 0, 2].view(N, 1, 1), intrinsics[:, 1, 2].view(N, 1, 1)
+    v, u = torch.meshgrid(torch.arange(H, device=d.device, dtype=d.dtype),
+                          torch.arange(W, device=d.device, dtype=d.dtype), indexing="ij")
+    P = torch.stack([(u - cx) / fx * d, (v - cy) / fy * d, d], dim=-1)  # [N,H,W,3]
+    r = P.norm(dim=-1).clamp_min(1e-6)
+    log_s = -2.0 * torch.log(r)
+
+    if target == "phys":
+        dx = torch.zeros_like(P)
+        dy = torch.zeros_like(P)
+        dx[:, :, 1:-1] = P[:, :, 2:] - P[:, :, :-2]
+        dy[:, 1:-1] = P[:, 2:] - P[:, :-2]
+        n = F.normalize(torch.cross(dx, dy, dim=-1), dim=-1)
+        cos = (n * (-P / r.unsqueeze(-1))).sum(-1).abs()  # visible surface faces the camera
+        log_s = log_s + torch.log(cos.clamp_min(1e-3))
+        # a central difference needs both neighbours valid; also drop the image border
+        nb = -F.max_pool2d(-valid.float().unsqueeze(1), 3, stride=1, padding=1)[:, 0]
+        valid = valid & (nb > 0)
+        valid[:, [0, -1], :] = False
+        valid[:, :, [0, -1]] = False
+    elif target != "invr2":
+        raise ValueError(f"illu target must be 'phys' or 'invr2', got {target}")
+    return log_s, valid
+
+
+def compute_illu_loss(predictions, batch, target="phys", smooth_sigma=1.0, min_valid_frac=0.5, **kwargs):
+    """Scale-invariant L1 between the illumination head's log map and GT-depth shading.
+
+    The target is pooled to the head's own grid in log space (valid pixels only), and a cell
+    counts only if at least `min_valid_frac` of it is valid. Per frame the residual is shifted by
+    its (detached) median before the L1, so neither the trainer's per-sample depth normalisation
+    nor the unknown light intensity matters. Computed at the grid, not upsampled: one token
+    cannot express texture, and a full-resolution comparison would bake that in as an
+    irreducible floor (the same trap as the gate's soft-label BCE).
+
+    Also returns `loss_illu_corr`, the per-frame Pearson correlation over kept cells averaged
+    over frames -- logged only, never added to the objective. It answers "did the head learn the
+    target at all", which the shifted L1 alone does not.
+    """
+    pred = predictions["illu_log16"].float()  # [B,S,g,g]
+    B, S, g, _ = pred.shape
+    depths = batch["depths"].float()
+    H, W = depths.shape[-2:]
+
+    with torch.no_grad():
+        log_s, valid = illu_shading_target(
+            depths.reshape(B * S, H, W), batch["intrinsics"].float().reshape(B * S, 3, 3),
+            batch["point_masks"].reshape(B * S, H, W).bool(), target=target, smooth_sigma=smooth_sigma,
+        )
+        vf = valid.float().unsqueeze(1)
+        frac = F.adaptive_avg_pool2d(vf, g)
+        tgt = F.adaptive_avg_pool2d(torch.where(valid, log_s, 0.0).unsqueeze(1), g) / frac.clamp_min(1e-6)
+        tgt = tgt.view(B, S, g * g)
+        keep = (frac.view(B, S, g * g) >= min_valid_frac)
+
+    e = pred.view(B, S, g * g) - tgt
+    losses, corrs = [], []
+    for b in range(B):
+        for s in range(S):
+            k = keep[b, s]
+            if k.sum() < 4:
+                continue
+            eb = e[b, s][k]
+            losses.append((eb - eb.median().detach()).abs().mean())
+            with torch.no_grad():
+                p = pred[b, s].reshape(-1)[k]
+                t = tgt[b, s][k]
+                p, t = p - p.mean(), t - t.mean()
+                corrs.append((p * t).sum() / (p.norm() * t.norm()).clamp_min(1e-8))
+
+    if not losses:  # no frame had enough valid depth: keep the head in the graph, contribute 0
+        return {"loss_illu": pred.sum() * 0.0, "loss_illu_corr": torch.zeros((), device=pred.device)}
+    loss = check_and_fix_inf_nan(torch.stack(losses).mean(), "loss_illu")
+    return {"loss_illu": loss, "loss_illu_corr": torch.stack(corrs).mean()}
 
 
 def oracle_gate_logits_from_mask(motion_mask: torch.Tensor, patch_size: int = 14, k: float = 30.0) -> torch.Tensor:
