@@ -165,6 +165,9 @@ class Trainer:
         #                report data; a complementary in-domain-generalization pick).
         self.best_ate = float("inf")
         self.best_loss = float("inf")
+        # Snapshot of the band centres at the first epoch boundary, so dual_stream.jsonl can
+        # report how far s has travelled from its (layer-symmetric) initialisation.
+        self._dual_stream_s0 = None
 
         # Store hyperparameters
         self.accum_steps = accum_steps
@@ -531,11 +534,13 @@ class Trainer:
           ``best_loss.pt`` -- lowest channel-A held-out (PO-test) camera loss (an unbiased
                               pick whose selection signal never touches the report data).
         """
+        self._snapshot_dual_stream_init()
         while self.epoch < self.max_epochs:
             set_seeds(self.seed_value + self.epoch * 100, self.max_epochs, self.distributed_rank)
 
             dataloader = self.train_dataset.get_loader(epoch=int(self.epoch + self.distributed_rank))
             self.train_epoch(dataloader)
+            self._log_dual_stream()
 
             # Clean up training memory before validation.
             del dataloader
@@ -955,9 +960,20 @@ class Trainer:
                     loss_meters[f"Grad/{key}"].update(grad_norm)
 
             # Optimizer step
-            for optim in self.optims:   
+            for optim in self.optims:
                 self.scaler.step(optim.optimizer)
             self.scaler.update()
+
+            # Frame-distance band: range projection + schedule counter, one tick per OPTIMIZER
+            # step (so accum_steps cannot accelerate the ramp), outside any forward.
+            agg = self._dual_stream_module()
+            if agg is not None:
+                agg.dual_stream_post_step_()
+                # Extra samples inside the first epoch: the ramp is still climbing here, and
+                # "s never moved" is the failure this log exists to catch -- waiting for the
+                # epoch boundary to find out wastes the epoch.
+                if self.epoch == 0 and int(agg.dual_stream_steps) in (100, 300, 600, 1000):
+                    self._log_dual_stream()
 
             # Measure elapsed time
             batch_time.update(time.time() - end)
@@ -1174,6 +1190,81 @@ class Trainer:
 
         self.steps[phase] += 1
         return loss_dict, y_hat
+
+    def _dual_stream_module(self):
+        """The aggregator, if this run has the frame-distance band bias; else None."""
+        model = self.model.module if isinstance(
+            self.model, torch.nn.parallel.DistributedDataParallel
+        ) else self.model
+        agg = getattr(model, "aggregator", None)
+        return agg if getattr(agg, "enable_dual_stream", False) else None
+
+    def _snapshot_dual_stream_init(self) -> None:
+        """Band centres as training starts (after any resume), the baseline for s_shift_max.
+
+        Also checks the schedule counter against the trainer's own step count. The two are
+        counted independently (buffer in the model, self.steps in the checkpoint dict), so a
+        mismatch after a resume means the ramp is running off a different clock than the run --
+        which would otherwise produce no warning at all.
+        """
+        agg = self._dual_stream_module()
+        if agg is None:
+            return
+        self._dual_stream_s0 = agg.dual_stream_log_s.detach().float().exp().cpu()
+        band, trained = int(agg.dual_stream_steps), int(self.steps["train"])
+        if band != trained:
+            # A fresh start off VGGT-1B has neither key, so both are 0 and this stays quiet.
+            logging.warning(
+                "dual_stream_steps (%d) != trainer train steps (%d): the band schedule is "
+                "out of step with the run (checkpoint lacking the buffer?)", band, trained,
+            )
+
+    def _log_dual_stream(self) -> None:
+        """Dump the frame-distance band parameters, once per epoch, to logs/<exp>/dual_stream.jsonl.
+
+        Three readings the ATE curve cannot give: whether the model WANTS the band (beta), how the
+        per-head band centres s move away from their layer-symmetric init (the scatter plot), and
+        whether s moves at all in the first epochs (too-weak gradient => the schedule or the lr
+        group is wrong, and that is worth catching after epoch 1 rather than after epoch 10).
+        """
+        agg = self._dual_stream_module()
+        if self.rank != 0 or agg is None:
+            return
+
+        with torch.no_grad():
+            beta = agg.dual_stream_beta.detach().float().cpu()
+            s = agg.dual_stream_log_s.detach().float().exp().cpu()
+            sigma = agg.dual_stream_log_sigma.detach().float().exp().cpu()
+        start = agg.dual_stream_start
+        if self._dual_stream_s0 is None:          # init snapshot, for the "did s move" column
+            self._dual_stream_s0 = s.clone()
+        active = slice(start, s.shape[0])         # blocks below start never see the bias
+
+        warm = float(agg._dual_stream_warm())
+        record = {
+            "epoch": int(self.epoch),
+            "train_steps": int(self.steps["train"]),
+            "band_steps": int(agg.dual_stream_steps),
+            # warm and beta_eff make the line self-contained: beta alone cannot tell you the
+            # strength that was actually in force when the line was written.
+            "warm": warm,
+            "beta_eff": [round(warm * float(x), 5) for x in beta[active]],
+            "start": int(start),
+            "beta": [round(float(x), 5) for x in beta[active]],
+            "s": [[round(float(x), 5) for x in row] for row in s[active]],
+            "sigma": [[round(float(x), 5) for x in row] for row in sigma[active]],
+            "s_shift_max": float((s[active] / self._dual_stream_s0[active]).log().abs().max()),
+        }
+        path = os.path.join(self.logging_conf.log_dir, "dual_stream.jsonl")
+        with open(path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+
+        step = self.steps["train"]
+        self.tb_writer.log("Dual/beta_median", float(beta[active].median()), step)
+        # spread of the 16 head centres WITHIN a layer: stays high = multi-scale division of
+        # labour, collapses = the heads agreed on one scale.
+        self.tb_writer.log("Dual/s_head_spread", float(s[active].log().std(dim=1).mean()), step)
+        self.tb_writer.log("Dual/s_shift_max", record["s_shift_max"], step)
 
     def _update_and_log_scalars(self, data: Mapping, phase: str, step: int, loss_meters: dict):
         """Updates average meters and logs scalar values to TensorBoard."""

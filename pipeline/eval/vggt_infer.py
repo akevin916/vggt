@@ -50,15 +50,36 @@ def load_vggt_for_eval(
     # oracle/off modes -- which override the predictor output -- are meaningful.
     has_gate = any("gate_predictor" in k for k in keys) or force_gate
     has_temporal = any("temporal" in k for k in keys)
+    # Weight-shared temporal variant: its ONLY weights are aggregator.temporal_ls.*, so the
+    # has_temporal test above fires but building 8 fresh blocks would score the checkpoint with
+    # random attention at LayerScale 0.01 (not identity) while temporal_ls is dropped as
+    # unexpected -- silently, under strict=False.
+    temporal_shared = any(k.startswith("aggregator.temporal_ls") for k in keys)
     has_depth = any(k.startswith("depth_head") for k in keys)
     # force_point: same idea for the point head, which the gate configs disable entirely
     # (method §7.2). The head is then random-init and only useful once real weights are
     # grafted in -- see graft_point_head.
     has_point = any(k.startswith("point_head") for k in keys) or force_point
-    # Dual-stream bias: its only weight is aggregator.dual_stream_p. Without this detection the
-    # key is dropped as "unexpected" under strict=False and the checkpoint is silently scored
-    # with the bias OFF. Scope/start are NOT stored in weights -- defaults match scared_cam_dual.
-    has_dual = "aggregator.dual_stream_p" in sd
+    # Frame-distance band bias. Without this detection its weights are dropped as "unexpected"
+    # under strict=False and the checkpoint is silently scored with the bias OFF. Scope/start are
+    # NOT stored in weights -- the defaults below match scared_cam_dual_kern.
+    has_dual = "aggregator.dual_stream_log_s" in sd
+    if "aggregator.dual_stream_p" in sd:
+        # Pre-2026-09-23 dual-stream: bias = sign_l * |p_l| * DINO-similarity. That forward no
+        # longer exists here; loading such a checkpoint would silently score it as plain VGGT.
+        raise SystemExit(
+            f"{ckpt} is a legacy dual-stream checkpoint (aggregator.dual_stream_p). Its forward "
+            "was replaced by the log-distance band bias; check out commit 18aa9fc to evaluate it."
+        )
+    if has_dual:
+        # Every buffer that decides the bias arithmetic must come from the checkpoint. Missing
+        # ones would fall back to this build's constructor defaults and reinterpret the trained
+        # log_s under different arithmetic -- with no error and no visible symptom.
+        need = ["aggregator.dual_stream_steps", "aggregator.dual_stream_warmup",
+                "aggregator.dual_stream_delta_mode", "aggregator.dual_stream_keep_mode"]
+        absent = [k for k in need if k not in sd]
+        if absent:
+            raise SystemExit(f"{ckpt} has dual_stream_log_s but lacks {absent}")
     # Illumination token: it shifts patch_start_idx by one, so loading an illu checkpoint without
     # it would not merely drop a head -- every head would read the token grid off by one slot.
     has_illu = "aggregator.illu_token" in sd
@@ -73,6 +94,7 @@ def load_vggt_for_eval(
         enable_point=has_point,
         enable_track=False,
         enable_temporal=has_temporal,
+        temporal_share_frame_weights=temporal_shared,
         enable_gate=has_gate,
         gate_block_iter=gate_block_iter,
         gate_leaky=gate_leaky,
@@ -87,7 +109,12 @@ def load_vggt_for_eval(
     )
     miss, unexp = model.load_state_dict(sd, strict=False)
     if verbose and has_dual:
-        print(f"dual-stream ON: scope={dual_stream_scope} start={dual_stream_start} (not stored in ckpt)")
+        agg = model.aggregator
+        print(f"dual-stream ON: scope={dual_stream_scope} start={dual_stream_start} "
+              f"(not stored in ckpt), steps={int(agg.dual_stream_steps)} "
+              f"warmup={int(agg.dual_stream_warmup)} warm={agg._dual_stream_warm():.3f} "
+              f"delta_mode={int(agg.dual_stream_delta_mode)} "
+              f"keep_mode={int(agg.dual_stream_keep_mode)}")
     if verbose:
         if has_gate:
             n_gate = sum(1 for k in sd if "gate_predictor" in k)

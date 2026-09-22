@@ -451,6 +451,13 @@ def main():
     with open(p, "w") as f:
         json.dump(payload, f, indent=2)
     print(f"\n-> {p}")
+    import torch  # module-level import is deliberately avoided in this script
+    if torch.cuda.is_available():
+        # Deterministic, and the unit any VRAM budget should be argued in. reserved is what
+        # nvidia-smi sees; reserved - allocated is fragmentation, i.e. how much
+        # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True could plausibly give back.
+        print(f"peak VRAM: allocated {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB | "
+              f"reserved {torch.cuda.max_memory_reserved() / 2**30:.2f} GiB")
 
 
 if __name__ == "__main__":

@@ -1312,13 +1312,37 @@ def illu_shading_target(depths, intrinsics, valid, target="phys", smooth_sigma=1
     return log_s, valid
 
 
-def compute_illu_loss(predictions, batch, target="phys", smooth_sigma=1.0, min_valid_frac=0.5, **kwargs):
-    """Scale-invariant L1 between the illumination head's log map and GT-depth shading.
+def illu_msr_target(images, sigmas=(15.0, 80.0, 250.0), down=4):
+    """Log illumination from the image alone: the multi-scale Retinex surround, mean_k log(G_sk * Y).
+
+    images [N,3,H,W] in [0,1] -> (log_s [N,H,W], valid [N,H,W] all True). Needs no depth, so it
+    works on SCARED, whose sparse GT depth cannot feed the phys/invr2 targets (keep_frac 0.0026).
+    Blurred at 1/`down` resolution with sigma/`down` -- the target is pooled to 16x16 anyway.
+    Unlike the depth targets this one is a fixed function of the input: whatever value it has
+    must come from the token isolating per-frame brightness, not from information the image lacks.
+    """
+    N, _, H, W = images.shape
+    y = (0.299 * images[:, 0] + 0.587 * images[:, 1] + 0.114 * images[:, 2]).unsqueeze(1)
+    y = F.adaptive_avg_pool2d(y.clamp_min(1e-3), (max(1, H // down), max(1, W // down)))
+    log_s = torch.stack([torch.log(_gaussian_blur_nc(y, s / down).clamp_min(1e-4)) for s in sigmas]).mean(0)
+    log_s = F.interpolate(log_s, size=(H, W), mode="bilinear", align_corners=False)[:, 0]
+    return log_s, torch.ones_like(log_s, dtype=torch.bool)
+
+
+def compute_illu_loss(predictions, batch, target="phys", smooth_sigma=1.0, min_valid_frac=0.5,
+                      shift_invariant=True, **kwargs):
+    """L1 between the illumination head's log map and a log-illumination target.
+
+    target: "phys" / "invr2" = near-field shading from GT depth (illu_shading_target);
+            "msr" = multi-scale Retinex surround of the image itself (illu_msr_target).
+    shift_invariant: subtract the per-frame (detached) median residual before the L1. Needed for
+    the depth targets (unknown depth scale and light intensity); for "msr" the absolute log level
+    is well defined and IS the per-frame brightness, so set it False there or that part is erased.
 
     The target is pooled to the head's own grid in log space (valid pixels only), and a cell
-    counts only if at least `min_valid_frac` of it is valid. Per frame the residual is shifted by
-    its (detached) median before the L1, so neither the trainer's per-sample depth normalisation
-    nor the unknown light intensity matters. Computed at the grid, not upsampled: one token
+    counts only if at least `min_valid_frac` of it is valid. With shift_invariant, per frame the
+    residual is shifted by its (detached) median before the L1, so neither the trainer's per-sample
+    depth normalisation nor the unknown light intensity matters. Computed at the grid, not upsampled: one token
     cannot express texture, and a full-resolution comparison would bake that in as an
     irreducible floor (the same trap as the gate's soft-label BCE).
 
@@ -1328,14 +1352,19 @@ def compute_illu_loss(predictions, batch, target="phys", smooth_sigma=1.0, min_v
     """
     pred = predictions["illu_log16"].float()  # [B,S,g,g]
     B, S, g, _ = pred.shape
-    depths = batch["depths"].float()
-    H, W = depths.shape[-2:]
 
     with torch.no_grad():
-        log_s, valid = illu_shading_target(
-            depths.reshape(B * S, H, W), batch["intrinsics"].float().reshape(B * S, 3, 3),
-            batch["point_masks"].reshape(B * S, H, W).bool(), target=target, smooth_sigma=smooth_sigma,
-        )
+        if target == "msr":
+            images = batch["images"].float()
+            H, W = images.shape[-2:]
+            log_s, valid = illu_msr_target(images.reshape(B * S, 3, H, W))
+        else:
+            depths = batch["depths"].float()
+            H, W = depths.shape[-2:]
+            log_s, valid = illu_shading_target(
+                depths.reshape(B * S, H, W), batch["intrinsics"].float().reshape(B * S, 3, 3),
+                batch["point_masks"].reshape(B * S, H, W).bool(), target=target, smooth_sigma=smooth_sigma,
+            )
         vf = valid.float().unsqueeze(1)
         frac = F.adaptive_avg_pool2d(vf, g)
         tgt = F.adaptive_avg_pool2d(torch.where(valid, log_s, 0.0).unsqueeze(1), g) / frac.clamp_min(1e-6)
@@ -1350,17 +1379,26 @@ def compute_illu_loss(predictions, batch, target="phys", smooth_sigma=1.0, min_v
             if k.sum() < 4:
                 continue
             eb = e[b, s][k]
-            losses.append((eb - eb.median().detach()).abs().mean())
+            losses.append(((eb - eb.median().detach()) if shift_invariant else eb).abs().mean())
             with torch.no_grad():
                 p = pred[b, s].reshape(-1)[k]
                 t = tgt[b, s][k]
                 p, t = p - p.mean(), t - t.mean()
                 corrs.append((p * t).sum() / (p.norm() * t.norm()).clamp_min(1e-8))
 
+    # How much of the grid the target can actually score, the illu counterpart of
+    # flow_geom_valid_frac: keep_frac over all cells, frame_frac over the frames that clear the
+    # 4-cell minimum. On a dataset whose GT depth is sparse (SCARED covers 34-40% of pixels)
+    # these two decide whether this loss has any signal at all, which the loss value cannot say.
+    keep_frac = keep.float().mean()
+    frame_frac = (keep.sum(dim=-1) >= 4).float().mean()
+
     if not losses:  # no frame had enough valid depth: keep the head in the graph, contribute 0
-        return {"loss_illu": pred.sum() * 0.0, "loss_illu_corr": torch.zeros((), device=pred.device)}
+        return {"loss_illu": pred.sum() * 0.0, "loss_illu_corr": torch.zeros((), device=pred.device),
+                "illu_keep_frac": keep_frac, "illu_frame_frac": frame_frac}
     loss = check_and_fix_inf_nan(torch.stack(losses).mean(), "loss_illu")
-    return {"loss_illu": loss, "loss_illu_corr": torch.stack(corrs).mean()}
+    return {"loss_illu": loss, "loss_illu_corr": torch.stack(corrs).mean(),
+            "illu_keep_frac": keep_frac, "illu_frame_frac": frame_frac}
 
 
 def oracle_gate_logits_from_mask(motion_mask: torch.Tensor, patch_size: int = 14, k: float = 30.0) -> torch.Tensor:

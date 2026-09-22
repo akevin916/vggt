@@ -22,14 +22,30 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
     def __init__(self, img_size=518, patch_size=14, embed_dim=1024,
                  enable_camera=True, enable_point=True, enable_depth=True, enable_track=True,
                  enable_temporal=False,
+                 temporal_share_frame_weights=False,  # temporal steps borrow the frame block's weights
                  # motion-gated camera aggregation
                  enable_gate=False, gate_block_iter=7, gate_pose_grad=False, gate_leaky=0.0,
                  gate_bias_zero_ref=False,
                  gate_bias_scale=None, gate_bias_a=1.0, gate_bias_tau=0.0, gate_bias_learn=False,
                  enable_dual_stream=False, dual_stream_scope="camera", dual_stream_start=8,
-                 dual_stream_init=0.01, dual_stream_signal="dino",
-                 enable_illu=False):
+                 dual_stream_warmup_steps=3000, dual_stream_s_init=(0.09, 1.0),
+                 dual_stream_sigma_init=0.5,
+                 enable_illu=False,
+                 # Removed 2026-09-23 with the DINO/gap dual-stream. Named explicitly so a config
+                 # still carrying them fails with this message instead of a bare TypeError -- and
+                 # so it can never be the other failure mode, a key silently ignored and the run
+                 # quietly training as vanilla.
+                 dual_stream_signal=None, dual_stream_init=None):
         super().__init__()
+        if dual_stream_signal is not None or dual_stream_init is not None:
+            raise ValueError(
+                "dual_stream_signal / dual_stream_init were removed with the DINO-similarity "
+                "dual-stream. The bias is now a log-distance band configured by "
+                "dual_stream_warmup_steps / dual_stream_s_init / dual_stream_sigma_init, and its "
+                "parameters are dual_stream_beta / dual_stream_log_s / dual_stream_log_sigma "
+                "(see pipeline/training/config/scared_cam_dual_kern.yaml). The old forward lives "
+                "in commit 18aa9fc."
+            )
 
         # NEW: enable_temporal injects temporal attention into the aggregator (aa_order gains "temporal").
         aa_order = ["frame", "temporal", "global"] if enable_temporal else ["frame", "global"]
@@ -41,9 +57,11 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             gate_bias_scale=gate_bias_scale, gate_bias_a=gate_bias_a, gate_bias_tau=gate_bias_tau,
             gate_bias_learn=gate_bias_learn,
             enable_dual_stream=enable_dual_stream, dual_stream_scope=dual_stream_scope,
-            dual_stream_start=dual_stream_start, dual_stream_init=dual_stream_init,
-            dual_stream_signal=dual_stream_signal,
+            dual_stream_start=dual_stream_start,
+            dual_stream_warmup_steps=dual_stream_warmup_steps,
+            dual_stream_s_init=dual_stream_s_init, dual_stream_sigma_init=dual_stream_sigma_init,
             enable_illu=enable_illu,
+            temporal_share_frame_weights=temporal_share_frame_weights,
         )
 
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None
