@@ -80,6 +80,16 @@ def load_vggt_for_eval(
         absent = [k for k in need if k not in sd]
         if absent:
             raise SystemExit(f"{ckpt} has dual_stream_log_s but lacks {absent}")
+    # 3D (y,x,t) RoPE carries NO parameters, so only this persistent buffer distinguishes a 3D
+    # checkpoint from a 2D one; without it the weights would be scored under a different position
+    # code than they were trained with, silently.
+    rope_3d_dims = sd.get("aggregator.rope_3d_dims")
+    rope_3d = rope_3d_dims is not None
+    # Composed (y,x)+time RoPE: alpha lives in aggregator.rope_t.*, and the time base is a buffer.
+    # Both must come from the checkpoint or the trained alphas would be applied under a different
+    # frequency ladder than they were learned with.
+    rope_time = any(k.startswith("aggregator.rope_t.") for k in keys)
+    rope_time_base = float(sd["aggregator.rope_time_base"]) if "aggregator.rope_time_base" in sd else 10.0
     # Illumination token: it shifts patch_start_idx by one, so loading an illu checkpoint without
     # it would not merely drop a head -- every head would read the token grid off by one slot.
     has_illu = "aggregator.illu_token" in sd
@@ -95,6 +105,10 @@ def load_vggt_for_eval(
         enable_track=False,
         enable_temporal=has_temporal,
         temporal_share_frame_weights=temporal_shared,
+        rope_time=rope_time,
+        rope_time_base=rope_time_base,
+        rope_3d=rope_3d,
+        rope_3d_dims=tuple(int(x) for x in rope_3d_dims) if rope_3d else (24, 24, 16),
         enable_gate=has_gate,
         gate_block_iter=gate_block_iter,
         gate_leaky=gate_leaky,
@@ -115,6 +129,12 @@ def load_vggt_for_eval(
               f"warmup={int(agg.dual_stream_warmup)} warm={agg._dual_stream_warm():.3f} "
               f"delta_mode={int(agg.dual_stream_delta_mode)} "
               f"keep_mode={int(agg.dual_stream_keep_mode)}")
+    if verbose and rope_time:
+        alphas = torch.cat([v.flatten() for k, v in sd.items() if k.startswith("aggregator.rope_t.")])
+        print(f"time RoPE ON: base={rope_time_base} |alpha| median={alphas.abs().median():.4f} "
+              f"max={alphas.abs().max():.4f}")
+    if verbose and rope_3d:
+        print(f"3D RoPE ON: dims={tuple(int(x) for x in rope_3d_dims)} (y, x, t)")
     if verbose:
         if has_gate:
             n_gate = sum(1 for k in sd if "gate_predictor" in k)

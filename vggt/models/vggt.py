@@ -23,13 +23,17 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                  enable_camera=True, enable_point=True, enable_depth=True, enable_track=True,
                  enable_temporal=False,
                  temporal_share_frame_weights=False,  # temporal steps borrow the frame block's weights
+                 rope_3d=False, rope_3d_dims=(24, 24, 16), rope_3d_zero_time=False,  # (y,x,t) RoPE
+                 rope_time=False, rope_time_base=10.0,  # (y,x) RoPE + added time phase
                  # motion-gated camera aggregation
                  enable_gate=False, gate_block_iter=7, gate_pose_grad=False, gate_leaky=0.0,
                  gate_bias_zero_ref=False,
                  gate_bias_scale=None, gate_bias_a=1.0, gate_bias_tau=0.0, gate_bias_learn=False,
                  enable_dual_stream=False, dual_stream_scope="camera", dual_stream_start=8,
+                 dual_stream_flex=True,   # scope "all": bias inside flex_attention's kernel
                  dual_stream_warmup_steps=3000, dual_stream_s_init=(0.09, 1.0),
-                 dual_stream_sigma_init=0.5,
+                 dual_stream_sigma_init=0.5, dual_stream_s_clamp=(0.02, 1.2),
+                 dual_stream_sigma_clamp=(0.3, 3.0),
                  enable_illu=False,
                  # Removed 2026-09-23 with the DINO/gap dual-stream. Named explicitly so a config
                  # still carrying them fails with this message instead of a bare TypeError -- and
@@ -57,11 +61,15 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             gate_bias_scale=gate_bias_scale, gate_bias_a=gate_bias_a, gate_bias_tau=gate_bias_tau,
             gate_bias_learn=gate_bias_learn,
             enable_dual_stream=enable_dual_stream, dual_stream_scope=dual_stream_scope,
+            dual_stream_flex=dual_stream_flex,
             dual_stream_start=dual_stream_start,
             dual_stream_warmup_steps=dual_stream_warmup_steps,
             dual_stream_s_init=dual_stream_s_init, dual_stream_sigma_init=dual_stream_sigma_init,
+            dual_stream_s_clamp=dual_stream_s_clamp, dual_stream_sigma_clamp=dual_stream_sigma_clamp,
             enable_illu=enable_illu,
             temporal_share_frame_weights=temporal_share_frame_weights,
+            rope_3d=rope_3d, rope_3d_dims=rope_3d_dims, rope_3d_zero_time=rope_3d_zero_time,
+            rope_time=rope_time, rope_time_base=rope_time_base,
         )
 
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None

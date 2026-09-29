@@ -14,10 +14,14 @@ from typing import Optional, Tuple, Union, List, Dict, Any
 
 from vggt.layers import PatchEmbed
 from vggt.layers.block import Block
-from vggt.layers.rope import RotaryPositionEmbedding2D, RotaryPositionEmbedding1D, PositionGetter  # MODIFIED: import 1D temporal RoPE for Dyn-VGGT
+from vggt.layers.rope import (RotaryPositionEmbedding2D, RotaryPositionEmbedding1D,  # MODIFIED: 1D temporal RoPE
+                              RotaryPositionEmbedding3D, RotaryPositionEmbedding2DTime,  # NEW: (y,x,t)
+                              PositionGetter)
 from vggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
 
 logger = logging.getLogger(__name__)
+
+_FLEX_FN = None   # compiled flex_attention, built on first use (Aggregator._flex_attention)
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +126,19 @@ class Aggregator(nn.Module):
         # Temporal design change (2026-09-20). Defaults to the ORIGINAL behaviour, so an existing
         # checkpoint reproduces bit-for-bit; switched on per-arm from the config.
         temporal_share_frame_weights: bool = False,
+        # 3D RoPE over (y, x, t): frame-order information into global attention with ZERO new
+        # parameters -- the control that separates temporal's information from its 100.8M weights.
+        # NOT a warm start: it re-splits head_dim, so the pretrained spatial encoding changes
+        # meaning from step 0. rope_3d_zero_time is eval-only and measures that re-split alone.
+        rope_3d: bool = False,
+        rope_3d_dims=(24, 24, 16),      # per-axis widths, must sum to head_dim (64) -> 12/12/8 pairs
+        rope_3d_zero_time: bool = False,
+        # Composed variant (2026-09-24): spatial ladder UNTOUCHED, a time phase alpha[l,h]*nu_k*t is
+        # ADDED on top. alpha starts at 0 -> exact pretrained warm start, unlike the re-split above
+        # (whose zero-training probe cost +112% chunk5). Specials carry time but no space, so only
+        # patch tokens share channels between the two axes.
+        rope_time: bool = False,
+        rope_time_base: float = 10.0,   # periods ~6..54 frames; spatial base stays 100
         #   True builds NO temporal blocks. Each temporal step reuses the weights of the frame
         #   block at the same depth (identical shape; RoPE carries no parameters) along the time
         #   axis, and the only new parameters are two LayerScale vectors per temporal step, zero
@@ -141,10 +158,13 @@ class Aggregator(nn.Module):
         # frame-distance band bias: a log-Gaussian band over |i-j| per (global block, head)
         enable_dual_stream: bool = False,
         dual_stream_scope: str = "camera",  # "camera": camera/register queries only; "all": every query
+        dual_stream_flex: bool = True,      # scope "all": add the bias inside flex_attention's kernel
         dual_stream_start: int = 8,         # global blocks [start, depth) get the bias
         dual_stream_warmup_steps: int = 3000,   # train steps over which the schedule ramps 0 -> 1
         dual_stream_s_init: tuple = (0.09, 1.0),  # per-head band centres, log-spaced over this range
         dual_stream_sigma_init: float = 0.5,      # band width in log-delta units
+        dual_stream_s_clamp: tuple = (0.02, 1.2),     # projection range for the band centres
+        dual_stream_sigma_clamp: tuple = (0.3, 3.0),  # projection range for the band widths
         # illumination token (IlluVGGT minimal version): one extra special token per frame
         enable_illu: bool = False,
     ):
@@ -153,8 +173,32 @@ class Aggregator(nn.Module):
         self.__build_patch_embed__(patch_embed, img_size, patch_size, num_register_tokens, embed_dim=embed_dim)
 
         # Initialize rotary position embedding if frequency > 0
-        self.rope = RotaryPositionEmbedding2D(frequency=rope_freq) if rope_freq > 0 else None
+        self.rope_3d = bool(rope_3d)
+        self.rope_3d_zero_time = bool(rope_3d_zero_time)
+        if rope_freq > 0 and self.rope_3d:
+            self.rope = RotaryPositionEmbedding3D(frequency=rope_freq, dims=tuple(rope_3d_dims))
+            # Persistent marker: 3D RoPE has NO parameters, so without this the loader cannot tell a
+            # 3D checkpoint from a 2D one and would silently score it with the wrong position code.
+            self.register_buffer("rope_3d_dims", torch.tensor(list(rope_3d_dims), dtype=torch.long),
+                                 persistent=True)
+        else:
+            self.rope = RotaryPositionEmbedding2D(frequency=rope_freq) if rope_freq > 0 else None
         self.position_getter = PositionGetter() if self.rope is not None else None
+
+        # One RoPE-with-time module per block, so alpha is per-layer AND per-head (16 numbers per
+        # block). The blocks receive their own instance below; self.rope stays for the 2D/3D paths.
+        self.rope_time = bool(rope_time)
+        if rope_freq > 0 and self.rope_time:
+            if self.rope_3d:
+                raise ValueError("rope_time and rope_3d are mutually exclusive")
+            self.rope_t = nn.ModuleList([
+                RotaryPositionEmbedding2DTime(num_heads=num_heads, frequency=rope_freq,
+                                              time_base=rope_time_base)
+                for _ in range(2 * depth)   # frame blocks first, then global blocks
+            ])
+            self.register_buffer("rope_time_base", torch.tensor(float(rope_time_base)), persistent=True)
+        else:
+            self.rope_t = None
 
         # NEW: temporal RoPE — independent 1D rotary embedding applied only inside temporal attention,
         #      keeping the spatial 2D RoPE untouched so pretrained weights warm-start cleanly (docs §3.1).
@@ -171,9 +215,9 @@ class Aggregator(nn.Module):
                     ffn_bias=ffn_bias,
                     init_values=init_values,
                     qk_norm=qk_norm,
-                    rope=self.rope,
+                    rope=self.rope_t[i] if self.rope_t is not None else self.rope,
                 )
-                for _ in range(depth)
+                for i in range(depth)
             ]
         )
 
@@ -188,9 +232,9 @@ class Aggregator(nn.Module):
                     ffn_bias=ffn_bias,
                     init_values=init_values,
                     qk_norm=qk_norm,
-                    rope=self.rope,
+                    rope=self.rope_t[depth + i] if self.rope_t is not None else self.rope,
                 )
-                for _ in range(depth)
+                for i in range(depth)
             ]
         )
 
@@ -336,6 +380,7 @@ class Aggregator(nn.Module):
             raise ValueError(f"dual_stream_scope must be 'camera' or 'all', got {dual_stream_scope}")
         self.enable_dual_stream = enable_dual_stream
         self.dual_stream_scope = dual_stream_scope
+        self.dual_stream_flex = bool(dual_stream_flex)
         self.dual_stream_start = int(dual_stream_start)
         # Plain attribute only for the disabled case; when the feature is on this is a buffer
         # (registered below) so the ramp length travels with the checkpoint.
@@ -347,6 +392,10 @@ class Aggregator(nn.Module):
             # training is 1/(12-1), so a band centred below that would sit where the data has no
             # samples, collect no gradient, and masquerade as "the model chose a small scale".
             fan = torch.exp(torch.linspace(math.log(s_lo), math.log(s_hi), num_heads))  # [H]
+            self.ds_log_s_range = (math.log(float(dual_stream_s_clamp[0])),
+                                   math.log(float(dual_stream_s_clamp[1])))
+            self.ds_log_sigma_range = (math.log(float(dual_stream_sigma_clamp[0])),
+                                       math.log(float(dual_stream_sigma_clamp[1])))
             self.dual_stream_beta = nn.Parameter(torch.ones(depth))
             self.dual_stream_log_s = nn.Parameter(fan.log().expand(depth, num_heads).clone())
             self.dual_stream_log_sigma = nn.Parameter(
@@ -499,6 +548,21 @@ class Aggregator(nn.Module):
             pos_special = torch.zeros(B * S, self.patch_start_idx, 2).to(images.device).to(pos.dtype)
             pos = torch.cat([pos_special, pos], dim=1)
 
+        if self.rope_3d or self.rope_time:
+            # Third coordinate = frame index + 1 for camera and patch tokens; 0 for register/illu
+            # tokens, which is the identity rotation (same convention as the temporal RoPE, B4).
+            # Frame attention is unaffected: t is constant within a frame and RoPE sees only
+            # position differences, so only global attention feels this axis.
+            t = torch.arange(S, device=images.device, dtype=pos.dtype).add(1)
+            t = t.view(1, S, 1).expand(B, S, pos.shape[1]).reshape(B * S, pos.shape[1]).clone()
+            if self.rope_3d and self.patch_start_idx > 1:
+                t[:, 1:self.patch_start_idx] = 0      # 3D re-split: registers get no time axis
+            # rope_time: camera, register and illu all carry the time phase (they have no spatial
+            # term, since their spatial coordinate is 0), which is the point of the composed form.
+            if self.rope_3d_zero_time:
+                t.zero_()                      # eval-only: isolates the cost of re-splitting head_dim
+            pos = torch.cat([pos, t.unsqueeze(-1)], dim=-1)
+
         # update P because we added special tokens
         _, P, C = tokens.shape
 
@@ -591,8 +655,9 @@ class Aggregator(nn.Module):
         if tokens.shape != (B * S, P, C):
             tokens = tokens.view(B, S, P, C).view(B * S, P, C)
 
-        if pos is not None and pos.shape != (B * S, P, 2):
-            pos = pos.view(B, S, P, 2).view(B * S, P, 2)
+        if pos is not None and pos.shape[:2] != (B * S, P):
+            D = pos.shape[-1]          # 2 for (y,x), 3 when the 3D (y,x,t) RoPE is on
+            pos = pos.view(B, S, P, D).view(B * S, P, D)
 
         intermediates = []
 
@@ -612,6 +677,9 @@ class Aggregator(nn.Module):
     # pushed past the lower bound would be dead there forever -- and "sigma grows until the band
     # switches itself off" is exactly the escape hatch this design wants to keep available.
     DS_BETA_RANGE = (0.0, 4.0)        # negative beta would invert the band into a repulsion
+    # Defaults only -- the live ranges are per-instance (dual_stream_s_clamp / _sigma_clamp), so
+    # an arm can widen them. Heads parked on a bound are unreadable: "chose an extreme scale" and
+    # "was stopped by my ceiling" look identical in the scatter plot.
     DS_LOG_S_RANGE = (math.log(0.02), math.log(1.2))     # d lives in (0, 1]
     DS_LOG_SIGMA_RANGE = (math.log(0.3), math.log(3.0))  # lower bound: a band this narrow is a spike
     DS_BIAS_FLOOR = -20.0             # finite stand-in for -inf; keeps softmax well-defined
@@ -630,8 +698,8 @@ class Aggregator(nn.Module):
         bound can sit there a while and then jump once the gradient reverses.
         """
         self.dual_stream_beta.clamp_(*self.DS_BETA_RANGE)
-        self.dual_stream_log_s.clamp_(*self.DS_LOG_S_RANGE)
-        self.dual_stream_log_sigma.clamp_(*self.DS_LOG_SIGMA_RANGE)
+        self.dual_stream_log_s.clamp_(*self.ds_log_s_range)
+        self.dual_stream_log_sigma.clamp_(*self.ds_log_sigma_range)
         self.dual_stream_steps += 1
 
     def _dual_stream_warm(self) -> float:
@@ -690,8 +758,9 @@ class Aggregator(nn.Module):
         if tokens.shape != (B, S * P, C):
             tokens = tokens.view(B, S, P, C).view(B, S * P, C)
 
-        if pos is not None and pos.shape != (B, S * P, 2):
-            pos = pos.view(B, S, P, 2).view(B, S * P, 2)
+        if pos is not None and pos.shape[:2] != (B, S * P):
+            D = pos.shape[-1]          # 2 for (y,x), 3 when the 3D (y,x,t) RoPE is on
+            pos = pos.view(B, S, P, D).view(B, S * P, D)
 
         intermediates = []
 
@@ -875,6 +944,23 @@ class Aggregator(nn.Module):
 
         return tokens
 
+    @staticmethod
+    def _flex_attention(q, k, v, score_mod):
+        """flex_attention, compiled once per process (eager flex is several times slower)."""
+        global _FLEX_FN
+        if _FLEX_FN is None:
+            from torch.nn.attention.flex_attention import flex_attention as _fa
+            # Frames per batch vary (img_nums [4, 12]), so each distinct shape compiles its own
+            # kernel. Dynamo's default cache_size_limit of 8 is hit around step 9, after which it
+            # falls back to EAGER flex -- which raises immediately ("get value out of a tracing
+            # tensor"). Measured 2026-09-27: 8 good steps then a crash; with the limit raised, 12
+            # varied (B, S) combinations all pass. automatic_dynamic_shapes off keeps every shape
+            # specialised instead of switching to dynamic (which trips the same error).
+            torch._dynamo.config.cache_size_limit = max(64, torch._dynamo.config.cache_size_limit)
+            torch._dynamo.config.automatic_dynamic_shapes = False
+            _FLEX_FN = torch.compile(_fa, dynamic=False)
+        return _FLEX_FN(q, k, v, score_mod=score_mod)
+
     def _dual_global_block_forward(self, block, tokens, pos, pair_bias, B, S, patch_start_idx):
         """
         One global block with the frame-distance band bias pair_bias [H, S, S] (head, query frame,
@@ -902,7 +988,25 @@ class Aggregator(nn.Module):
         # in q's dtype instead of once in fp32 and once cast. (Measured at 50 frames: peak
         # allocation is unchanged, so the peak is set elsewhere -- this just does less work.)
         pair_bias = pair_bias.to(q.dtype)
-        if self.dual_stream_scope == "all":
+        if self.dual_stream_scope == "all" and self.dual_stream_flex:
+            # Patch queries included WITHOUT materialising anything N x N. An explicit attn_mask
+            # forces SDPA off its fused path, so the [B,H,N,N] scores appear in memory: ~5 GB at 12
+            # training frames and a 5.4 GB mask at the 50-frame pose_eval, which is what made
+            # scope="all" unusable (2026-09-16: OOM at batch 12; every pose_eval OOM at batch 8).
+            # flex_attention adds the same bias inside the kernel via score_mod, so the arithmetic
+            # is identical to the materialised branch below (verified) at flash-like memory.
+            assert drop_p == 0.0, "flex path does not implement attention dropout"
+            # q/k come out of q_norm/k_norm as fp32 under autocast while v stays bf16. SDPA tolerates
+            # that mix; flex_attention rejects it, so align all three on v's dtype.
+            q, k = q.to(v.dtype), k.to(v.dtype)
+            bias = pair_bias.to(v.dtype)                       # [H, S, S]
+            P_ = P
+
+            def _score_mod(score, b, h, q_idx, kv_idx):
+                return score + bias[h, q_idx // P_, kv_idx // P_]
+
+            attn_out = self._flex_attention(q, k, v, score_mod=_score_mod)
+        elif self.dual_stream_scope == "all":
             mask = pair_bias[None, :, :, None, :, None].expand(1, H, S, P, S, P).reshape(1, H, N, N)
             attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=drop_p)
         else:
