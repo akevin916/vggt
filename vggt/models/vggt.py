@@ -34,6 +34,14 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                  dual_stream_warmup_steps=3000, dual_stream_s_init=(0.09, 1.0),
                  dual_stream_sigma_init=0.5, dual_stream_s_clamp=(0.02, 1.2),
                  dual_stream_sigma_clamp=(0.3, 3.0),
+                 # band distance: 0 = |i-j|/(S-1), 1 = absolute frames, 2 = DINO odometer (aggregator)
+                 dual_stream_delta_mode=0, dual_stream_abs_span=11.0, dual_stream_odo_unit=1.91e-4,
+                 # dual v0 re-implemented: alternating-sign per-layer scalar (aggregator alt_stream)
+                 enable_alt_stream=False, alt_stream_start=8, alt_stream_init=0.01, alt_stream_signal="gap",
+                 # per-token DINO band (tokdino), all queries, one-hot SDPA
+                 enable_tokdino=False, tokdino_start=8, tokdino_warmup_steps=3000,
+                 tokdino_s_init=(1e-4, 1e-2), tokdino_sigma_init=1.0,
+                 tokdino_s_range=(3e-5, 3e-2), tokdino_sigma_range=(0.3, 3.0),
                  enable_illu=False,
                  # Removed 2026-09-23 with the DINO/gap dual-stream. Named explicitly so a config
                  # still carrying them fails with this message instead of a bare TypeError -- and
@@ -66,6 +74,14 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             dual_stream_warmup_steps=dual_stream_warmup_steps,
             dual_stream_s_init=dual_stream_s_init, dual_stream_sigma_init=dual_stream_sigma_init,
             dual_stream_s_clamp=dual_stream_s_clamp, dual_stream_sigma_clamp=dual_stream_sigma_clamp,
+            dual_stream_delta_mode=int(dual_stream_delta_mode),
+            dual_stream_abs_span=float(dual_stream_abs_span), dual_stream_odo_unit=float(dual_stream_odo_unit),
+            enable_alt_stream=enable_alt_stream, alt_stream_start=int(alt_stream_start),
+            alt_stream_init=float(alt_stream_init), alt_stream_signal=str(alt_stream_signal),
+            enable_tokdino=enable_tokdino, tokdino_start=tokdino_start,
+            tokdino_warmup_steps=tokdino_warmup_steps, tokdino_s_init=tuple(tokdino_s_init),
+            tokdino_sigma_init=tokdino_sigma_init, tokdino_s_range=tuple(tokdino_s_range),
+            tokdino_sigma_range=tuple(tokdino_sigma_range),
             enable_illu=enable_illu,
             temporal_share_frame_weights=temporal_share_frame_weights,
             rope_3d=rope_3d, rope_3d_dims=rope_3d_dims, rope_3d_zero_time=rope_3d_zero_time,
@@ -87,7 +103,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         # and everything still used (trunk, camera/depth/point) loads unchanged.
 
     def forward(self, images: torch.Tensor, query_points: torch.Tensor = None,
-                gate_logits_override: torch.Tensor = None):
+                gate_logits_override: torch.Tensor = None, frame_pos: torch.Tensor = None):
         """
         Forward pass of the VGGT model.
 
@@ -101,6 +117,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 the gate bias (see Aggregator.forward docstring); bypasses the model's own
                 GatePredictor output when building the camera/register attention bias. Used for
                 oracle-mask gate ablations. Default: None (use the model's own predicted gate).
+            frame_pos (torch.Tensor, optional): [B, S] real frame indices of the clip; only the
+                temporal blocks read it (see Aggregator.forward). Default: None (positions 0..S-1).
 
         Returns:
             dict: A dictionary containing the following predictions:
@@ -124,7 +142,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             query_points = query_points.unsqueeze(0)
 
         aggregated_tokens_list, patch_start_idx, gate_logits = self.aggregator(
-            images, gate_logits_override=gate_logits_override
+            images, gate_logits_override=gate_logits_override, frame_pos=frame_pos
         )
 
         predictions = {}

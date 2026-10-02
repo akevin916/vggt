@@ -165,6 +165,24 @@ class Aggregator(nn.Module):
         dual_stream_sigma_init: float = 0.5,      # band width in log-delta units
         dual_stream_s_clamp: tuple = (0.02, 1.2),     # projection range for the band centres
         dual_stream_sigma_clamp: tuple = (0.3, 3.0),  # projection range for the band widths
+        # what d_ij is: 0 = |i-j|/(S-1); 1 = min(|i-j|/span, 1); 2 = min(DINO odometer/(span*unit), 1)
+        dual_stream_delta_mode: int = 0,
+        dual_stream_abs_span: float = 11.0,     # modes 1/2: d == 1 at this many (typical) frames
+        dual_stream_odo_unit: float = 1.91e-4,  # mode 2: median adjacent-frame DINO step, SCARED train
+        # tokdino: per-TOKEN log-Gaussian band over the DINO distance between frames, all queries
+        enable_tokdino: bool = False,
+        tokdino_start: int = 8,                  # global blocks [start, depth) get the bias
+        tokdino_warmup_steps: int = 3000,        # train steps over which beta ramps 0 -> 1
+        tokdino_s_init: tuple = (1e-4, 1e-2),    # per-head init centres, log-spaced (DINO 1-cos units)
+        tokdino_sigma_init: float = 1.0,         # init band width in log-d units
+        tokdino_s_range: tuple = (3e-5, 3e-2),   # predicted s is tanh-squashed into this range
+        tokdino_sigma_range: tuple = (0.3, 3.0),  # predicted sigma is tanh-squashed into this range
+        # alt-stream (dual v0, re-implemented 2026-10-02): per-layer scalar, sign alternating with
+        # depth, over a row-standardised frame-pair signal; camera/register queries only
+        enable_alt_stream: bool = False,
+        alt_stream_start: int = 8,
+        alt_stream_init: float = 0.01,
+        alt_stream_signal: str = "gap",       # "gap": -|i-j|; "dino": pairwise cosine; "odo": -|tau_i - tau_j|
         # illumination token (IlluVGGT minimal version): one extra special token per frame
         enable_illu: bool = False,
     ):
@@ -416,10 +434,89 @@ class Aggregator(nn.Module):
             self.register_buffer("dual_stream_warmup",
                                  torch.tensor(int(dual_stream_warmup_steps), dtype=torch.long),
                                  persistent=True)
-            self.register_buffer("dual_stream_delta_mode", torch.zeros((), dtype=torch.long),
+            self.register_buffer("dual_stream_delta_mode", torch.tensor(int(dual_stream_delta_mode)),
                                  persistent=True)
             self.register_buffer("dual_stream_keep_mode", torch.zeros((), dtype=torch.long),
                                  persistent=True)
+            # Modes 1/2 (2026-10-01): d no longer depends on S, so a band learned on 4-12 frame
+            # clips keeps its meaning at 64 (eval-time probe: c64 -6.8% for mode-0 weights read
+            # this way). Mode 2 swaps the frame count for the DINO odometer -- the running sum of
+            # adjacent-frame (1 - cos) of mean-pooled patch_embed features, which grows with how
+            # fast the view changes rather than with time. Both are clamped to 1 so long chunks
+            # never leave the range seen in training. Their constants are buffers registered only
+            # for these modes, so mode-0 checkpoints keep their exact key set.
+            if dual_stream_delta_mode not in (0, 1, 2):
+                raise ValueError(f"dual_stream_delta_mode must be 0, 1 or 2, got {dual_stream_delta_mode}")
+            if dual_stream_delta_mode != 0:
+                if dual_stream_scope != "camera":
+                    raise ValueError("dual_stream_delta_mode 1/2 is implemented for scope 'camera' only")
+                self.register_buffer("dual_stream_abs_span", torch.tensor(float(dual_stream_abs_span)),
+                                     persistent=True)
+            if dual_stream_delta_mode == 2:
+                self.register_buffer("dual_stream_odo_unit", torch.tensor(float(dual_stream_odo_unit)),
+                                     persistent=True)
+
+        # tokdino: the dual-stream band made content-adaptive. Every token (camera, register and
+        # patch alike) predicts its OWN band centre s and width sigma per head from its features
+        # entering the block, and the distance is the DINO distance between frames:
+        #   b[h, n, j] = -warm * beta_l * (log d[frame(n), j] - log s[n, h])^2 / (2 sigma[n, h]^2)
+        #   d = 1 - cos(mean-pooled patch_embed features of the two frames)   (absolute, no S)
+        # The key side is a whole frame, so the bias is [B, H, N, S], never N x N, and it enters
+        # the kernel through one-hot augmentation (_tokdino_global_block_forward) -- plain SDPA,
+        # no flex. Own frame, key frame 0 and duplicate frames (d == 0) are pinned to 0.
+        # Predictor weights start at 0 and its bias encodes the per-head init fan, so at step 0
+        # every token predicts the same (s, sigma) and the model is a per-head band; warm == 0
+        # skips the path entirely (bit-identical to the base).
+        # Alt-stream: dual v0 (commit d0aaf23, retired 2026-09-23 for the band) re-implemented so it
+        # can run on the current base. Same arithmetic as d0aaf23:
+        #   b_l(i,j) = sign_l * |p_l| * z_ij,  sign_l = +1 on even global blocks, -1 on odd,
+        #   z = the signal row-standardised around its off-diagonal row median (z > 0: nearer than
+        #   this frame's typical key), own frame and key frame 0 never suppressed (clamped >= 0).
+        # p starts at 0.01 (exact 0 would sit on abs()'s zero-gradient point), no warmup, one bias
+        # shared by all heads. Signal "odo" (new) uses the DINO odometer of delta_mode 2.
+        if alt_stream_signal not in ("gap", "dino", "odo"):
+            raise ValueError(f"alt_stream_signal must be gap, dino or odo, got {alt_stream_signal}")
+        if enable_alt_stream and (enable_dual_stream or enable_gate):
+            raise ValueError("enable_alt_stream excludes enable_dual_stream and enable_gate")
+        self.enable_alt_stream = enable_alt_stream
+        self.alt_stream_start = int(alt_stream_start)
+        if enable_alt_stream:
+            self.alt_stream_p = nn.Parameter(torch.full((depth,), float(alt_stream_init)))
+            self.register_buffer("alt_stream_signal_id",
+                                 torch.tensor({"dino": 0, "gap": 1, "odo": 2}[alt_stream_signal]),
+                                 persistent=True)
+
+        if enable_tokdino and (enable_dual_stream or enable_gate):
+            raise ValueError("enable_tokdino excludes enable_dual_stream and enable_gate")
+        self.enable_tokdino = enable_tokdino
+        if enable_tokdino:
+            n_tok = depth - int(tokdino_start)
+            log_s_rng = (math.log(tokdino_s_range[0]), math.log(tokdino_s_range[1]))
+            log_sig_rng = (math.log(tokdino_sigma_range[0]), math.log(tokdino_sigma_range[1]))
+
+            def _raw(target, rng):                # inverse of the tanh squash used in forward
+                mid, half = (rng[0] + rng[1]) / 2, (rng[1] - rng[0]) / 2
+                return torch.atanh(((target - mid) / half).clamp(-0.999, 0.999))
+
+            fan = torch.linspace(math.log(tokdino_s_init[0]), math.log(tokdino_s_init[1]), num_heads)
+            bias_init = torch.cat([_raw(fan, log_s_rng),
+                                   _raw(torch.full((num_heads,), math.log(tokdino_sigma_init)), log_sig_rng)])
+            self.tokdino_pred = nn.ModuleList([nn.Linear(embed_dim, 2 * num_heads) for _ in range(n_tok)])
+            for lin in self.tokdino_pred:
+                nn.init.zeros_(lin.weight)
+                with torch.no_grad():
+                    lin.bias.copy_(bias_init)
+            self.tokdino_beta = nn.Parameter(torch.ones(n_tok))
+            # Everything the forward arithmetic depends on travels in the state_dict (the lesson of
+            # dual_stream_scope, which did not): start sets which blocks, the ranges define the
+            # squash, warmup/steps the ramp.
+            for name, val in (("tokdino_steps", torch.zeros((), dtype=torch.long)),
+                              ("tokdino_warmup", torch.tensor(int(tokdino_warmup_steps))),
+                              ("tokdino_start", torch.tensor(int(tokdino_start))),
+                              ("tokdino_log_s_range", torch.tensor(log_s_rng)),
+                              ("tokdino_log_sigma_range", torch.tensor(log_sig_rng))):
+                self.register_buffer(name, val, persistent=True)
+        self._tokdino_stats = {}   # global_idx -> [3 quantiles, 2 (s, sigma), H], last forward
 
         # Note: We have two camera tokens, one for the first frame and one for the rest
         # The same applies for register tokens
@@ -494,6 +591,7 @@ class Aggregator(nn.Module):
         self,
         images: torch.Tensor,
         gate_logits_override: Optional[torch.Tensor] = None,
+        frame_pos: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
@@ -504,6 +602,10 @@ class Aggregator(nn.Module):
                 camera/register attention bias in every gated global block — for oracle-mask
                 ablations (docs/method.md gate diagnostics). The model's own
                 gate_logits are still computed and returned unaffected, for logging.
+            frame_pos: [B, S] optional real frame indices. When given, the temporal blocks' 1D RoPE
+                uses each frame's offset from the clip's first frame instead of its position 0..S-1
+                (identical on contiguous frames). Nothing else reads it: the time-phase RoPE, the
+                distance band and alt_stream still use positions.
 
         Returns:
             (list[torch.Tensor], int):
@@ -571,8 +673,12 @@ class Aggregator(nn.Module):
         #      register tokens (idx 1..patch_start_idx-1) get 0 → identity rotation (no temporal RoPE).
         temporal_pos = None
         if self.n_temporal and self.temporal_rope is not None:
-            frame_index = torch.arange(S, device=images.device)
-            temporal_pos = frame_index.view(1, 1, S).expand(B, P, S).clone()  # (B, P, S)
+            if frame_pos is None:
+                frame_index = torch.arange(S, device=images.device).view(1, 1, S)
+            else:
+                fp = frame_pos.to(images.device).long()
+                frame_index = (fp - fp[:, :1]).view(B, 1, S)
+            temporal_pos = frame_index.expand(B, P, S).clone()  # (B, P, S)
             if self.patch_start_idx > 1:
                 temporal_pos[:, 1:self.patch_start_idx, :] = 0  # register tokens → no temporal RoPE
             temporal_pos = temporal_pos.reshape(B * P, S)
@@ -596,7 +702,7 @@ class Aggregator(nn.Module):
         if self.enable_dual_stream:
             pair_warm = self._dual_stream_warm()
             if pair_warm > 0.0 and S > 1:
-                pair_log_delta = self._dual_stream_log_delta(S, images.device)
+                pair_log_delta = self._dual_stream_log_delta(S, images.device, patch_tokens, B)
             elif self.training:
                 # warm == 0 (the first optimizer step) or S < 2: the biased path is skipped, so
                 # the band parameters would receive no gradient at all and DDP's reducer aborts
@@ -605,6 +711,27 @@ class Aggregator(nn.Module):
                 tokens = tokens + 0.0 * (self.dual_stream_beta.sum()
                                          + self.dual_stream_log_s.sum()
                                          + self.dual_stream_log_sigma.sum())
+
+        alt_z = None
+        if self.enable_alt_stream and S > 1:
+            alt_z = self._alt_stream_z(patch_tokens, B, S)
+
+        # tokdino inputs: log DINO distance between frames [B, S, S] and the pinned pairs. Same
+        # skip / graph-edge logic as the dual-stream block above.
+        tok_logd, tok_keep, tok_warm = None, None, 0.0
+        if self.enable_tokdino:
+            tok_warm = self._tokdino_warm()
+            if tok_warm > 0.0 and S > 1:
+                with torch.no_grad():
+                    f = F.normalize(patch_tokens.float().view(B, S, -1, patch_tokens.shape[-1]).mean(2), dim=-1)
+                    d = 1.0 - f @ f.transpose(1, 2)                                  # [B, S, S]
+                    tok_keep = d < 1e-6                     # duplicate frames (and the diagonal)
+                    tok_keep |= torch.eye(S, dtype=torch.bool, device=d.device)
+                    tok_keep[:, :, 0] = True                # key frame 0: the reference camera
+                    tok_logd = d.clamp(min=1e-6).log()
+            elif self.training:
+                tokens = tokens + 0.0 * (self.tokdino_beta.sum()
+                                         + sum(p.sum() for p in self.tokdino_pred.parameters()))
 
         for block_iter in range(self.aa_block_num):
             for attn_type in self.aa_order:
@@ -617,6 +744,7 @@ class Aggregator(nn.Module):
                     tokens, global_idx, global_intermediates = self._process_global_attention(
                         tokens, B, S, P, C, global_idx, pos=pos, gate_logits=gate_bias_source,
                         pair_log_delta=pair_log_delta, pair_warm=pair_warm,
+                        tok_logd=tok_logd, tok_keep=tok_keep, tok_warm=tok_warm, alt_z=alt_z,
                     )
                 elif attn_type == "temporal":
                     # NEW: run a temporal block once every `temporal_every` aa-blocks.
@@ -709,30 +837,52 @@ class Aggregator(nn.Module):
             return 1.0
         return min(1.0, float(int(self.dual_stream_steps)) / float(warmup))
 
-    def _dual_stream_log_delta(self, S: int, device) -> torch.Tensor:
-        """log d_ij with d = |i-j|/(S-1) in (0,1]. The diagonal (d=0) is a placeholder: the bias
-        there is overwritten with 0 in _dual_stream_pair_bias. [S, S]
+    def _dual_stream_log_delta(self, S: int, device, patch_tokens=None, B: int = 1) -> torch.Tensor:
+        """log d_ij, [S, S] (modes 0/1) or [B, S, S] (mode 2). The diagonal (d=0) is a
+        placeholder: the bias there is overwritten with 0 in _dual_stream_pair_bias.
+          mode 0: d = |i-j| / (S-1)                     in (0, 1]
+          mode 1: d = min(|i-j| / span, 1)              in [1/span, 1]
+          mode 2: d = min(|tau_j - tau_i| / (span*unit), 1), floored at 0.5/span off the diagonal,
+                  tau = cumsum over frames of 1 - cos(mean-pooled patch_embed, adjacent frames).
+                  The floor stands in for exact duplicate frames (SCARED has some): their
+                  odometer distance is 0, which would otherwise sit at log(1e-6) and be crushed
+                  by every band instead of being treated as the very-near frame it is.
 
         A checkpoint carrying a different delta_mode was trained under different arithmetic, and
         scoring it with this one would silently reinterpret its log_s -- so refuse instead."""
-        if int(self.dual_stream_delta_mode) != 0:
+        mode = int(self.dual_stream_delta_mode)
+        if mode not in (0, 1, 2) or (mode != 0 and not hasattr(self, "dual_stream_abs_span")) \
+                or (mode == 2 and not hasattr(self, "dual_stream_odo_unit")):
             raise ValueError(
-                f"checkpoint dual_stream_delta_mode={int(self.dual_stream_delta_mode)} but this "
-                "build only implements mode 0 (d = |i-j|/(S-1))"
+                f"checkpoint dual_stream_delta_mode={mode} does not match how this Aggregator was "
+                "built (pass dual_stream_delta_mode to the constructor; see load_vggt_for_eval)"
             )
         t = torch.arange(S, device=device, dtype=torch.float32)
-        d = (t[:, None] - t[None, :]).abs() / float(S - 1)
-        return d.clamp(min=1e-6).log()
+        if mode == 0:
+            d = (t[:, None] - t[None, :]).abs() / float(S - 1)
+            return d.clamp(min=1e-6).log()
+        span = float(self.dual_stream_abs_span)
+        if mode == 1:
+            d = ((t[:, None] - t[None, :]).abs() / span).clamp(max=1.0)
+            return d.clamp(min=1e-6).log()
+        with torch.no_grad():
+            f = F.normalize(patch_tokens.float().view(B, S, -1, patch_tokens.shape[-1]).mean(2), dim=-1)
+            step = 1.0 - (f[:, 1:] * f[:, :-1]).sum(-1)                              # [B, S-1]
+            tau = torch.cat([step.new_zeros(B, 1), step.cumsum(1)], dim=1)           # [B, S]
+            d = (tau[:, None, :] - tau[:, :, None]).abs() / (span * float(self.dual_stream_odo_unit))
+            d = d.clamp(min=0.5 / span, max=1.0)
+            return d.log()
 
     def _dual_stream_pair_bias(self, log_delta, warm, global_idx):
-        """b_{l,h}(i,j) = -warm * beta_l * (log d - log s_{l,h})^2 / (2 sigma_{l,h}^2). [H, S, S]
+        """b_{l,h}(i,j) = -warm * beta_l * (log d - log s_{l,h})^2 / (2 sigma_{l,h}^2).
+        [H, S, S] for a batch-independent log_delta [S, S]; [B, H, S, S] for mode 2's [B, S, S].
 
         Own frame and key frame 0 are pinned to 0 -- which also disposes of log(0) on the diagonal.
         """
         log_s = self.dual_stream_log_s[global_idx].view(-1, 1, 1)       # [H,1,1]
         sigma = self.dual_stream_log_sigma[global_idx].exp().view(-1, 1, 1)
         beta = warm * self.dual_stream_beta[global_idx]
-        bias = -beta * (log_delta.unsqueeze(0) - log_s).pow(2) / (2.0 * sigma.pow(2))
+        bias = -beta * (log_delta.unsqueeze(-3) - log_s).pow(2) / (2.0 * sigma.pow(2))
         bias = bias.clamp(min=self.DS_BIAS_FLOOR)
         if int(self.dual_stream_keep_mode) != 0:
             raise ValueError(
@@ -746,7 +896,8 @@ class Aggregator(nn.Module):
         return bias.masked_fill(keep, 0.0)
 
     def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None, gate_logits=None,
-                                  pair_log_delta=None, pair_warm=0.0):
+                                  pair_log_delta=None, pair_warm=0.0,
+                                  tok_logd=None, tok_keep=None, tok_warm=0.0, alt_z=None):
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
 
@@ -766,7 +917,32 @@ class Aggregator(nn.Module):
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
-            if pair_log_delta is not None and global_idx >= self.dual_stream_start:
+            if tok_logd is not None and global_idx >= int(self.tokdino_start):
+                blk = self.global_blocks[global_idx]
+                _B, _S, _gi, _w = B, S, global_idx, tok_warm
+
+                def _tok_fn(t, p, ld, kp):  # noqa: E306
+                    return self._tokdino_global_block_forward(blk, t, p, ld, kp, _w, _B, _S, _gi)
+
+                if self.training:
+                    tokens = checkpoint(_tok_fn, tokens, pos, tok_logd, tok_keep,
+                                        use_reentrant=self.use_reentrant)
+                else:
+                    tokens = _tok_fn(tokens, pos, tok_logd, tok_keep)
+            elif alt_z is not None and global_idx >= self.alt_stream_start:
+                blk = self.global_blocks[global_idx]
+                _B, _S, _psi, _gi = B, S, self.patch_start_idx, global_idx
+
+                def _alt_fn(t, p, z):  # noqa: E306
+                    return self._dual_global_block_forward(
+                        blk, t, p, self._alt_stream_pair_bias(z, _gi), _B, _S, _psi, scope="camera"
+                    )
+
+                if self.training:
+                    tokens = checkpoint(_alt_fn, tokens, pos, alt_z, use_reentrant=self.use_reentrant)
+                else:
+                    tokens = _alt_fn(tokens, pos, alt_z)
+            elif pair_log_delta is not None and global_idx >= self.dual_stream_start:
                 blk = self.global_blocks[global_idx]
                 _B, _S, _psi, _gi, _w = B, S, self.patch_start_idx, global_idx, pair_warm
 
@@ -961,10 +1137,45 @@ class Aggregator(nn.Module):
             _FLEX_FN = torch.compile(_fa, dynamic=False)
         return _FLEX_FN(q, k, v, score_mod=score_mod)
 
-    def _dual_global_block_forward(self, block, tokens, pos, pair_bias, B, S, patch_start_idx):
+    def _alt_stream_z(self, patch_tokens, B, S):
+        """Row-standardised frame-pair signal z [B, S, S], no grad (patch_embed is frozen)."""
+        with torch.no_grad():
+            sid = int(self.alt_stream_signal_id)
+            dev = patch_tokens.device
+            if sid == 1:
+                t = torch.arange(S, device=dev, dtype=torch.float32)
+                sim = -(t[:, None] - t[None]).abs().expand(B, S, S)
+            else:
+                f = F.normalize(patch_tokens.float().view(B, S, -1, patch_tokens.shape[-1]).mean(2), dim=-1)
+                if sid == 0:
+                    sim = f @ f.transpose(1, 2)
+                else:
+                    step = 1.0 - (f[:, 1:] * f[:, :-1]).sum(-1)
+                    tau = torch.cat([step.new_zeros(B, 1), step.cumsum(1)], dim=1)
+                    sim = -(tau[:, :, None] - tau[:, None, :]).abs()
+            eye = torch.eye(S, dtype=torch.bool, device=dev)
+            off = sim.masked_fill(eye, float("nan"))
+            med = off.nanmedian(dim=-1, keepdim=True).values
+            d = off - med
+            std = d.pow(2).nanmean(dim=-1, keepdim=True).sqrt().clamp(min=1e-6)
+            return (d / std).nan_to_num(0.0)                                   # diagonal -> 0
+
+    def _alt_stream_pair_bias(self, z, global_idx):
+        """b_l = sign_l * |p_l| * z, own frame and key frame 0 never suppressed. [B, 1, S, S]"""
+        sign = 1.0 if global_idx % 2 == 0 else -1.0
+        bias = sign * self.alt_stream_p[global_idx].abs() * z
+        S = bias.shape[-1]
+        keep = torch.zeros(S, S, dtype=torch.bool, device=bias.device)
+        keep[:, 0] = True
+        keep.fill_diagonal_(True)
+        return torch.where(keep, bias.clamp(min=0.0), bias).unsqueeze(1)
+
+    def _dual_global_block_forward(self, block, tokens, pos, pair_bias, B, S, patch_start_idx,
+                                   scope=None):
         """
         One global block with the frame-distance band bias pair_bias [H, S, S] (head, query frame,
-        key frame), broadcast to every token of the key frame. Same qkv/norm/rope/ls path as
+        key frame; [B, H, S, S] for delta_mode 2, scope "camera" only), broadcast to every token
+        of the key frame. Same qkv/norm/rope/ls path as
         _gated_global_block_forward.
           scope "camera": only camera/register queries are biased (patch queries unchanged, tiny op).
           scope "all":    every query is biased; builds an [B, 1, N, N] mask (no flash; flash is
@@ -988,7 +1199,8 @@ class Aggregator(nn.Module):
         # in q's dtype instead of once in fp32 and once cast. (Measured at 50 frames: peak
         # allocation is unchanged, so the peak is set elsewhere -- this just does less work.)
         pair_bias = pair_bias.to(q.dtype)
-        if self.dual_stream_scope == "all" and self.dual_stream_flex:
+        scope = scope or self.dual_stream_scope
+        if scope == "all" and self.dual_stream_flex:
             # Patch queries included WITHOUT materialising anything N x N. An explicit attn_mask
             # forces SDPA off its fused path, so the [B,H,N,N] scores appear in memory: ~5 GB at 12
             # training frames and a 5.4 GB mask at the 50-frame pose_eval, which is what made
@@ -1006,7 +1218,7 @@ class Aggregator(nn.Module):
                 return score + bias[h, q_idx // P_, kv_idx // P_]
 
             attn_out = self._flex_attention(q, k, v, score_mod=_score_mod)
-        elif self.dual_stream_scope == "all":
+        elif scope == "all":
             mask = pair_bias[None, :, :, None, :, None].expand(1, H, S, P, S, P).reshape(1, H, N, N)
             attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=drop_p)
         else:
@@ -1014,13 +1226,82 @@ class Aggregator(nn.Module):
             q_sp = q.view(B, H, S, P, D)
             q_special = q_sp[:, :, :, :patch_start_idx, :].reshape(B, H, S * patch_start_idx, D)
             q_patch = q_sp[:, :, :, patch_start_idx:, :].reshape(B, H, S * P_patch, D)
-            mask = pair_bias[None, :, :, None, :, None].expand(1, H, S, patch_start_idx, S, P)
-            mask = mask.reshape(1, H, S * patch_start_idx, N)
+            pb = pair_bias if pair_bias.dim() == 4 else pair_bias[None]     # [1 or B, H, S, S]
+            mask = pb[:, :, :, None, :, None].expand(pb.shape[0], H, S, patch_start_idx, S, P)  # H may broadcast from 1
+            mask = mask.reshape(pb.shape[0], H, S * patch_start_idx, N)
             attn_patch = F.scaled_dot_product_attention(q_patch, k, v, dropout_p=drop_p)
             attn_special = F.scaled_dot_product_attention(q_special, k, v, attn_mask=mask,
                                                           dropout_p=drop_p)
             attn_out = torch.cat([attn_special.view(B, H, S, patch_start_idx, D),
                                   attn_patch.view(B, H, S, P_patch, D)], dim=3).reshape(B, H, N, D)
+
+        attn_out = block.attn.proj_drop(block.attn.proj(attn_out.permute(0, 2, 1, 3).reshape(B, N, C_dim)))
+        tokens = tokens + block.ls1(attn_out)
+        return tokens + block.ls2(block.mlp(block.norm2(tokens)))
+
+    TOK_BETA_RANGE = (0.0, 4.0)
+
+    def _tokdino_warm(self) -> float:
+        """min(1, step / warmup); 0 at step 0 => the tokdino path is skipped."""
+        warmup = int(self.tokdino_warmup)
+        return 1.0 if warmup <= 0 else min(1.0, float(int(self.tokdino_steps)) / float(warmup))
+
+    @torch.no_grad()
+    def tokdino_post_step_(self):
+        """Called by the trainer after optimizer.step() (see dual_stream_post_step_ for why)."""
+        self.tokdino_beta.clamp_(*self.TOK_BETA_RANGE)
+        self.tokdino_steps += 1
+
+    def _tokdino_global_block_forward(self, block, tokens, pos, log_d, keep, warm, B, S, global_idx):
+        """
+        One global block with the per-token DINO band, every query biased.
+
+        log_d [B, S, S] log DINO distance (query frame, key frame); keep [B, S, S] pinned pairs.
+        The bias for token n and key frame j is shared by all P tokens of frame j, so it is added
+        through the dot product instead of a mask:
+          q_aug = [q, sqrt(D) * bias[n, :], 0-pad]   k_aug = [k, onehot(frame(key)), 0-pad]
+          sdpa(q_aug, k_aug, v, scale=1/sqrt(D))  ==  softmax(q.k/sqrt(D) + bias[n, frame(key)]) v
+        q/k are padded to a multiple of 8, v stays at D (measured fastest, 2026-09-29).
+        """
+        N, C_dim = tokens.shape[1], tokens.shape[2]
+        P = N // S
+        H, D = block.attn.num_heads, block.attn.head_dim
+        li = global_idx - int(self.tokdino_start)
+
+        x_norm = block.norm1(tokens)
+        q, k, v = block.attn.qkv(x_norm).reshape(B, N, 3, H, D).permute(2, 0, 3, 1, 4).unbind(0)
+        q, k = block.attn.q_norm(q), block.attn.k_norm(k)
+        if block.attn.rope is not None and pos is not None:
+            q, k = block.attn.rope(q, pos), block.attn.rope(k, pos)
+        drop_p = block.attn.attn_drop.p if self.training else 0.0
+
+        # per-token (log s, log sigma), tanh-squashed into the stored ranges        [B, N, H] each
+        raw_s, raw_sig = self.tokdino_pred[li](x_norm).float().split(H, dim=-1)
+        (s_lo, s_hi), (g_lo, g_hi) = self.tokdino_log_s_range.tolist(), self.tokdino_log_sigma_range.tolist()
+        log_s = (s_lo + s_hi) / 2 + (s_hi - s_lo) / 2 * torch.tanh(raw_s)
+        log_sig = (g_lo + g_hi) / 2 + (g_hi - g_lo) / 2 * torch.tanh(raw_sig)
+
+        frame = torch.arange(N, device=tokens.device) // P                          # [N]
+        ld = log_d[:, frame, :].unsqueeze(2)                                         # [B, N, 1, S]
+        bias = -warm * self.tokdino_beta[li] * (ld - log_s.unsqueeze(-1)).pow(2) \
+            / (2.0 * torch.exp(2.0 * log_sig).unsqueeze(-1))                        # [B, N, H, S]
+        bias = bias.clamp(min=self.DS_BIAS_FLOOR).masked_fill(keep[:, frame, None, :], 0.0)
+        bias = bias.permute(0, 2, 1, 3)                                              # [B, H, N, S]
+
+        with torch.no_grad():                   # readout for the trainer's tokdino.jsonl
+            qs = torch.tensor([0.1, 0.5, 0.9], device=tokens.device)
+            self._tokdino_stats[global_idx] = torch.stack([
+                torch.quantile(log_s.reshape(-1, H).exp(), qs, dim=0),
+                torch.quantile(log_sig.reshape(-1, H).exp(), qs, dim=0)], dim=1)    # [3, 2, H]
+
+        dt = v.dtype
+        pad = (-(D + S)) % 8
+        zeros = lambda n: torch.zeros(B, H, N, n, device=tokens.device, dtype=dt)   # noqa: E731
+        onehot = F.one_hot(frame, S).to(dt).expand(B, H, N, S)
+        q_aug = torch.cat([q.to(dt), (bias * math.sqrt(D)).to(dt), zeros(pad)], dim=-1)
+        k_aug = torch.cat([k.to(dt), onehot, zeros(pad)], dim=-1)
+        attn_out = F.scaled_dot_product_attention(q_aug, k_aug, v, dropout_p=drop_p,
+                                                  scale=1.0 / math.sqrt(D))          # [B, H, N, D]
 
         attn_out = block.attn.proj_drop(block.attn.proj(attn_out.permute(0, 2, 1, 3).reshape(B, N, C_dim)))
         tokens = tokens + block.ls1(attn_out)

@@ -87,6 +87,7 @@ class Trainer:
         accum_steps: int = 1,
         oracle_gate: Optional[Dict[str, Any]] = None,
         corruption: Optional[Dict[str, Any]] = None,
+        temporal_frame_pos: bool = False,
         resume: bool = False,
         **kwargs,
     ):
@@ -159,6 +160,11 @@ class Trainer:
         # as augmentation). loss.influence then scores how far the UNCORRUPTED frames moved.
         # Config keys: enabled, warmup_steps, plus anything data.photometric_corruption reads.
         self.corruption_conf = corruption
+        # True: the temporal blocks' RoPE reads each frame's real offset from the clip's first frame
+        # (batch["ids"]) instead of its position 0..S-1. With strided clips (contiguous_stride) this
+        # trains offsets up to (S-1)*stride, so a stride-1 chunk of 64 at eval stays in range. Eval
+        # passes nothing, which on contiguous frames is the same thing (offset == position).
+        self.temporal_frame_pos = bool(temporal_frame_pos)
         # Two independently-selected best checkpoints, both restored on resume:
         #   best_ate  -> lowest channel-B full-sequence Sintel ATE (the report metric).
         #   best_loss -> lowest channel-A held-out (PO-test) camera loss (unbiased vs the
@@ -541,6 +547,7 @@ class Trainer:
             dataloader = self.train_dataset.get_loader(epoch=int(self.epoch + self.distributed_rank))
             self.train_epoch(dataloader)
             self._log_dual_stream()
+            self._log_tokdino()
 
             # Clean up training memory before validation.
             del dataloader
@@ -974,6 +981,11 @@ class Trainer:
                 # epoch boundary to find out wastes the epoch.
                 if self.epoch == 0 and int(agg.dual_stream_steps) in (100, 300, 600, 1000):
                     self._log_dual_stream()
+            tok = self._tokdino_module()
+            if tok is not None:
+                tok.tokdino_post_step_()
+                if self.epoch == 0 and int(tok.tokdino_steps) in (100, 300, 600, 1000):
+                    self._log_tokdino()
 
             # Measure elapsed time
             batch_time.update(time.time() - end)
@@ -1124,6 +1136,7 @@ class Trainer:
         # Train phase only: validation must stay a plain single forward or its loss stops being
         # comparable with every previous run's.
         images_in = batch["images"]
+        frame_pos = batch["ids"] if self.temporal_frame_pos else None
         y_teacher = None
         if (
             phase == "train"
@@ -1148,7 +1161,8 @@ class Trainer:
                            else torch.float16),
                     cache_enabled=False,
                 ):
-                    y_teacher = model(images=batch["images"], gate_logits_override=gate_override)
+                    y_teacher = model(images=batch["images"], gate_logits_override=gate_override,
+                                      frame_pos=frame_pos)
                     y_teacher = {
                         k: v for k, v in y_teacher.items()
                         if k in ("world_points", "world_points_conf", "depth", "pose_enc_list")
@@ -1157,7 +1171,7 @@ class Trainer:
                 batch["_teacher"] = y_teacher
                 batch["corrupt_frame_mask"] = corrupt_mask
 
-        y_hat = model(images=images_in, gate_logits_override=gate_override)
+        y_hat = model(images=images_in, gate_logits_override=gate_override, frame_pos=frame_pos)
         
         # Loss computation
         loss_dict = self.loss(y_hat, batch)
@@ -1198,6 +1212,45 @@ class Trainer:
         ) else self.model
         agg = getattr(model, "aggregator", None)
         return agg if getattr(agg, "enable_dual_stream", False) else None
+
+    def _tokdino_module(self):
+        """The aggregator, if this run has the per-token DINO band (tokdino); else None."""
+        model = self.model.module if isinstance(
+            self.model, torch.nn.parallel.DistributedDataParallel
+        ) else self.model
+        agg = getattr(model, "aggregator", None)
+        return agg if getattr(agg, "enable_tokdino", False) else None
+
+    def _log_tokdino(self) -> None:
+        """Append beta and the predicted (s, sigma) spread to logs/<exp>/tokdino.jsonl.
+
+        s and sigma are per-token predictions, so the readout is their distribution over the
+        tokens of the LAST training forward: 10/50/90% quantiles per (layer, head). The p10-p90
+        gap is the "did tokens learn different distances" reading; zero gap = a per-head band.
+        """
+        agg = self._tokdino_module()
+        if self.rank != 0 or agg is None:
+            return
+        warm = float(agg._tokdino_warm())
+        beta = agg.tokdino_beta.detach().float().cpu()
+        stats = {int(k): v.detach().float().cpu() for k, v in agg._tokdino_stats.items()}
+        rnd = lambda x: [round(float(a), 6) for a in x]  # noqa: E731
+        record = {
+            "epoch": int(self.epoch),
+            "train_steps": int(self.steps["train"]),
+            "tok_steps": int(agg.tokdino_steps),
+            "warm": warm,
+            "start": int(agg.tokdino_start),
+            "beta": rnd(beta),
+            "beta_eff": rnd(warm * beta),
+            # per layer: {"s": [p10[H], p50[H], p90[H]], "sigma": [...]}
+            "pred": {str(k): {"s": [rnd(v[i, 0]) for i in range(3)],
+                              "sigma": [rnd(v[i, 1]) for i in range(3)]}
+                     for k, v in sorted(stats.items())},
+        }
+        path = os.path.join(self.logging_conf.log_dir, "tokdino.jsonl")
+        with open(path, "a") as f:
+            f.write(json.dumps(record) + "\n")
 
     def _snapshot_dual_stream_init(self) -> None:
         """Band centres as training starts (after any resume), the baseline for s_shift_max.
