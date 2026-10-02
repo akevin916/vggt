@@ -67,6 +67,7 @@ class ScaredDataset(BaseDataset):
         dynamic_source: str = "none",
         min_anchor_valid_frac: float = 0.05,
         nearby_expand_range: int | None = None,
+        contiguous_stride: int | None = None,
     ):
         super().__init__(common_conf=common_conf)
 
@@ -88,6 +89,20 @@ class ScaredDataset(BaseDataset):
         # 480 = 21.72 -- the endoscope loiters and doubles back, so displacement SATURATES
         # past ~240 and a wider window buys baseline at the cost of view overlap.
         self.nearby_expand_range = nearby_expand_range
+        # Evenly spaced clip instead of get_nearby's random draw: frames anchor, anchor+s, ...,
+        # anchor+(N-1)s. s=1 is exactly the test/pose protocol (stride-1 video). None keeps the
+        # inherited random draw, which samples WITH replacement (base_dataset.get_nearby_ids) --
+        # ~12% of adjacent pairs are the same frame at +-2N, ~38% at +-6 for a 12-view clip.
+        # The anchor stays the FIRST frame, so the dense-depth anchor pool actually protects
+        # the camera loss (it reads frame 0 only); the random draw sorts ids, so its frame 0 is
+        # usually not the anchor.
+        # An int fixes s; a list draws s per clip, uniformly over the strides whose clip still
+        # fits the keyframe (so a 12-view s=9 clip, spanning 99 frames, is never drawn on the
+        # 88-frame dataset2/keyframe1 -- that keyframe sees the smaller strides only).
+        if contiguous_stride is None or isinstance(contiguous_stride, int):
+            self.contiguous_strides = [contiguous_stride] if contiguous_stride else None
+        else:
+            self.contiguous_strides = [int(s) for s in contiguous_stride]
 
         if dynamic_source not in ("none",):
             raise ValueError(
@@ -160,7 +175,15 @@ class ScaredDataset(BaseDataset):
         num_frames = store["num_frames"]
 
         if ids is None:
-            if self.get_nearby:
+            if self.get_nearby and self.contiguous_strides:
+                fits = [s for s in self.contiguous_strides if s * (img_per_seq - 1) < num_frames]
+                stride = int(np.random.choice(fits)) if fits else 1
+                span = stride * (img_per_seq - 1)
+                pool = store["anchors"][store["anchors"] + span < num_frames]
+                anchor = int(np.random.choice(pool if len(pool) else store["anchors"]))
+                start = max(min(anchor, num_frames - 1 - span), 0)
+                ids = start + stride * np.arange(img_per_seq)
+            elif self.get_nearby:
                 # anchor from the dense-depth pool only (see module header)
                 anchor = int(np.random.choice(store["anchors"]))
                 if self.nearby_expand_range is None:
