@@ -80,6 +80,12 @@ def load_vggt_for_eval(
         absent = [k for k in need if k not in sd]
         if absent:
             raise SystemExit(f"{ckpt} has dual_stream_log_s but lacks {absent}")
+    # delta_mode decides which extra buffers the Aggregator registers (abs_span / odo_unit), so it
+    # must be read BEFORE building; their values are then overwritten by load_state_dict.
+    dual_delta_mode = int(sd["aggregator.dual_stream_delta_mode"]) if has_dual else 0
+    # Alt-stream (dual v0 re-implemented): the signal id is a buffer, overwritten on load; start is
+    # not stored and must match training (8, as in every v0 config).
+    has_alt = "aggregator.alt_stream_p" in sd
     # 3D (y,x,t) RoPE carries NO parameters, so only this persistent buffer distinguishes a 3D
     # checkpoint from a 2D one; without it the weights would be scored under a different position
     # code than they were trained with, silently.
@@ -93,6 +99,15 @@ def load_vggt_for_eval(
     # Illumination token: it shifts patch_start_idx by one, so loading an illu checkpoint without
     # it would not merely drop a head -- every head would read the token grid off by one slot.
     has_illu = "aggregator.illu_token" in sd
+    # tokdino: start and the squash ranges are buffers (all of them decide the forward), so the
+    # checkpoint alone reproduces it; start must be read BEFORE building (it sets how many
+    # predictors exist). Ranges/steps/warmup are overwritten by load_state_dict.
+    has_tokdino = "aggregator.tokdino_beta" in sd
+    tok_need = ["aggregator.tokdino_steps", "aggregator.tokdino_warmup", "aggregator.tokdino_start",
+                "aggregator.tokdino_log_s_range", "aggregator.tokdino_log_sigma_range"]
+    if has_tokdino and any(k not in sd for k in tok_need):
+        raise SystemExit(f"{ckpt} has tokdino_beta but lacks {[k for k in tok_need if k not in sd]}")
+    tokdino_start = int(sd["aggregator.tokdino_start"]) if has_tokdino else 8
 
     if require_gate and not has_gate:
         raise SystemExit(f"checkpoint has no gate_predictor weights: {ckpt}")
@@ -119,6 +134,10 @@ def load_vggt_for_eval(
         enable_dual_stream=has_dual,
         dual_stream_scope=dual_stream_scope,
         dual_stream_start=dual_stream_start,
+        dual_stream_delta_mode=dual_delta_mode,
+        enable_alt_stream=has_alt,
+        enable_tokdino=has_tokdino,
+        tokdino_start=tokdino_start,
         enable_illu=has_illu,
     )
     miss, unexp = model.load_state_dict(sd, strict=False)
@@ -129,6 +148,16 @@ def load_vggt_for_eval(
               f"warmup={int(agg.dual_stream_warmup)} warm={agg._dual_stream_warm():.3f} "
               f"delta_mode={int(agg.dual_stream_delta_mode)} "
               f"keep_mode={int(agg.dual_stream_keep_mode)}")
+    if verbose and has_alt:
+        agg = model.aggregator
+        print(f"alt-stream ON: start={agg.alt_stream_start} (not stored in ckpt) "
+              f"signal_id={int(agg.alt_stream_signal_id)} |p| mean={agg.alt_stream_p[agg.alt_stream_start:].abs().mean().item():.4f}")
+    if verbose and has_tokdino:
+        agg = model.aggregator
+        print(f"tokdino ON: start={int(agg.tokdino_start)} steps={int(agg.tokdino_steps)} "
+              f"warmup={int(agg.tokdino_warmup)} warm={agg._tokdino_warm():.3f} "
+              f"s_range={agg.tokdino_log_s_range.exp().tolist()} "
+              f"sigma_range={agg.tokdino_log_sigma_range.exp().tolist()}")
     if verbose and rope_time:
         alphas = torch.cat([v.flatten() for k, v in sd.items() if k.startswith("aggregator.rope_t.")])
         print(f"time RoPE ON: base={rope_time_base} |alpha| median={alphas.abs().median():.4f} "

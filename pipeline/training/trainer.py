@@ -658,7 +658,15 @@ class Trainer:
                     self.logging_conf.log_dir, "pose_eval", f"epoch_{int(self.epoch) + 1}"
                 )
                 device = self.device if isinstance(self.device, str) else "cuda"
-                if dataset == "scared":
+                results = None
+                if dataset == "scared_primary":
+                    results, ate_primary = self._run_scared_primary(cfg, model, out_dir, device)
+                    if ate_primary is not None and ate_primary > 0:
+                        ate_val[0] = float(ate_primary)
+                    logging.info("Primary eval at epoch %s: pose c64 snippet ATE=%.4f, depth multi AbsRel=%s",
+                                 self.epoch, ate_val.item(),
+                                 results.get("depth", {}).get("mean", {}).get("abs_rel"))
+                elif dataset == "scared":
                     # SCARED runs have no Sintel-shaped eval: same val split as channel A,
                     # but scored as full contiguous sequences with sim3-aligned ATE.
                     from pipeline.benchmark.eval_scared import evaluate as eval_evaluate
@@ -714,18 +722,20 @@ class Trainer:
                         chunk_size=int(cfg.get("chunk_size", 0) or 0),
                         max_depth=float(cfg.get("max_depth", 80.0)),
                     )
-                results = eval_evaluate(args, model=model)
-                ate = results.get("pose", {}).get("mean", {}).get("ate", None)
-                if ate is not None and ate > 0:
-                    ate_val[0] = float(ate)
-                logging.info(
-                    "Pose eval (full-seq %s) at epoch %s: ATE=%.4f",
-                    dataset, self.epoch, ate_val.item()
-                )
+                if results is None:
+                    results = eval_evaluate(args, model=model)
+                    ate = results.get("pose", {}).get("mean", {}).get("ate", None)
+                    if ate is not None and ate > 0:
+                        ate_val[0] = float(ate)
+                    logging.info(
+                        "Pose eval (full-seq %s) at epoch %s: ATE=%.4f",
+                        dataset, self.epoch, ate_val.item()
+                    )
                 # Channel B is now the sole validation signal -> log its full-sequence mean
                 # metrics to TensorBoard under the same validation/{pose,depth}_* tags (drop-in
                 # replacing the removed windowed channel A) so the TB curves are all full-sequence.
-                for group in ("pose", "depth"):
+                groups = ("pose_c64", "depth_multi") if dataset == "scared_primary" else ("pose", "depth")
+                for group in groups:
                     for key, val in results.get(group, {}).get("mean", {}).items():
                         self.tb_writer.log(f"validation/{group}_{key}", val, self.epoch)
         finally:
@@ -740,6 +750,35 @@ class Trainer:
             dist.broadcast(ate_val, src=0)
         ate = ate_val.item()
         return ate if ate != float("inf") else None
+
+    def _run_scared_primary(self, cfg, model, out_dir, device):
+        """pose_eval.dataset == "scared_primary" (2026-10-05): score the live model on the two
+        exploration-phase primary metrics, on TEST (the plan's rule: test is the validation set
+        while exploring, docs/planning/計劃書_2026-10.md §0.2):
+          pose c64   test/pose, whole sequences, 64-frame chunks overlap 16 -> 5-frame snippet ATE
+          depth multi test/depth, whole keyframes, 64-frame chunks overlap 16, afsfm protocol
+        Identical arguments to the eval_scared.py CLI runs of those protocols, so the per-epoch
+        numbers equal the post-training ones. Returns (results, c64 snippet ATE); the latter is
+        the best_ate.pt selection signal in this mode. Results are re-keyed so TensorBoard gets
+        validation/{pose_c64,depth_multi}_* instead of the val-split tags."""
+        from types import SimpleNamespace
+        from pipeline.benchmark.eval_scared import evaluate as eval_evaluate
+        from pipeline.data.paths import data_path
+
+        root = cfg.get("scared_root", None) or data_path("train", "scared")
+        common = dict(ckpt=f"live_epoch_{int(self.epoch) + 1}", scared_root=root, seqs=None, n_frames=0,
+                      chunk_size=int(cfg.get("chunk_size", 64) or 64), overlap=int(cfg.get("overlap", 16)),
+                      # None, as in the CLI: resolve_max_depth then applies each protocol's own cap
+                      # (afsfm: 150 mm). Passing pose_eval.max_depth (200) here would NOT match the CLI.
+                      max_depth=None, gate_mode=cfg.get("gate_mode", "predicted"),
+                      img_size=int(cfg.get("img_size", 518)), single_view=False, device=device)
+        pose = eval_evaluate(SimpleNamespace(**common, split="test/pose", no_depth=True, depth_protocol="monst3r",
+                                             out_dir=os.path.join(out_dir, "pose_c64")), model=model)
+        depth = eval_evaluate(SimpleNamespace(**common, split="test/depth", no_depth=False, depth_protocol="afsfm",
+                                              out_dir=os.path.join(out_dir, "depth_multi")), model=model)
+        ate = pose.get("pose", {}).get("mean", {}).get("snippet_ate", None)
+        return {"pose_c64": pose.get("pose", {}), "depth_multi": depth.get("depth", {}),
+                "depth": depth.get("depth", {})}, ate
 
     @torch.no_grad()
     def val_epoch(self, val_loader):

@@ -92,6 +92,52 @@ def split_tag(split: str) -> str:
     return split.replace("/", "_")
 
 
+# CLI default layout (2026-10-05): outputs/eval/<exp>/<protocol>_<role>/results.json, so one
+# experiment's numbers live under one dir. The four reference protocols get the short names
+# pose / depth (c5 snippet pose, single-view afsfm depth); every other flag set spells itself
+# out (pose_c64, depth_multi, ..._gateoff). --out_dir keeps the old <out_dir>/<exp>_<stem>/.
+OUT_TOOL = "eval"
+CKPT_ROLE = {"last.pt": "last", "best_ate.pt": "best"}
+
+
+def protocol_tag(args) -> str:
+    cs, ov = args.chunk_size, args.overlap
+    if args.split == "test/pose":
+        tag = "pose" if (cs, ov) == (5, 4) else "pose_c64" if (cs, ov) == (64, 16) else f"pose_c{cs}o{ov}"
+    elif args.split == "test/depth":
+        if args.single_view:
+            tag = "depth"
+        else:
+            tag = "depth_multi" if (cs, ov) == (64, 16) else f"depth_multi_c{cs}o{ov}"
+        if args.depth_protocol != "afsfm":
+            tag += f"_{args.depth_protocol}"
+    else:
+        tag = f"{split_tag(args.split)}_c{cs}o{ov}" + ("_single" if args.single_view else "")
+        if args.depth_protocol != "monst3r":
+            tag += f"_{args.depth_protocol}"
+    if args.n_frames > 0:
+        tag += f"_{args.n_frames}f"
+    if args.gate_mode != "predicted":
+        tag += f"_gate{args.gate_mode}"
+    if args.img_size != 518:
+        tag += f"_img{args.img_size}"
+    return tag
+
+
+def ckpt_role(ckpt: str) -> str:
+    """last.pt -> last, best_ate.pt -> best, epoch_10.pt -> last (plan §0.3)."""
+    d, base = os.path.split(os.path.abspath(ckpt))
+    if os.path.basename(d) != "ckpts":
+        raise SystemExit(f"{ckpt}: not under logs/<exp>/ckpts/, pass --out_dir")
+    if base in CKPT_ROLE:
+        return CKPT_ROLE[base]
+    # SCARED runs are 10 epochs, so epoch_10.pt and last.pt are the same weights and share a dir.
+    if base == "epoch_10.pt":
+        return "last"
+    raise SystemExit(f"{ckpt}: only last.pt / best_ate.pt / epoch_10.pt have a default dir, "
+                     f"pass --out_dir")
+
+
 def list_sequences(root: str, split: str):
     out = []
     split_dir = os.path.join(root, split)
@@ -156,6 +202,7 @@ def eval_ckpt(ckpt, root, split, seqs, args, model=None):
         model = load_vggt_for_eval(ckpt, device=args.device)
     fids_all = {}
     per_seq_pose, per_seq_depth = {}, {}
+    failed = []
 
     for seq in tqdm(seqs, desc=os.path.basename(ckpt)):
         seq_dir = os.path.join(root, split, seq)
@@ -250,7 +297,9 @@ def eval_ckpt(ckpt, root, split, seqs, args, model=None):
                                                 / max(scale["bbox_diag"], 1e-9))
             fids_all[seq] = [int(os.path.basename(p)[:-4]) for p in paths]
 
-            if not args.no_depth and "depth" in pred:
+            # test/pose has no depth GT: skip instead of raising, which the failure guard would
+            # count as a failed sequence and turn the pose means into NaN.
+            if not args.no_depth and "depth" in pred and os.path.isdir(os.path.join(seq_dir, "depth_left")):
                 gt_d = load_gt_depths(seq_dir, fids_all[seq])
                 metas = [compute_preprocess_meta(p) for p in paths]
                 pred_d = [resize_pred_to_gt(pred["depth"][i], metas[i]) for i in range(len(paths))]
@@ -264,6 +313,7 @@ def eval_ckpt(ckpt, root, split, seqs, args, model=None):
                     post_clip_max=max_d, device=args.device)
         except Exception:
             traceback.print_exc()
+            failed.append(seq)
     if owns_model:
         del model
     import torch
@@ -273,15 +323,23 @@ def eval_ckpt(ckpt, root, split, seqs, args, model=None):
     mean_pose = ({k: float(np.mean([v[k] for v in per_seq_pose.values() if k in v]))
                   for k in _keys if any(k in v for v in per_seq_pose.values())}
                  if per_seq_pose else {})
+    mean_depth = (average_depth_results(
+                      per_seq_depth,
+                      weight_key=("num_frames"
+                                  if getattr(args, "depth_protocol", "monst3r") == "afsfm"
+                                  else "valid_pixels"))
+                  if per_seq_depth else {})
+    if failed:
+        # A mean over the sequences that happened to survive is a different number, not a
+        # noisier one (2026-09-30: tokdino's multi-view depth lost the two longest sequences
+        # to OOM and silently reported the average of the other five). Keep the per-seq values,
+        # poison the means.
+        print(f"[eval_scared] {len(failed)}/{len(seqs)} sequences FAILED: {failed} -> means set to NaN")
+        mean_pose = {k: float("nan") for k in mean_pose}
+        mean_depth = {k: float("nan") for k in mean_depth}
     return dict(pose=dict(per_seq=per_seq_pose, mean=mean_pose),
-                depth=dict(per_seq=per_seq_depth,
-                           mean=average_depth_results(
-                               per_seq_depth,
-                               weight_key=("num_frames"
-                                           if getattr(args, "depth_protocol", "monst3r") == "afsfm"
-                                           else "valid_pixels"))
-                           if per_seq_depth else {}),
-                frames=fids_all)
+                depth=dict(per_seq=per_seq_depth, mean=mean_depth),
+                frames=fids_all, failed_seqs=failed)
 
 
 def evaluate(args, model=None):
@@ -303,6 +361,10 @@ def evaluate(args, model=None):
     payload = dict(meta=dict(ckpt=args.ckpt, scared_root=args.scared_root, split=args.split,
                              seqs=seqs, n_frames=args.n_frames, max_depth=resolve_max_depth(args),
                              depth_protocol=getattr(args, "depth_protocol", "monst3r"),
+                             chunk_size=getattr(args, "chunk_size", 0),
+                             overlap=getattr(args, "overlap", None),
+                             single_view=bool(getattr(args, "single_view", False)),
+                             gate_mode=getattr(args, "gate_mode", "predicted"),
                              timestamp=datetime.now().isoformat(timespec="seconds")),
                    results=results)
     with open(os.path.join(args.out_dir, "results.json"), "w") as f:
@@ -350,15 +412,15 @@ def main():
     args = ap.parse_args()
 
     seqs = args.seqs or list_sequences(args.scared_root, args.split)
-    suffix = "" if args.gate_mode == "predicted" else f"_gate{args.gate_mode}"
-    if args.single_view:
-        suffix += "_single"
-    if args.depth_protocol == "afsfm":
-        suffix += "_afsfm"
-    base_out = args.out_dir or output_dir_for_exp(
-        f"{split_tag(args.split)}_{args.n_frames}f{suffix}", TOOL)
+    base_out = args.out_dir
+    if base_out is None:
+        tag = protocol_tag(args)
+        out_dirs = {c: os.path.join(output_dir_for_exp(exp_name_from_ckpt(c), OUT_TOOL),
+                                    f"{tag}_{ckpt_role(c)}") for c in args.ckpts}
+        if len(set(out_dirs.values())) != len(out_dirs):
+            raise SystemExit(f"two ckpts map to one output dir: {out_dirs}")
     print(f"{len(args.ckpts)} ckpts x {len(seqs)} sequences ({args.split}), "
-          f"{args.n_frames} frames each -> {base_out}")
+          f"{args.n_frames} frames each -> {base_out or 'outputs/eval/<exp>/'}")
 
     results = {}
     for ckpt in args.ckpts:
@@ -377,7 +439,7 @@ def main():
         # with the same split/flags wrote to the same results.json, and the second silently
         # destroyed the first -- which is exactly what happened when the VGGT-1B test/pose run
         # landed on top of the fine-tuned one.
-        args.out_dir = os.path.join(base_out, name)
+        args.out_dir = os.path.join(base_out, name) if base_out else out_dirs[ckpt]
         results[name] = evaluate(args)
     out_dir = base_out
 
@@ -447,10 +509,13 @@ def main():
                                        "per-frame metrics averaged unweighted"),
                              timestamp=datetime.now().isoformat(timespec="seconds")),
                    results=results)
-    p = os.path.join(out_dir, "results.json")
-    with open(p, "w") as f:
-        json.dump(payload, f, indent=2)
-    print(f"\n-> {p}")
+    if out_dir is None:   # default layout: each ckpt already has its own results.json
+        print("\n-> " + "\n-> ".join(os.path.join(d, "results.json") for d in out_dirs.values()))
+    else:
+        p = os.path.join(out_dir, "results.json")
+        with open(p, "w") as f:
+            json.dump(payload, f, indent=2)
+        print(f"\n-> {p}")
     import torch  # module-level import is deliberately avoided in this script
     if torch.cuda.is_available():
         # Deterministic, and the unit any VRAM budget should be argued in. reserved is what
