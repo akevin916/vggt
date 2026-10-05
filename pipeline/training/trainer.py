@@ -754,7 +754,7 @@ class Trainer:
     def _run_scared_primary(self, cfg, model, out_dir, device):
         """pose_eval.dataset == "scared_primary" (2026-10-05): score the live model on the two
         exploration-phase primary metrics, on TEST (the plan's rule: test is the validation set
-        while exploring, docs/planning/計劃書_2026-10.md §0.2):
+        while exploring, docs/計劃書_2026-10.md §0.2):
           pose c64   test/pose, whole sequences, 64-frame chunks overlap 16 -> 5-frame snippet ATE
           depth multi test/depth, whole keyframes, 64-frame chunks overlap 16, afsfm protocol
         Identical arguments to the eval_scared.py CLI runs of those protocols, so the per-epoch
