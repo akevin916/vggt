@@ -9,12 +9,13 @@
 
 Gate（正式版 v1）在自然場景把 Sintel ATE 從 0.1714 帶到 0.1343，但**增益幾乎全部來自
 temporal + camera_smooth，gate 本身的 soft bias 目前近乎無作用**（predicted −0.15%，oracle −5.85%）；
+SCARED 的成分消融（§E）已成形：最佳組合 pose −16.7%，光照 token 是負結果。
 醫學域（SCARED）是另一條較晚開的線，pose 相對微調 baseline 有 17–24% 改善、depth 幾乎沒動；
 照明穩健性（L_inf）機制已實作、第一次 run 失敗、**結論未定**。
 
 ---
 
-## 四條線的狀態
+## 五條線的狀態
 
 | 線 | 域 | 狀態 | 最後一個可信數字 | 依據 |
 |---|---|---|---|---|
@@ -22,6 +23,7 @@ temporal + camera_smooth，gate 本身的 soft bias 目前近乎無作用**（pr
 | **B. 醫學域適配** | SCARED / C3VD / 私人內視鏡 | 🟢 有正向結果，但排名未定 | snippet ATE **0.0597**（chunk 64）、單張 AbsRel **0.0537** | [results/medical.md](results/medical.md) §1 |
 | **C. 照明穩健性（L_inf）** | SCARED | ⚪ 機制已實作，**尚未有結論** | — | [method.md](method.md) §5 |
 | **D. 反光的影響** | C3VD | 🔴 負結果（C3VD 上反光不傷重建） | 點雲角度校正後 **2.07 vs 2.23 mm** | 本頁 §D.2 |
+| **E. SCARED 成分消融** | SCARED | 🟢 主線，最佳組合成立；光照 token 為負結果 | snippet ATE **0.0709**（chunk 5，`tfs`） | [results/medical_part2.md](results/medical_part2.md)、本頁 §E |
 
 「已收掉」的線見文末。
 
@@ -117,8 +119,9 @@ Endo-FASt3r（0.051）、上期 ESRT-Row（0.048）。全序列的 0.0434 **主�
 **pose 追上但沒贏。** 64 幀下 Seq.2 的 0.0478 追平 AF-SfMLearner，但那是 64 幀 context；
 公平的 5 幀設定（0.0844 / 0.0567）兩條都還輸給全部 published 方法。
 
-**全序列 evo ATE 不報。** Sim3 拼接讓該指標擺動 −1%~+32% 且不可預測 → EndoSfM3D 系的 pose 欄填不了。
-**是不估，不是估錯。**
+**全序列 evo ATE 不報。** Sim3 拼接讓該指標擺動 −1%~+32% 且不可預測。**是不估，不是估錯。**
+這不妨礙對外比較：EndoSfM3D 表上的 pose 欄是經 EndoDAC 沿用的 AF snippet 協定，可以和我們的 5 幀列
+逐序列比；只有 EndoSfM3D 自己那一列的協定論文未載明。前提與規則見 [results/sota.md](results/sota.md) §2.1。
 
 ### B.3 兩個負結果
 
@@ -231,6 +234,65 @@ ckpt 用 C3VD 微調的 `logs/c3vd_cam_vanilla/ckpts/best_ate.pt`。
 - **目視印象與數字方向相反**：3D 點雲上可見部分反光區一致性較差、極少數較遠的反光表面
   有凸起；數字則說校正後反光略優。凸起在 acc_mean 上沒有反映，與「極少數」一致。
 - **注入 arm 從未跑過**。自然反光沒有可測傷害，不代表更強的反光沒有。
+
+---
+
+## E. SCARED 成分消融（2026-09）— 主線在這裡
+
+12 支 arm 建在同一個底座（`scared_cam_vanilla_depth`：depth head 解凍 + `loss.depth` α=0.02）。
+數字全在 [results/medical_part2.md](results/medical_part2.md)。判斷顯著性一律用該節列的擺動上限
+（pose c5 是 2.4%），**全部單一 seed**。
+
+**pose 主指標是 c5**（2026-10-02 定）：它是唯一能和論文逐序列對比的設定（見 [results/sota.md](results/sota.md) §2.1）。
+c64 當作參考。
+
+### E.1 已經成立的
+
+**最佳組合是 temporal + flow_geom + camera_smooth（`tfs`）**，pose c5 0.0709，比底座 −16.7%，
+多張 depth 與兩種 pose 都是全表第一。它超過 temporal 單獨（−11.5%）加 flowgeom_smooth 單獨
+（−4.7%）的總和，**架構時序與 loss 端幾何約束是互補的**。
+
+**單張 depth 分不出勝負。** 同底座 12 支全部落在 0.0493–0.0504 的 1% 區間內。唯一真實的落差
+是兩個底座之間（凍結 0.0561 對解凍 0.0501），那是解凍 depth head 買到的，不是任何成分。
+
+**temporal 的效果約三分之二來自「幀順序資訊」，不是它的 100.8M 參數。** 零新模組、768 個參數的
+時間相位 RoPE 在 pose c5 拿到 −7.6%，完整 temporal 是 −11.5%；兩者疊加 −10.1%，重疊而非互補。
+
+**載體比資訊重要。** 同樣注入幀索引，重切 head_dim（`rope3d`）是 +11.0%（全表唯一比底座差的），
+加在原有角度上（`ropet`）是 −7.6%。差別在於重切改掉每個通道的位置語意，而 32 個凍結的
+attention block 無法適應——零訓練探測顯示光是重切就讓 pose c5 掉 112%。
+
+### E.2 負結果
+
+**光照 token 對 pose 沒有貢獻通道。** 證據四項互相印證：單獨跑四項全在雜訊帶（c5 −6.2% 是唯一
+超過門檻的）；疊到 `tfs` 上讓 −16.7% 退成 −12.0%；SCARED 與 C3VD 兩次切斷檢驗都顯示切掉它
+pose 只動 0.7% / 1.5%，比切一個普通 register token 還小；weight 1.0 與 0.2 的差距全在雜訊內。
+
+病因量到了，而且修法已驗證一半：`L_illu` 佔訓練目標 76%，在共享 trunk 上的梯度範數是 camera 的
+20 倍、camera_smooth 的 440 倍，但兩兩餘弦落在 −0.047 至 +0.025，**是量級擠壓不是方向衝突**。
+把權重降到 0.05（1/20.6，梯度對齊 camera）之後，`tfsi_w005` 的 pose c5 回到 **0.0717**，
+落在事前定的「不損害」帶（≤ 0.0726），pose c64 甚至是 0.0603（`tfs` 是 0.0609）。
+**代價是光照本身學得較差**：illu corr 由 weight 1.0 的 0.8432 降到 0.7347。所以這是一個
+「光照不再傷害 pose、但也不再是有力的賣點」的交換，不是白拿的改善。單一 seed。
+
+**時間相位 RoPE 的效果依賴 context 長度。** 三種組合（單獨、加 temporal、加兩個 loss）在
+pose c64 上都是 +8% 左右的傷害，幅度一致；而在 c5 上都是有效的。alpha 只在 t ≤ 12 的 clip 上
+學過（訓練 `img_nums [4,12]`），chunk 64 讓它進入沒見過的相位範圍。**這是外插，不是組合方式
+的問題。** 最便宜的修法是把時間頻率底數由 10 降到 3，未試。
+
+### E.3 attention 先驗（跨底座，尚未對齊）
+
+幀距高斯帶 bias 明顯優於前兩代：凍結底座上 −14.8%，對比只看幀號差的 −8.8% 與看 DINO 相似度
+的 −6.4%。搬到解凍底座後縮到 −8.7%。per-token 自適應 DINO 距離帶（`tokdino`）在解凍底座上是
+0.0850，與底座 0.0851 相同，**目前看不到效果**。patch query 也吃 bias 的版本技術上已可行
+（flex_attention，12 幀 fwd+bwd 17.3 GiB），但訓練慢 7 倍、推論慢 2.28 倍，未跑。
+
+### E.4 缺口
+
+- 三個貢獻全開（temporal + 兩個 loss + attn bias）在另一台機器進行中（`tfsd`、`tfsdi`），主表的「完整模型」那一列還是空的。
+- 全部單一 seed；`tfs` 的 −16.7% 只有一次觀測。
+- 依 baseline 政策要有的「微調過的 MonST3R」至今沒訓練過。
+- 私人資料集（lesion / gastric）沒有用這批 ckpt 更新。
 
 ---
 

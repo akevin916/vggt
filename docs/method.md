@@ -552,8 +552,9 @@ run 1 的 24 個 epoch（channel B）：`mean=0.1752, std=0.0149`。
 權威說明在 `pipeline/eval/vggt_infer.infer_sequence_chunked` 的 docstring。
 
 **推論：SCARED 的全序列 evo ATE 我們不報。** VGGT 單次上限 80 幀，Sim3 拼接讓 ATE
-擺動 −1%~+32% 且與 seam 數無關、不可預測。**是不估，不是估錯**——代價是
-EndoSfM3D 那一系的 pose 欄填不了，我們只對得上 AF-SfMLearner 的 snippet 協定。
+擺動 −1%~+32% 且與 seam 數無關、不可預測。**是不估，不是估錯。** published 的 SCARED pose 表
+（AF、EndoDAC、EndoSfM3D）用的都是 AF 的 snippet 協定，所以不報全序列 ATE 不影響對外比較，
+見 `results/sota.md` §2.1。
 
 ### 9.4 與 MonST3R 比較的前提
 

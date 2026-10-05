@@ -95,6 +95,54 @@ Seq.1 = `dataset5/keyframe4`（411 幀），Seq.2 = `dataset3/keyframe4`（834 �
 （最貼近 published 方法的設定）；64 幀 = 從 64 幀的 chunk 取出。兩者算指標的方式相同，
 但預測本身不同——64 幀對每個 ckpt 都好 12~19%。
 
+### 2.1 pose 對照的前提（2026-10-02 核對原始碼）
+
+**表上所有 published 列都是同一套 AF snippet 協定，可以和我們的 5 幀列逐序列比。** 協定的傳承：
+
+- SfMLearner（Zhou 2017，KITTI）：`compute_ate` / `dump_xyz` 的源頭。5 幀窗、每窗各自估尺度、
+  誤差除以 N。設計目的是避開單目 pose 的尺度不定與長程漂移，只評局部運動。
+- AF-SfMLearner：原封不動搬到 SCARED，**只跑 seq2**（`reference/AF-SfMLearner/evaluate_pose.py`）。
+- EndoDAC：同一份函式逐字相同，**擴充成 seq1 + seq2 分開報**（`reference/EndoDAC/evaluate_pose.py`）。
+- EndoSfM3D：pose 表整塊沿用（Fang / Monodepth2 / Endo-SfM / AF 四列與 EndoDAC 逐字相同），
+  沒有自己重跑 baseline。
+
+已核對的一致性：
+
+- split：EndoDAC 的 5 個 split 檔與 AF、與我們的 `data/train/scared/split/` 逐 byte 相同。
+- GT：EndoDAC 的 `gt_poses_sequence{1,2}.npz`（`export_gt_pose.py`：`pose_{i+1} @ inv(pose_i)`）
+  與用同一公式從我們 `test/pose/*/cam_data/extrinsics.txt` 重算的相對轉換，最大差 6e-8（float32 精度）。
+- 窗數：409 / 832，與 `eval_scared.py` 的 `n_windows` 相同。
+- EndoDAC repo 附帶的 `pred_poses_sequence{1,2}.npz` 用它自己的程式算得 0.0776 / 0.0487。
+  **這不是 EndoDAC 的論文數字**：那個檔每次執行都會被覆寫，不知道是哪支權重的輸出。
+
+**每窗能用的資訊不同，這是刻意保留的差異，不另做對齊。**
+
+| | published 方法 | 我們的 5 幀列 | 我們的 64 幀列 |
+|---|---|---|---|
+| 一次 forward 看幾幀 | 2（相鄰兩幀，6 通道疊在一起） | 5 | 64 |
+| 整條序列的 forward 次數 | 幀數 − 1 | 幀數 − 4 | 依 chunk 數 |
+| 一個 5 幀窗的軌跡怎麼來 | 4 個獨立的兩兩預測依序相乘 | 同一次 forward 的 5 個 pose | 64 幀 forward 中取 5 個 |
+
+- published 方法的 2 幀是架構限制：pose encoder 第一層 conv 的輸入通道數固定為「幀數 × 3」，
+  權重用 `--pose_model_input pairs` 訓練（`all` 模式也只有訓練用的 3 幀）。
+- 它們每個窗的 4 段運動各自決定尺度，段與段之間尺度不一致會成為誤差；我們的 5 幀共用一次 forward。
+- **決定（2026-10-02）：不做「每次只餵 2 幀」的對齊版。** 多幀輸入是方法的一部分，不該為了對齊而拿掉。
+  代價是 5 幀列並非「同資訊量」的比較，所以表上的「輸入」欄必須保留，論文也要寫明。
+
+**引用時的四條規則：**
+
+1. **逐序列比，不用兩條平均。** Seq.1 = `dataset5/keyframe4`、Seq.2 = `dataset3/keyframe4`。
+   `docs/results/medical_part2.md` 的 c5 欄是兩條等權平均，不能直接放進本表的欄位；要用它 §1.2 的逐序列值。
+2. **只有 5 幀列對應 published 設定。** 64 幀列沒有文獻對應，只能當補充。
+3. **EndoSfM3D 自己那一列（0.0791 / 0.0529）的協定論文沒寫。** 它釋出的程式算的是全序列 evo ATE，
+   但這個數字的量級屬於 snippet：同樣的序列，光是 50 幀的全序列 ATE 就有 0.5–2 mm（trainer 的 val ATE）。
+   推論它那一列也是 snippet 數字，或至少不是那份程式的輸出——**無法從程式碼證實**，引用時加註。
+4. **不照抄 EndoDAC 的 95% 信賴區間做法。** 它用 `st.sem` 把 832 個窗當獨立樣本，但相鄰窗共用 4 幀，
+   區間會偏窄。我們若要報不確定性，要在序列內做 block bootstrap。
+
+depth 的協定差異只有最小深度：AF 與 EndoDAC 用 1e-3 mm，EndoSfM3D 與我們（`AFSFM_MIN_DEPTH`）用 1e-2 mm。
+SCARED 的 GT 深度在十幾到一百多 mm，兩個門檻之間應無像素，但沒有實際量過。
+
 ---
 
 
@@ -161,15 +209,15 @@ gate 凍結 ≈ 原版架構）可以拆開：pose 64 幀 Seq.2 = 0.0626 → 0.0
 而 Sim3 拼接會讓該指標擺動 −1% ~ **+32%**，且與 seam 數無關、不可預測
 （`diag/stitch_error.py`，80 連續幀實測）。根因是模型只預測出 0.368 mm 位移而 GT 走 17.10 mm，
 `correct_scale` 對齊把預測空間 1% 的抖動放大 47 倍。**選擇不估，而非估錯。**
-代價是 EndoSfM3D / DARES / Endo-FASt3r 那一系的 pose 欄我們填不了——本表的 pose 只對得上
-AF-SfMLearner 的 snippet 協定。
+這不影響本表的可比性：published 表上的 pose 欄本來就是 AF snippet 協定（見 §2.1）。
+（2026-10-02 前這裡寫「EndoSfM3D 那一系的 pose 欄填不了」，那是把 EndoSfM3D 的程式當成了它的表格。）
 
 **test/depth split 的 snippet ATE**：算不了。`eval_scared.py:168` 檢查幀是否 stride-1，
 test/depth split 間隔 1–296 幀，守衛會 skip。pose 只能用 `test/pose`。
 
-**EndoSfM3D pose 那一列存疑**：其論文引用的 baseline 確定是 snippet 協定（AF Table 10 明文），
-但其釋出的 `dares/evaluate_pose_and_intrinsics.py` 算的是全序列 evo ATE，論文未說明自己那列用哪個。
-與 AF / Endo-FASt3r 的比較紮實，與 EndoSfM3D 那列存疑。
+**EndoSfM3D pose 那一列的協定未載明**：其論文引用的 baseline 確定是 snippet 協定（AF Table 10 明文，
+經 EndoDAC 轉手），但其釋出的 `dares/evaluate_pose_and_intrinsics.py` 算的是全序列 evo ATE，
+論文未說明自己那列用哪個。數字量級像 snippet，詳見 §2.1 規則 3。
 
 ---
 
