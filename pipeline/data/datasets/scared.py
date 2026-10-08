@@ -33,7 +33,7 @@
 # frames with valid_frac > `min_anchor_valid_frac`.
 #
 # motion_mask: SCARED has NO dynamic annotation, and the RAFT flow-residual recipe used by
-# Spring/Waymo was measured NOT to work here (docs/topics/scared_dataset.md). `dynamic_source` is
+# Spring/Waymo was measured NOT to work here (docs/內視鏡整理.md 測試 §2). `dynamic_source` is
 # therefore "none" by default, which returns all-zero masks. NOTE that all-zero means
 # "everything is GT-static", which is a LIE for endoscopy (deforming tissue, moving
 # instruments) -- it is a placeholder to keep the key present, not a label. Do not enable
