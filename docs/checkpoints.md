@@ -113,7 +113,7 @@
 | `inst_gts` | `epoch_30.pt` | 30 † | 0.1343 |
 | `inst_gts_o1` | `best_ate.pt` | 3 | 0.1371 |
 | `inst_gts_photo` | `best_ate.pt` | 2 | 0.1413 |
-| `inst_gtsp_buginit` | `best_ate.pt` | 15 | 0.1534 |
+| `inst_gtsp_buginit` | `best_ate.pt`（**2026-10 已刪**） | 15 | 0.1534 |
 | `inst_gts_egoflow` | `best_ate.pt` | 3 | 0.1340 |
 | `inst_gts_egoflow_gt` | `best_ate.pt` | 3 | 0.1346 |
 | `inst_gts_egoflow_gt_nomask` | `best_ate.pt` | 3 | 0.1325 |

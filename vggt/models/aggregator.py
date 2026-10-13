@@ -261,6 +261,18 @@ class Aggregator(nn.Module):
         self.patch_size = patch_size
         self.aa_block_size = aa_block_size
         self.temporal_every = temporal_every  # NEW
+        # Eval-only ablation, set after loading: the first k global blocks attend within the
+        # query's own frame only (weights unchanged). 0 = original behaviour.
+        self.global_as_frame_layers = 0
+        # Eval-only oracle patch masking (docs/plan/遮罩網格_實作說明.md), set after loading and never
+        # stored in a checkpoint. mask_flags None = none of the masked paths is entered.
+        self.mask_flags = None      # [B, S, P_patch] bool, True = hide this patch
+        self.mask_mode = None       # global blocks: "camera" | "all" | "cross"; None = leave them alone
+        self.mask_start = 8         # first aa-block (global and temporal) that is masked
+        self.mask_temporal = False  # also mask the temporal blocks
+        # "cross" runs in flex_attention; its default block size fails to compile here
+        # ("No valid triton configs ... out of resource"), 32 x 32 fits.
+        self.mask_flex_kernel_options = {"BLOCK_M": 32, "BLOCK_N": 32}
 
         # Validate that depth is divisible by aa_block_size
         if self.depth % self.aa_block_size != 0:
@@ -683,6 +695,16 @@ class Aggregator(nn.Module):
                 temporal_pos[:, 1:self.patch_start_idx, :] = 0  # register tokens → no temporal RoPE
             temporal_pos = temporal_pos.reshape(B * P, S)
 
+        if self.mask_flags is not None:
+            if self.training or self.gate_predictor is not None:
+                # a gated checkpoint would stack its own bias on top of the mask
+                raise RuntimeError("mask_flags is eval-only and not supported on a checkpoint with a gate")
+            if self.mask_flags.shape != (B, S, P - self.patch_start_idx):
+                raise ValueError(f"mask_flags {tuple(self.mask_flags.shape)} != "
+                                 f"{(B, S, P - self.patch_start_idx)}")
+            if self.mask_mode not in (None, "camera", "all", "cross"):
+                raise ValueError(f"unknown mask_mode {self.mask_mode}")
+
         frame_idx = 0
         global_idx = 0
         temporal_idx = 0
@@ -754,6 +776,7 @@ class Aggregator(nn.Module):
                         tokens, temporal_idx = self._process_temporal_attention(
                             tokens, B, S, P, C, temporal_idx, pos=temporal_pos,
                             shared_block=self.frame_blocks[block_iter] if self.temporal_share_frame_weights else None,
+                            block_iter=block_iter,
                         )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
@@ -917,7 +940,15 @@ class Aggregator(nn.Module):
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
-            if tok_logd is not None and global_idx >= int(self.tokdino_start):
+            if global_idx < self.global_as_frame_layers:
+                # eval-only ablation: this global block's weights, but attention confined to the
+                # query's own frame (frame-attention reshape). Every bias path is skipped here.
+                blk = self.global_blocks[global_idx]
+                D = pos.shape[-1] if pos is not None else None
+                t_f = tokens.view(B * S, P, C)
+                p_f = pos.view(B * S, P, D) if pos is not None else None
+                tokens = blk(t_f, pos=p_f).view(B, S * P, C)
+            elif tok_logd is not None and global_idx >= int(self.tokdino_start):
                 blk = self.global_blocks[global_idx]
                 _B, _S, _gi, _w = B, S, global_idx, tok_warm
 
@@ -956,6 +987,10 @@ class Aggregator(nn.Module):
                                         use_reentrant=self.use_reentrant)
                 else:
                     tokens = _dual_fn(tokens, pos, pair_log_delta)
+            elif self.mask_flags is not None and self.mask_mode is not None and global_idx >= self.mask_start:
+                tokens = self._masked_global_block_forward(
+                    self.global_blocks[global_idx], tokens, pos, self.mask_flags, B, S, self.patch_start_idx
+                )
             elif gate_logits is not None:
                 # gated attention — split into patch-query path (flash, no bias) and
                 # camera/register-query path (small, with per-patch-key bias).
@@ -1120,8 +1155,80 @@ class Aggregator(nn.Module):
 
         return tokens
 
+    def _masked_global_block_forward(self, block, tokens, pos, flags, B, S, patch_start_idx):
+        """
+        One global block with flagged patches hidden as attention keys (eval-only oracle masking).
+        flags [B, S, P_patch] bool. Same qkv/norm/rope/ls path as _gated_global_block_forward.
+          mask_mode "camera": camera/register queries skip flagged patches (the gate's own path).
+          mask_mode "all":    every query skips them. The flagged keys/values are dropped instead of
+                              biased: an attn_mask takes SDPA off flash and materialises N x N.
+          mask_mode "cross":  every query skips flagged patches of OTHER frames (flex_attention).
+        """
+        if self.mask_mode == "camera":
+            # legacy gate bias min(0, log2 - softplus(g)): exactly 0 at g=-30, about -29.3 at g=+30
+            g = torch.where(flags, 30.0, -30.0).to(torch.float32)
+            return self._gated_global_block_forward(block, tokens, pos, g, B, S, patch_start_idx)
+
+        N, C_dim = tokens.shape[1], tokens.shape[2]
+        P = N // S
+        H, D = block.attn.num_heads, block.attn.head_dim
+
+        x_norm = block.norm1(tokens)
+        q, k, v = block.attn.qkv(x_norm).reshape(B, N, 3, H, D).permute(2, 0, 3, 1, 4).unbind(0)
+        q, k = block.attn.q_norm(q), block.attn.k_norm(k)
+        if block.attn.rope is not None and pos is not None:
+            q, k = block.attn.rope(q, pos), block.attn.rope(k, pos)
+
+        # patch flags in the frame-interleaved token order; special tokens are never hidden
+        flag_tok = flags.new_zeros(B, S, P)
+        flag_tok[:, :, patch_start_idx:] = flags
+        flag_tok = flag_tok.view(B, N)
+
+        if self.mask_mode == "all":
+            assert B == 1, "mask_mode 'all' drops keys per sequence and needs B == 1"
+            keep = ~flag_tok[0]
+            attn_out = F.scaled_dot_product_attention(q, k[:, :, keep], v[:, :, keep])
+        else:
+            # flex_attention rejects the fp32 q/k + bf16 v mix that SDPA tolerates
+            q, k = q.to(v.dtype), k.to(v.dtype)
+            P_ = P
+
+            def _score_mod(score, b, h, q_idx, kv_idx):
+                hide = flag_tok[b, kv_idx] & ((q_idx // P_) != (kv_idx // P_))
+                return score - 30.0 * hide.to(score.dtype)
+
+            attn_out = self._flex_attention(q, k, v, score_mod=_score_mod,
+                                            kernel_options=self.mask_flex_kernel_options)
+
+        attn_out = block.attn.proj_drop(block.attn.proj(attn_out.permute(0, 2, 1, 3).reshape(B, N, C_dim)))
+        tokens = tokens + block.ls1(attn_out)
+        return tokens + block.ls2(block.mlp(block.norm2(tokens)))
+
+    def _masked_temporal_block_forward(self, block, tokens, pos, flags, B, S, P):
+        """
+        One temporal block where each position, attending along time, skips the OTHER frames in
+        which that same patch is flagged (eval-only oracle masking). tokens (B*P, S, C), row
+        b*P + p; flags [B, S, P_patch] bool. Same algebra as Block.forward.
+        """
+        attn = block.attn
+        H, D = attn.num_heads, attn.head_dim
+        q, k, v = attn.qkv(block.norm1(tokens)).reshape(B * P, S, 3, H, D).permute(2, 0, 3, 1, 4).unbind(0)
+        q, k = attn.q_norm(q), attn.k_norm(k)
+        if attn.rope is not None:
+            q, k = attn.rope(q, pos), attn.rope(k, pos)
+
+        key_flag = flags.new_zeros(B, P, S)                       # special-token rows stay unmasked
+        key_flag[:, self.patch_start_idx:] = flags.transpose(1, 2)
+        other = ~torch.eye(S, dtype=torch.bool, device=flags.device)
+        bias = (key_flag.reshape(B * P, 1, 1, S) & other).to(q.dtype) * -30.0     # [B*P, 1, S, S]
+
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
+        out = attn.proj_drop(attn.proj(out.transpose(1, 2).reshape(B * P, S, -1)))
+        tokens = tokens + block.ls1(out)
+        return tokens + block.ls2(block.mlp(block.norm2(tokens)))
+
     @staticmethod
-    def _flex_attention(q, k, v, score_mod):
+    def _flex_attention(q, k, v, score_mod, kernel_options=None):
         """flex_attention, compiled once per process (eager flex is several times slower)."""
         global _FLEX_FN
         if _FLEX_FN is None:
@@ -1135,6 +1242,8 @@ class Aggregator(nn.Module):
             torch._dynamo.config.cache_size_limit = max(64, torch._dynamo.config.cache_size_limit)
             torch._dynamo.config.automatic_dynamic_shapes = False
             _FLEX_FN = torch.compile(_fa, dynamic=False)
+        if kernel_options is not None:
+            return _FLEX_FN(q, k, v, score_mod=score_mod, kernel_options=kernel_options)
         return _FLEX_FN(q, k, v, score_mod=score_mod)
 
     def _alt_stream_z(self, patch_tokens, B, S):
@@ -1327,7 +1436,8 @@ class Aggregator(nn.Module):
         tokens = tokens + ls1 * out
         return tokens + ls2 * block.mlp(block.norm2(tokens))
 
-    def _process_temporal_attention(self, tokens, B, S, P, C, temporal_idx, pos=None, shared_block=None):
+    def _process_temporal_attention(self, tokens, B, S, P, C, temporal_idx, pos=None, shared_block=None,
+                                    block_iter=None):
         # NEW: temporal attention (Dyn-VGGT contribution ①). Reshape so the *time* axis S is the
         #      sequence dim — each spatial position attends across its own S frames (motion/trajectory).
         #      Updates the streaming tokens only; emits NO intermediate (head input stays 2C, decision A2).
@@ -1338,7 +1448,14 @@ class Aggregator(nn.Module):
         # (B*S, P, C) or (B, S*P, C) -> (B, S, P, C) -> (B*P, S, C)
         tokens = tokens.view(B, S, P, C).permute(0, 2, 1, 3).reshape(B * P, S, C)
 
-        if shared_block is not None:
+        if (self.mask_flags is not None and self.mask_temporal
+                and block_iter is not None and block_iter >= self.mask_start):
+            if shared_block is not None:
+                raise RuntimeError("mask_temporal is not implemented for temporal_share_frame_weights")
+            tokens = self._masked_temporal_block_forward(
+                self.temporal_blocks[temporal_idx], tokens, pos, self.mask_flags, B, S, P
+            )
+        elif shared_block is not None:
             ls1, ls2 = self.temporal_ls[2 * temporal_idx], self.temporal_ls[2 * temporal_idx + 1]
             if self.training:
                 tokens = checkpoint(self._shared_temporal_block_forward, tokens, shared_block, pos,

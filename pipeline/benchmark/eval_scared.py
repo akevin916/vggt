@@ -119,6 +119,8 @@ def protocol_tag(args) -> str:
         tag += f"_{args.n_frames}f"
     if args.gate_mode != "predicted":
         tag += f"_gate{args.gate_mode}"
+    if getattr(args, "mask_mode", None) or getattr(args, "mask_temporal", False):
+        tag += f"_mask{args.mask_mode or ''}{'T' if args.mask_temporal else ''}_s{args.mask_start}"
     if args.img_size != 518:
         tag += f"_img{args.img_size}"
     return tag
@@ -193,6 +195,34 @@ def load_gt_depths(seq_dir: str, fids_sel):
     return out
 
 
+def load_mask_flags(mask_dir: str, split: str, seq: str, sel_fids, device):
+    """Oracle patch flags for the selected frames, [1, S, P_patch] bool (True = hide the patch).
+
+    Reads <mask_dir>/<split_tag>/<seq>.npz (fids [S_all], mask [S_all, h, w]) and picks the rows
+    by frame id, so a frame set that differs from the one the masks were built on fails loudly.
+    """
+    import torch
+    z = np.load(os.path.join(mask_dir, split_tag(split), f"{seq}.npz"))
+    row = {int(f): i for i, f in enumerate(z["fids"])}
+    missing = [int(f) for f in sel_fids if int(f) not in row]
+    if missing:
+        raise KeyError(f"{seq}: {len(missing)} frames have no mask, e.g. {missing[:5]}")
+    m = z["mask"][[row[int(f)] for f in sel_fids]]
+    return torch.from_numpy(m.reshape(1, len(sel_fids), -1)).to(device)
+
+
+def infer_masked(model, paths, args, override, flags):
+    """infer_sequence with the aggregator's eval-only patch mask set for this one pass."""
+    agg = model.aggregator
+    if flags is not None:
+        agg.mask_flags, agg.mask_mode = flags, args.mask_mode
+        agg.mask_start, agg.mask_temporal = int(args.mask_start), bool(args.mask_temporal)
+    try:
+        return infer_sequence(model, paths, device=args.device, gate_logits_override=override)
+    finally:
+        agg.mask_flags = None
+
+
 def eval_ckpt(ckpt, root, split, seqs, args, model=None):
     """Score one checkpoint. ``model``: optional preloaded (in-memory) VGGT -- when given,
     nothing is loaded from disk and the model is left alive for the caller (the trainer
@@ -223,6 +253,14 @@ def eval_ckpt(ckpt, root, split, seqs, args, model=None):
             # subsampled run they span hundreds, and the metric silently returns a large,
             # meaningless number instead of failing. Gate it on the frames actually selected.
             sel_fids = np.array([int(os.path.basename(p)[:-4]) for p in paths])
+            flags = None
+            if getattr(args, "mask_mode", None) or getattr(args, "mask_temporal", False):
+                if args.mask_temporal and not model.aggregator.n_temporal:
+                    raise SystemExit(f"--mask_temporal: {ckpt} has no temporal blocks")
+                if getattr(args, "single_view", False):
+                    print("[eval_scared] --single_view: one frame has nothing to mask across, mask ignored")
+                else:
+                    flags = load_mask_flags(args.mask_dir, split, seq, sel_fids, args.device)
             contiguous = bool(len(sel_fids) > 1 and np.all(np.diff(sel_fids) == 1))
 
             chunk = int(getattr(args, "chunk_size", 0) or 0)
@@ -261,8 +299,8 @@ def eval_ckpt(ckpt, root, split, seqs, args, model=None):
                 for st in starts:
                     sub = slice(st, min(st + chunk, len(paths)))
                     ov_sub = override[:, sub] if override is not None else None
-                    pr = infer_sequence(model, paths[sub], device=args.device,
-                                        gate_logits_override=ov_sub)
+                    pr = infer_masked(model, paths[sub], args, ov_sub,
+                                      flags[:, sub] if flags is not None else None)
                     parts.append((st, pr["extrinsic"]))
                     if "depth" in pr:
                         # Depth is per-frame, so chunking is harmless -- but take each frame
@@ -280,8 +318,7 @@ def eval_ckpt(ckpt, root, split, seqs, args, model=None):
                 per_seq_pose[seq]["n_chunks"] = len(starts)
                 per_seq_pose[seq]["full_seq_ate_reported"] = False
             else:
-                pred = infer_sequence(model, paths, device=args.device,
-                                      gate_logits_override=override)
+                pred = infer_masked(model, paths, args, override, flags)
                 per_seq_pose[seq] = eval_pose_metrics(pred["extrinsic"], gt_tum, gt_ts)
                 if contiguous:
                     per_seq_pose[seq].update(snippet_pose_metrics(pred["extrinsic"], gt_E))
@@ -290,6 +327,8 @@ def eval_ckpt(ckpt, root, split, seqs, args, model=None):
                 per_seq_pose[seq]["full_seq_ate_reported"] = True
             per_seq_pose[seq]["n_frames"] = len(paths)
             per_seq_pose[seq]["contiguous"] = contiguous
+            if flags is not None:
+                per_seq_pose[seq]["mask_frac"] = float(flags.float().mean())
             per_seq_pose[seq]["valid_frac_mean"] = float(np.mean(vfs))
             per_seq_pose[seq].update(scale)
             if "ate" in per_seq_pose[seq]:
@@ -365,6 +404,10 @@ def evaluate(args, model=None):
                              overlap=getattr(args, "overlap", None),
                              single_view=bool(getattr(args, "single_view", False)),
                              gate_mode=getattr(args, "gate_mode", "predicted"),
+                             mask_mode=getattr(args, "mask_mode", None),
+                             mask_temporal=bool(getattr(args, "mask_temporal", False)),
+                             mask_start=getattr(args, "mask_start", None),
+                             mask_dir=getattr(args, "mask_dir", None),
                              timestamp=datetime.now().isoformat(timespec="seconds")),
                    results=results)
     with open(os.path.join(args.out_dir, "results.json"), "w") as f:
@@ -408,8 +451,19 @@ def main():
     ap.add_argument("--gate_mode", default="predicted", choices=["predicted", "off"],
                     help="'off' feeds zero gate logits, which makes the attention bias exactly 0")
     ap.add_argument("--img_size", type=int, default=518)
+    ap.add_argument("--mask_mode", default=None, choices=["camera", "all", "cross"],
+                    help="eval-only oracle masking of the global blocks: which queries stop "
+                         "seeing the flagged patches (camera/register, all, all but same-frame)")
+    ap.add_argument("--mask_temporal", action="store_true",
+                    help="also hide flagged patches of other frames in the temporal blocks")
+    ap.add_argument("--mask_start", type=int, default=8,
+                    help="first aa-block (global and temporal) the mask applies to")
+    ap.add_argument("--mask_dir", default=None,
+                    help="dir holding <split>/<seq>.npz patch masks (fids, mask)")
     ap.add_argument("--out_dir", default=None)
     args = ap.parse_args()
+    if (args.mask_mode or args.mask_temporal) and not args.mask_dir:
+        ap.error("--mask_mode / --mask_temporal need --mask_dir")
 
     seqs = args.seqs or list_sequences(args.scared_root, args.split)
     base_out = args.out_dir

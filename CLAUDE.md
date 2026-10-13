@@ -38,7 +38,7 @@ gate 是否真的改善 pose 屬**未定論的研究問題**，最新進展與�
 
 config 檔名 = `<標籤>_<成分>[_<變體>]`，**與 `exp_name` 和 `logs/<exp>/` 目錄名三者一致**（2026-08-20 統一，舊的 `dyn_vggt_v3_s{n}_*` 全部退役，對照表見 [docs/checkpoints.md](docs/checkpoints.md)）。標籤 `inst` = instance×scene-flow mask（唯一在用的動態標籤）；成分字母 `g` = gate、`t` = temporal、`s` = camera_smooth，依序疊加。所以 `inst_g` 是 gate+camera、`inst_gts` 再加 temporal 與 smooth，變體另接後綴（`inst_gts_egoflow`、`inst_g_photo`）。SCARED 那組用資料集前綴 `scared_cam_*`。
 
-config 之間用 Hydra `defaults` 串成繼承鏈，**只寫 delta，不整份複製**：`default` → `inst_g` → `inst_gts` → 各變體；`default` → `scared_cam_b16` → `scared_cam_b2` / `scared_cam_b16_gg` → `..._smooth_temporal` → `..._smoke`。⚠️ **Hydra 對 list 是「取代」不是「合併」** —— 覆寫 `frozen_module_names` 或 `gradient_clip.configs` 時要把整份清單重寫（兩者的語意都與順序無關，可安心重排）。
+config 之間用 Hydra `defaults` 串成繼承鏈，**只寫 delta，不整份複製**：`default` → `inst_g`；`default` → `scared_cam_b16` → `scared_cam_b16_gg` → `..._smooth_temporal`；`scared_cam_b16` → `scared_cam_vanilla` → `scared_cam_depth_flowgeom_smooth` → `scared_cam_depth_tfs`。目錄裡只留 20 支（2026-10-10 整理），其餘在 `archive/2026-10-10/config/`，要用時搬回來。⚠️ **Hydra 對 list 是「取代」不是「合併」** —— 覆寫 `frozen_module_names` 或 `gradient_clip.configs` 時要把整份清單重寫（兩者的語意都與順序無關，可安心重排）。
 
 動態 mask **標籤**由 `pipeline/data/preprocess/po_*` script 離線預算：`dynmask_inst/`（instance × GT scene-flow —— PO 訓練標籤）或 `dynmask_raft/`（RAFT flow-residual —— 用於 Sintel/測試 eval）。`pipeline/data/datasets/` 下的 dataset（`pointodyssey.py`、`tartanair.py`、`spring.py`、`waymo.py`、`co3d.py`）透過 `dynamic_source=` 載入。資料集實體在另一顆碟上，一律**透過 repo root 的 `data` symlink** 存取，並依角色分兩個 bucket：
 
@@ -53,7 +53,7 @@ python 端走 `pipeline/data/paths.py` 的 `data_path("train", "point_odyssey")`
 
 - `pipeline/eval/` —— **純 library，不放 argparse 進入點**。`vggt_infer.py`（含 `infer_sequence_chunked` 與 Sim3 拼接 `infer_sequence_stitched`）、`paths.py`、`metrics_pose.py`（全序列 ATE + AF-SfMLearner snippet ATE）、`metrics_depth.py`、`metrics_val.py`（trainer 直接依賴）、`gate_common.py`、`gate_vis.py`、`warp_psnr.py`、`media_io.py`、`ply_io.py`。
 - `pipeline/benchmark/` —— **要寫進論文的數字**。進入點契約要穩定（ckpt 進、json 出、CLI 參數別亂改名）：`eval_sintel.py`（Sintel pose+depth 主表）、`eval_scared.py`（SCARED，對齊 EndoSfM3D/AF 協定）、`eval_lesion.py` / `eval_gastric.py`（私人資料集）、`eval_monst3r_lesion.py` / `eval_monst3r_gastric.py`（MonST3R 對照）。
-- `pipeline/diag/` —— **中間探索/找問題的工具**，壞掉或砍掉不影響論文。磁碟上約 23 支（含 `vis/`），但 `.gitignore` 只讓四支進版控 —— 下面三支加 `__init__.py`；其餘是一次性診斷，只留在本機：
+- `pipeline/diag/` —— **中間探索/找問題的工具**，壞掉或砍掉不影響論文。磁碟上 13 支（含 `vis/`；2026-10-10 整理，其餘在 `archive/2026-10-10/diag/`），但 `.gitignore` 只讓四支進版控 —— 下面三支加 `__init__.py`；其餘是一次性診斷，只留在本機：
   - `gate_eval.py` —— gate 的**唯一**評估入口（合併了舊的 `gate_quality.py` + `gate_bias_ablation.py`）。`--metrics quality`（AUC/F1/calibration，跟 GT mask 比準不准）、`--metrics pose`（`off`/`predicted`/`oracle`/`predicted_xT` 的 ATE，看兌現到相機沒有）、預設兩者都跑並共用同一次 forward。`--dataset sintel|po`，Sintel 可加 `--report_dynamic_fraction`。
   - `stitch_error.py` —— Sim3 拼接長序列本身貢獻多少 ATE（拼接數字進表前必跑）。
   - `pnp_pose.py` —— 拿 point head + PnP-RANSAC 算 pose，跟 camera head 比。
