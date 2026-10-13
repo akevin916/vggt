@@ -29,6 +29,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                  enable_gate=False, gate_block_iter=7, gate_pose_grad=False, gate_leaky=0.0,
                  gate_bias_zero_ref=False,
                  gate_bias_scale=None, gate_bias_a=1.0, gate_bias_tau=0.0, gate_bias_learn=False,
+                 gate_head="mlp", gate_bias_form="softplus", gate_apply_end=None,
                  enable_dual_stream=False, dual_stream_scope="camera", dual_stream_start=8,
                  dual_stream_flex=True,   # scope "all": bias inside flex_attention's kernel
                  dual_stream_warmup_steps=3000, dual_stream_s_init=(0.09, 1.0),
@@ -68,6 +69,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             gate_bias_zero_ref=gate_bias_zero_ref,
             gate_bias_scale=gate_bias_scale, gate_bias_a=gate_bias_a, gate_bias_tau=gate_bias_tau,
             gate_bias_learn=gate_bias_learn,
+            gate_head=gate_head, gate_bias_form=gate_bias_form, gate_apply_end=gate_apply_end,
             enable_dual_stream=enable_dual_stream, dual_stream_scope=dual_stream_scope,
             dual_stream_flex=dual_stream_flex,
             dual_stream_start=dual_stream_start,

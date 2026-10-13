@@ -49,26 +49,38 @@ class GatePredictor(nn.Module):
     to pretrained VGGT (warm-start property).
     """
 
-    def __init__(self, embed_dim: int, hidden_ratio: int = 4):
+    def __init__(self, embed_dim: int, hidden_ratio: int = 4, head: str = "mlp"):
         super().__init__()
+        if head not in ("mlp", "conv"):
+            raise ValueError(f"gate_head must be 'mlp' or 'conv', got {head!r}")
         hidden_dim = embed_dim // hidden_ratio
         self.norm = nn.LayerNorm(embed_dim)
         self.linear1 = nn.Linear(embed_dim, hidden_dim)
         self.act = nn.GELU()
         self.linear2 = nn.Linear(hidden_dim, 1)
+        # head="conv" (PAGE-4D §3.2): a 3x3 depthwise conv on the patch grid between the two
+        # linears, so a patch's logit sees its 8 neighbours. Built only on request -- the "mlp"
+        # state_dict is unchanged. linear2 stays the zero-init output, so g==0 at step 0 either way.
+        self.dwconv = (nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1, groups=hidden_dim)
+                       if head == "conv" else None)
         # Zero-init → g=0 at t=0 → bias=0 → pretrained VGGT behaviour preserved
         nn.init.zeros_(self.linear2.weight)
         nn.init.zeros_(self.linear2.bias)
 
-    def forward(self, patch_tokens: torch.Tensor) -> torch.Tensor:
+    def forward(self, patch_tokens: torch.Tensor, hw: Optional[Tuple[int, int]] = None) -> torch.Tensor:
         """
         Args:
             patch_tokens: [B, S, P_patch, C]  patch tokens only (no camera/register)
+            hw: patch grid (h, w) with h*w == P_patch; read only by head="conv"
         Returns:
             g: [B, S, P_patch]  per-patch dynamic logit
         """
-        x = self.norm(patch_tokens)
-        x = self.act(self.linear1(x))
+        x = self.linear1(self.norm(patch_tokens))
+        if self.dwconv is not None:
+            B, S, P_patch, D = x.shape
+            x = self.dwconv(x.reshape(B * S, hw[0], hw[1], D).permute(0, 3, 1, 2))
+            x = x.permute(0, 2, 3, 1).reshape(B, S, P_patch, D)
+        x = self.act(x)
         g = self.linear2(x).squeeze(-1)   # [B, S, P_patch]
         return g
 
@@ -155,6 +167,9 @@ class Aggregator(nn.Module):
         gate_bias_a: float = 1.0,      # logit sharpening inside the parametrised bias
         gate_bias_tau: float = 0.0,    # logit offset inside the parametrised bias
         gate_bias_learn: bool = False,  # make the scale a trainable nn.Parameter -- see below
+        gate_head: str = "mlp",        # "conv" = PAGE-4D-style linear + depthwise conv predictor
+        gate_bias_form: str = "softplus",  # "linear" = bias is -g itself -- see below
+        gate_apply_end: Optional[int] = None,  # last gated global block (inclusive); None = all
         # frame-distance band bias: a log-Gaussian band over |i-j| per (global block, head)
         enable_dual_stream: bool = False,
         dual_stream_scope: str = "camera",  # "camera": camera/register queries only; "all": every query
@@ -368,8 +383,25 @@ class Aggregator(nn.Module):
             self.gate_bias_scale_p = nn.Parameter(
                 torch.tensor(float(gate_bias_scale or 0.0), dtype=torch.float32)
             )
+        # gate_bias_form="linear": bias = -g, PAGE-4D's unclamped signed mask. Every softplus form
+        # above has slope -sigmoid(g), which vanishes once g drifts negative, so a gate trained by
+        # the pose loss alone (gate_pose_grad) can switch itself off for good. The linear form has
+        # slope -1 everywhere; g == 0 still gives bias == 0, so the zero-init warm start is exact.
+        # It can also BOOST a patch key (g < 0), which no softplus form can.
+        # gate_apply_end: gate only global blocks gate_block_iter+1 .. gate_apply_end (17 = PAGE-4D's
+        # "middle 10" with gate_block_iter 7) instead of every block to the end.
+        # Neither is stored in any weight, so both are persisted as buffers -- registered only when
+        # set, which keeps the default state_dict unchanged -- for load_vggt_for_eval to read back.
+        if gate_bias_form not in ("softplus", "linear"):
+            raise ValueError(f"gate_bias_form must be 'softplus' or 'linear', got {gate_bias_form!r}")
+        self.gate_bias_form = gate_bias_form
+        self.gate_apply_end = None if gate_apply_end is None else int(gate_apply_end)
+        if enable_gate and gate_bias_form == "linear":
+            self.register_buffer("gate_bias_linear", torch.tensor(1, dtype=torch.long))
+        if enable_gate and self.gate_apply_end is not None:
+            self.register_buffer("gate_apply_end_idx", torch.tensor(self.gate_apply_end, dtype=torch.long))
         if enable_gate:
-            self.gate_predictor = GatePredictor(embed_dim)
+            self.gate_predictor = GatePredictor(embed_dim, head=gate_head)
         else:
             self.gate_predictor = None
 
@@ -763,7 +795,8 @@ class Aggregator(nn.Module):
             if self.gate_predictor is not None and block_iter == self.gate_block_iter:
                 tokens_4d = tokens.view(B, S, P, C)
                 patch_tokens_mid = tokens_4d[:, :, self.patch_start_idx:, :]  # [B, S, P_patch, C]
-                gate_logits = self.gate_predictor(patch_tokens_mid)            # [B, S, P_patch]
+                gate_logits = self.gate_predictor(                             # [B, S, P_patch]
+                    patch_tokens_mid, hw=(H // self.patch_size, W // self.patch_size))
 
             for i in range(len(frame_intermediates)):
                 # concat frame and global intermediates, [B x S x P x 2C]
@@ -956,7 +989,7 @@ class Aggregator(nn.Module):
                                         use_reentrant=self.use_reentrant)
                 else:
                     tokens = _dual_fn(tokens, pos, pair_log_delta)
-            elif gate_logits is not None:
+            elif gate_logits is not None and (self.gate_apply_end is None or global_idx <= self.gate_apply_end):
                 # gated attention — split into patch-query path (flash, no bias) and
                 # camera/register-query path (small, with per-patch-key bias).
                 # detach unless gate_pose_grad: see __init__ for why the default is detached
@@ -1071,7 +1104,9 @@ class Aggregator(nn.Module):
         # some unknown fraction of patches already inside the dead zone. The forward value
         # stays continuous either way.
         bias_key = gate_logits_det.new_zeros(B, S, P)                # [B, S, P]
-        if self.gate_bias_learn or self.gate_bias_scale is not None:
+        if self.gate_bias_form == "linear":
+            _x = -gate_logits_det
+        elif self.gate_bias_learn or self.gate_bias_scale is not None:
             # -s * softplus(a * (g - tau)): already <= 0 everywhere, so the clamp, gate_leaky and
             # the softplus(0) reference are all bypassed -- they are the legacy branch's tools.
             _s = self.gate_bias_scale_p if self.gate_bias_learn else self.gate_bias_scale

@@ -49,6 +49,11 @@ def load_vggt_for_eval(
     # weights (e.g. pretrained VGGT-1B). The GatePredictor is then random-init and only the
     # oracle/off modes -- which override the predictor output -- are meaningful.
     has_gate = any("gate_predictor" in k for k in keys) or force_gate
+    # The gate's bias form and block range live in no weight; the conv head does. All three are
+    # read back from the checkpoint, or a linear-bias gate would be scored under the softplus clamp.
+    gate_head = "conv" if "aggregator.gate_predictor.dwconv.weight" in sd else "mlp"
+    gate_bias_form = "linear" if "aggregator.gate_bias_linear" in sd else "softplus"
+    gate_apply_end = int(sd["aggregator.gate_apply_end_idx"]) if "aggregator.gate_apply_end_idx" in sd else None
     has_temporal = any("temporal" in k for k in keys)
     # Weight-shared temporal variant: its ONLY weights are aggregator.temporal_ls.*, so the
     # has_temporal test above fires but building 8 fresh blocks would score the checkpoint with
@@ -131,6 +136,9 @@ def load_vggt_for_eval(
         gate_bias_scale=gate_bias_scale,
         gate_bias_a=gate_bias_a,
         gate_bias_tau=gate_bias_tau,
+        gate_head=gate_head,
+        gate_bias_form=gate_bias_form,
+        gate_apply_end=gate_apply_end,
         enable_dual_stream=has_dual,
         dual_stream_scope=dual_stream_scope,
         dual_stream_start=dual_stream_start,
