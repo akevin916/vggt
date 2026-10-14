@@ -54,6 +54,7 @@ def load_vggt_for_eval(
     gate_head = "conv" if "aggregator.gate_predictor.dwconv.weight" in sd else "mlp"
     gate_bias_form = "linear" if "aggregator.gate_bias_linear" in sd else "softplus"
     gate_apply_end = int(sd["aggregator.gate_apply_end_idx"]) if "aggregator.gate_apply_end_idx" in sd else None
+    gate_scope = "cross" if "aggregator.gate_scope_cross" in sd else "camera"
     has_temporal = any("temporal" in k for k in keys)
     # Weight-shared temporal variant: its ONLY weights are aggregator.temporal_ls.*, so the
     # has_temporal test above fires but building 8 fresh blocks would score the checkpoint with
@@ -139,6 +140,7 @@ def load_vggt_for_eval(
         gate_head=gate_head,
         gate_bias_form=gate_bias_form,
         gate_apply_end=gate_apply_end,
+        gate_scope=gate_scope,
         enable_dual_stream=has_dual,
         dual_stream_scope=dual_stream_scope,
         dual_stream_start=dual_stream_start,

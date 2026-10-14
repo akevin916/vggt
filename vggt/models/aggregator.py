@@ -170,6 +170,7 @@ class Aggregator(nn.Module):
         gate_head: str = "mlp",        # "conv" = PAGE-4D-style linear + depthwise conv predictor
         gate_bias_form: str = "softplus",  # "linear" = bias is -g itself -- see below
         gate_apply_end: Optional[int] = None,  # last gated global block (inclusive); None = all
+        gate_scope: str = "camera",    # "cross" = every query, cross-frame patch keys -- see below
         # frame-distance band bias: a log-Gaussian band over |i-j| per (global block, head)
         enable_dual_stream: bool = False,
         dual_stream_scope: str = "camera",  # "camera": camera/register queries only; "all": every query
@@ -400,6 +401,17 @@ class Aggregator(nn.Module):
             self.register_buffer("gate_bias_linear", torch.tensor(1, dtype=torch.long))
         if enable_gate and self.gate_apply_end is not None:
             self.register_buffer("gate_apply_end_idx", torch.tensor(self.gate_apply_end, dtype=torch.long))
+        # gate_scope: which attention rows the bias lands on.
+        #   "camera": camera/register queries, patch keys of every frame (the original gate).
+        #   "cross":  EVERY query, patch keys of the OTHER frames only -- score[i, j] += b_j *
+        #             [frame(i) != frame(j)]. A patch the gate flags stays visible inside its own
+        #             frame and is hidden from all cross-frame matching. Like the two options above
+        #             it lives in no weight, so it is stored as a buffer for load_vggt_for_eval.
+        if gate_scope not in ("camera", "cross"):
+            raise ValueError(f"gate_scope must be 'camera' or 'cross', got {gate_scope!r}")
+        self.gate_scope = gate_scope
+        if enable_gate and gate_scope == "cross":
+            self.register_buffer("gate_scope_cross", torch.tensor(1, dtype=torch.long))
         if enable_gate:
             self.gate_predictor = GatePredictor(embed_dim, head=gate_head)
         else:
@@ -994,12 +1006,14 @@ class Aggregator(nn.Module):
                 # camera/register-query path (small, with per-patch-key bias).
                 # detach unless gate_pose_grad: see __init__ for why the default is detached
                 gate_bias = gate_logits if self.gate_pose_grad else gate_logits.detach()
+                _gated_forward = (self._cross_gated_global_block_forward if self.gate_scope == "cross"
+                                  else self._gated_global_block_forward)
                 if self.training:
                     blk = self.global_blocks[global_idx]
                     _B, _S, _psi = B, S, self.patch_start_idx
 
                     def _gated_fn(t, p, g):  # noqa: E306
-                        return self._gated_global_block_forward(blk, t, p, g, _B, _S, _psi)
+                        return _gated_forward(blk, t, p, g, _B, _S, _psi)
 
                     # gate_bias is passed as a checkpoint ARGUMENT, not captured in the closure:
                     # a closure tensor gets no gradient under reentrant checkpointing, which
@@ -1007,7 +1021,7 @@ class Aggregator(nn.Module):
                     tokens = checkpoint(_gated_fn, tokens, pos, gate_bias,
                                         use_reentrant=self.use_reentrant)
                 else:
-                    tokens = self._gated_global_block_forward(
+                    tokens = _gated_forward(
                         self.global_blocks[global_idx], tokens, pos, gate_bias, B, S, self.patch_start_idx
                     )
             else:
@@ -1104,26 +1118,7 @@ class Aggregator(nn.Module):
         # some unknown fraction of patches already inside the dead zone. The forward value
         # stays continuous either way.
         bias_key = gate_logits_det.new_zeros(B, S, P)                # [B, S, P]
-        if self.gate_bias_form == "linear":
-            _x = -gate_logits_det
-        elif self.gate_bias_learn or self.gate_bias_scale is not None:
-            # -s * softplus(a * (g - tau)): already <= 0 everywhere, so the clamp, gate_leaky and
-            # the softplus(0) reference are all bypassed -- they are the legacy branch's tools.
-            _s = self.gate_bias_scale_p if self.gate_bias_learn else self.gate_bias_scale
-            _x = -_s * F.softplus(
-                self.gate_bias_a * (gate_logits_det - self.gate_bias_tau)
-            )
-        else:
-            _ref = 0.0 if self.gate_bias_zero_ref else math.log(2.0)
-            _x = _ref - F.softplus(gate_logits_det)
-            if self.gate_leaky > 0.0:
-                # `<=` not `<`: at x == 0 (i.e. g == 0, where a zero-init gate starts) the strict
-                # form would take the leaky branch and cut the gradient there by 1/gate_leaky --
-                # weakening the one point on the curve that was already healthy.
-                _x = torch.where(_x <= 0, _x, self.gate_leaky * _x)
-            else:
-                _x = torch.clamp(_x, max=0.0)
-        bias_key[:, :, patch_start_idx:] = _x   # [B, S, P_patch] slot
+        bias_key[:, :, patch_start_idx:] = self._gate_patch_bias(gate_logits_det)   # [B, S, P_patch] slot
         attn_bias = bias_key.reshape(B, 1, 1, N)                     # [B, 1, 1, N]
 
         drop_p = block.attn.attn_drop.p if self.training else 0.0
@@ -1154,6 +1149,64 @@ class Aggregator(nn.Module):
         tokens = tokens + block.ls2(block.mlp(block.norm2(tokens)))
 
         return tokens
+
+    def _gate_patch_bias(self, g: torch.Tensor) -> torch.Tensor:
+        """Gate logits g [B, S, P_patch] -> additive attention bias on those patch keys, same shape."""
+        if self.gate_bias_form == "linear":
+            return -g
+        if self.gate_bias_learn or self.gate_bias_scale is not None:
+            # -s * softplus(a * (g - tau)): already <= 0 everywhere, so the clamp, gate_leaky and
+            # the softplus(0) reference are all bypassed -- they are the legacy branch's tools.
+            _s = self.gate_bias_scale_p if self.gate_bias_learn else self.gate_bias_scale
+            return -_s * F.softplus(self.gate_bias_a * (g - self.gate_bias_tau))
+        _ref = 0.0 if self.gate_bias_zero_ref else math.log(2.0)
+        _x = _ref - F.softplus(g)
+        if self.gate_leaky > 0.0:
+            # `<=` not `<`: at x == 0 (i.e. g == 0, where a zero-init gate starts) the strict
+            # form would take the leaky branch and cut the gradient there by 1/gate_leaky --
+            # weakening the one point on the curve that was already healthy.
+            return torch.where(_x <= 0, _x, self.gate_leaky * _x)
+        return torch.clamp(_x, max=0.0)
+
+    def _cross_gated_global_block_forward(self, block, tokens, pos, gate_logits_det, B, S, patch_start_idx):
+        """
+        One global block under gate_scope="cross": for every query i and patch key j,
+          score[i, j] += b_j * [frame(i) != frame(j)],   b = _gate_patch_bias(g), 0 on special keys.
+        The bias depends on the query only through its frame, so it rides the dot product instead
+        of an [N, N] mask (same trick as _tokdino_global_block_forward):
+          q_aug = [q, sqrt(D) * (1 - onehot(frame(i))), 0-pad]   k_aug = [k, b_j * onehot(frame(j)), 0-pad]
+          sdpa(q_aug, k_aug, v, scale=1/sqrt(D))  ==  softmax(q.k/sqrt(D) + b_j * [frame(i) != frame(j)]) v
+        Same-frame pairs multiply two disjoint one-hots, so their bias is an exact 0, not a
+        cancellation. Same qkv/norm/rope/ls path as _gated_global_block_forward.
+        """
+        N, C_dim = tokens.shape[1], tokens.shape[2]
+        P = N // S
+        H, D = block.attn.num_heads, block.attn.head_dim
+
+        x_norm = block.norm1(tokens)
+        q, k, v = block.attn.qkv(x_norm).reshape(B, N, 3, H, D).permute(2, 0, 3, 1, 4).unbind(0)
+        q, k = block.attn.q_norm(q), block.attn.k_norm(k)
+        if block.attn.rope is not None and pos is not None:
+            q, k = block.attn.rope(q, pos), block.attn.rope(k, pos)
+        drop_p = block.attn.attn_drop.p if self.training else 0.0
+
+        bias_key = gate_logits_det.new_zeros(B, S, P)
+        bias_key[:, :, patch_start_idx:] = self._gate_patch_bias(gate_logits_det)
+
+        dt = q.dtype
+        pad = (-(D + S)) % 8
+        zeros = torch.zeros(B, H, N, pad, device=tokens.device, dtype=dt)
+        onehot = F.one_hot(torch.arange(N, device=tokens.device) // P, S).to(dt)      # [N, S]
+        q_extra = (math.sqrt(D) * (1.0 - onehot)).expand(B, H, N, S)
+        k_extra = (bias_key.reshape(B, 1, N, 1).to(dt) * onehot).expand(B, H, N, S)
+        q_aug = torch.cat([q, q_extra, zeros], dim=-1)
+        k_aug = torch.cat([k, k_extra, zeros], dim=-1)
+        attn_out = F.scaled_dot_product_attention(q_aug, k_aug, v, dropout_p=drop_p,
+                                                  scale=1.0 / math.sqrt(D))          # [B, H, N, D]
+
+        attn_out = block.attn.proj_drop(block.attn.proj(attn_out.permute(0, 2, 1, 3).reshape(B, N, C_dim)))
+        tokens = tokens + block.ls1(attn_out)
+        return tokens + block.ls2(block.mlp(block.norm2(tokens)))
 
     @staticmethod
     def _flex_attention(q, k, v, score_mod):
