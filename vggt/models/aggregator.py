@@ -78,7 +78,10 @@ class GatePredictor(nn.Module):
         x = self.linear1(self.norm(patch_tokens))
         if self.dwconv is not None:
             B, S, P_patch, D = x.shape
-            x = self.dwconv(x.reshape(B * S, hw[0], hw[1], D).permute(0, 3, 1, 2))
+            # .contiguous(): fed the permuted (channels-last) view, cuDNN picks runtime-compiled
+            # depthwise engines and calls NVRTC for every new grid/batch shape; one of those compiles
+            # segfaults within ~50 training steps (P3, 2026-10-14). A contiguous NCHW input compiles nothing.
+            x = self.dwconv(x.reshape(B * S, hw[0], hw[1], D).permute(0, 3, 1, 2).contiguous())
             x = x.permute(0, 2, 3, 1).reshape(B, S, P_patch, D)
         x = self.act(x)
         g = self.linear2(x).squeeze(-1)   # [B, S, P_patch]
@@ -171,6 +174,7 @@ class Aggregator(nn.Module):
         gate_bias_form: str = "softplus",  # "linear" = bias is -g itself -- see below
         gate_apply_end: Optional[int] = None,  # last gated global block (inclusive); None = all
         gate_scope: str = "camera",    # "cross" = every query, cross-frame patch keys -- see below
+        gate_cross_impl: str = "augment",  # how gate_scope="cross" is computed -- see below
         # frame-distance band bias: a log-Gaussian band over |i-j| per (global block, head)
         enable_dual_stream: bool = False,
         dual_stream_scope: str = "camera",  # "camera": camera/register queries only; "all": every query
@@ -412,6 +416,14 @@ class Aggregator(nn.Module):
         self.gate_scope = gate_scope
         if enable_gate and gate_scope == "cross":
             self.register_buffer("gate_scope_cross", torch.tensor(1, dtype=torch.long))
+        # gate_cross_impl: two exact rewrites of the same "cross" attention, chosen per run, not
+        # stored (the math is identical, so a checkpoint loads under either).
+        #   "augment":   bias folded into q.k via S extra dims (_cross_gated_global_block_forward).
+        #                q/k head dim becomes 64+S rounded to 8, which varies with S and != v's.
+        #   "per_frame": one SDPA per query frame with a [B,1,1,N] key bias; head dim stays 64.
+        if gate_cross_impl not in ("augment", "per_frame"):
+            raise ValueError(f"gate_cross_impl must be 'augment' or 'per_frame', got {gate_cross_impl!r}")
+        self.gate_cross_impl = gate_cross_impl
         if enable_gate:
             self.gate_predictor = GatePredictor(embed_dim, head=gate_head)
         else:
@@ -1006,8 +1018,12 @@ class Aggregator(nn.Module):
                 # camera/register-query path (small, with per-patch-key bias).
                 # detach unless gate_pose_grad: see __init__ for why the default is detached
                 gate_bias = gate_logits if self.gate_pose_grad else gate_logits.detach()
-                _gated_forward = (self._cross_gated_global_block_forward if self.gate_scope == "cross"
-                                  else self._gated_global_block_forward)
+                if self.gate_scope != "cross":
+                    _gated_forward = self._gated_global_block_forward
+                elif self.gate_cross_impl == "per_frame":
+                    _gated_forward = self._cross_gated_global_block_forward_per_frame
+                else:
+                    _gated_forward = self._cross_gated_global_block_forward
                 if self.training:
                     blk = self.global_blocks[global_idx]
                     _B, _S, _psi = B, S, self.patch_start_idx
@@ -1203,6 +1219,39 @@ class Aggregator(nn.Module):
         k_aug = torch.cat([k, k_extra, zeros], dim=-1)
         attn_out = F.scaled_dot_product_attention(q_aug, k_aug, v, dropout_p=drop_p,
                                                   scale=1.0 / math.sqrt(D))          # [B, H, N, D]
+
+        attn_out = block.attn.proj_drop(block.attn.proj(attn_out.permute(0, 2, 1, 3).reshape(B, N, C_dim)))
+        tokens = tokens + block.ls1(attn_out)
+        return tokens + block.ls2(block.mlp(block.norm2(tokens)))
+
+    def _cross_gated_global_block_forward_per_frame(self, block, tokens, pos, gate_logits_det, B, S, patch_start_idx):
+        """
+        Same attention as _cross_gated_global_block_forward, computed as S SDPA calls: the
+        queries of frame f see bias b_j * [frame(j) != f], which no longer depends on the query,
+        so it is a [B, 1, 1, N] mask broadcast over heads and queries. q/k keep head dim D.
+        """
+        N, C_dim = tokens.shape[1], tokens.shape[2]
+        P = N // S
+        H, D = block.attn.num_heads, block.attn.head_dim
+
+        x_norm = block.norm1(tokens)
+        q, k, v = block.attn.qkv(x_norm).reshape(B, N, 3, H, D).permute(2, 0, 3, 1, 4).unbind(0)
+        q, k = block.attn.q_norm(q), block.attn.k_norm(k)
+        if block.attn.rope is not None and pos is not None:
+            q, k = block.attn.rope(q, pos), block.attn.rope(k, pos)
+        drop_p = block.attn.attn_drop.p if self.training else 0.0
+
+        bias_key = gate_logits_det.new_zeros(B, S, P)
+        bias_key[:, :, patch_start_idx:] = self._gate_patch_bias(gate_logits_det)
+        bias_key = bias_key.to(q.dtype)
+
+        outs = []
+        for f in range(S):
+            mask = torch.cat([bias_key[:, :f], bias_key.new_zeros(B, 1, P), bias_key[:, f + 1:]], dim=1)
+            outs.append(F.scaled_dot_product_attention(
+                q[:, :, f * P:(f + 1) * P], k, v,
+                attn_mask=mask.reshape(B, 1, 1, N), dropout_p=drop_p))       # [B, H, P, D]
+        attn_out = torch.cat(outs, dim=2)                                    # [B, H, N, D]
 
         attn_out = block.attn.proj_drop(block.attn.proj(attn_out.permute(0, 2, 1, 3).reshape(B, N, C_dim)))
         tokens = tokens + block.ls1(attn_out)
