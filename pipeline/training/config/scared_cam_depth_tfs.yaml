@@ -1,0 +1,73 @@
+# scared_cam_depth_tfs (temporal + flow_geom + camera_smooth) with seed_value 43 (tfs uses 42).
+# Nothing else differs. Purpose: first seed-to-seed spread of a STACKED arm -- the base's spread
+# (scared_cam_vanilla_depth_seed43) does not transfer, since seed here also re-draws the init of
+# the 8 fresh temporal blocks (100.8M params), which the base does not have.
+# Written 2026-10-01 as ONE delta over scared_depth_base (portable: no chain to the local-only
+# flowgeom_smooth configs). Hydra REPLACES lists, so the clip list is the full merged list.
+defaults:
+- scared_depth_base
+- _self_
+exp_name: scared_cam_depth_tfs_seed43
+seed_value: 43
+logging:
+  scalar_keys_to_log:
+    train:
+      keys_to_log:
+      - loss_objective
+      - loss_camera
+      - loss_T
+      - loss_R
+      - loss_camera_smooth
+      - loss_smooth_T
+      - loss_smooth_R
+      - loss_flow_geom
+      - flow_geom_valid_frac
+      - loss_conf_depth
+      - loss_reg_depth
+      - loss_grad_depth
+    val:
+      keys_to_log:
+      - loss_objective
+      - loss_camera
+      - loss_camera_smooth
+      - loss_flow_geom
+      - flow_geom_valid_frac
+      - loss_conf_depth
+      - loss_reg_depth
+loss:
+  camera_smooth:
+    weight: 3.0
+    weight_trans: 1.0
+    weight_rot: 1.0
+    gamma: 0.6
+  flow_geom:
+    weight: 1.0
+    src_offsets:
+    - -1
+    - 1
+    flow_proc: 256
+    occ_thresh: 0.95
+    min_valid: 100
+optim:
+  gradient_clip:
+    configs:
+    - module_name:
+      - aggregator.global_blocks
+      - camera_head
+      max_norm: 1.0
+      norm_type: 2
+    - module_name:
+      - aggregator.camera_token
+      - aggregator.register_token
+      max_norm: 1.0
+      norm_type: 2
+    - module_name:
+      - depth_head
+      max_norm: 1.0
+      norm_type: 2
+    - module_name:
+      - aggregator.temporal_blocks
+      max_norm: 1.0
+      norm_type: 2
+model:
+  enable_temporal: true

@@ -1,0 +1,10 @@
+# scared_cam_depth_tfs (seed 43; the file is the tfs_seed43 delta) + temporal_frame_pos: temporal
+# blocks' RoPE reads the REAL frame offsets (batch["ids"]) under tfs's ORIGINAL random-window sampling
+# (+-2N window, sorted, with replacement; offsets reach ~48, duplicates give 0-gap pairs).
+# Compare against tfs_seed43 (same seed, same sampling) -> pure effect of temporal_frame_pos.
+# Written 2026-10-06.
+defaults:
+- scared_cam_depth_tfs
+- _self_
+exp_name: scared_cam_depth_tfs_fpos_seed43
+temporal_frame_pos: true

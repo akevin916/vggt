@@ -1,0 +1,39 @@
+# 3-4 / 3-3 B CONTROL: tfs_fpos_seed43 fine-tuned 4500 more steps with NO mask (lr peak 1e-5).
+# "tfs_abs" in the 3-3/3-4 specs = scared_cam_depth_tfs_fpos_seed43 (spec errata #1, 2026-10-23).
+# Images pinned to 518x420 (30x37 patches) in train AND val, because the D1 column mask is indexed by
+# patch position; the masked arms (c3_ft_learned_b25, c3_ft_reltile_b25) inherit this file, so all
+# three see identical data (errata #5). Everything else (frozen set, sampling, losses) = tfs.
+# Written 2026-10-23.
+defaults:
+- scared_cam_depth_tfs_fpos_seed43
+- _self_
+
+exp_name: c3_ft_ctrl
+max_epochs: 3
+
+checkpoint:
+  resume_checkpoint_path: logs/scared_cam_depth_tfs_fpos_seed43/ckpts/last.pt
+  warm_start_weights_only: true
+  strict: false
+  save_steps_freq: 500   # host drops GPUs (Xid 79); resume with --resume
+
+data:
+  train:
+    common_config:
+      augs:
+        aspects: [0.82, 0.82]
+  val:
+    common_config:
+      augs:
+        aspects: [0.82, 0.82]
+
+optim:
+  options:
+    lr:
+    - scheduler:
+        _target_: fvcore.common.param_scheduler.CompositeParamScheduler
+        schedulers:
+        - {_target_: fvcore.common.param_scheduler.LinearParamScheduler, start_value: 1.0e-08, end_value: 1.0e-05}
+        - {_target_: fvcore.common.param_scheduler.CosineParamScheduler, start_value: 1.0e-05, end_value: 1.0e-08}
+        lengths: [0.05, 0.95]
+        interval_scaling: [rescaled, rescaled]
