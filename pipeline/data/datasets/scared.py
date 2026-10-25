@@ -68,6 +68,7 @@ class ScaredDataset(BaseDataset):
         min_anchor_valid_frac: float = 0.05,
         nearby_expand_range: int | None = None,
         contiguous_stride: int | None = None,
+        nearby_no_replace: bool = False,
     ):
         super().__init__(common_conf=common_conf)
 
@@ -89,6 +90,9 @@ class ScaredDataset(BaseDataset):
         # 480 = 21.72 -- the endoscope loiters and doubles back, so displacement SATURATES
         # past ~240 and a wider window buys baseline at the cost of view overlap.
         self.nearby_expand_range = nearby_expand_range
+        # True: the random window draws DISTINCT frames (no same-frame pairs, which never occur at
+        # test time). Falls back to with-replacement when the window is too small.
+        self.nearby_no_replace = nearby_no_replace
         # Evenly spaced clip instead of get_nearby's random draw: frames anchor, anchor+s, ...,
         # anchor+(N-1)s. s=1 is exactly the test/pose protocol (stride-1 video). None keeps the
         # inherited random draw, which samples WITH replacement (base_dataset.get_nearby_ids) --
@@ -188,10 +192,12 @@ class ScaredDataset(BaseDataset):
                 anchor = int(np.random.choice(store["anchors"]))
                 if self.nearby_expand_range is None:
                     ids = self.get_nearby_ids([anchor] * img_per_seq, num_frames,
-                                              expand_ratio=2.0)
+                                              expand_ratio=2.0,
+                                              replace=not self.nearby_no_replace)
                 else:
                     ids = self.get_nearby_ids([anchor] * img_per_seq, num_frames,
-                                              expand_range=self.nearby_expand_range)
+                                              expand_range=self.nearby_expand_range,
+                                              replace=not self.nearby_no_replace)
             else:
                 ids = np.random.choice(num_frames, img_per_seq,
                                        replace=self.allow_duplicate_img)

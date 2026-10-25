@@ -13,6 +13,7 @@ from vggt.heads.camera_head import CameraHead
 from vggt.heads.dpt_head import DPTHead
 from vggt.heads.track_head import TrackHead
 from vggt.heads.illu_head import IlluminationHead
+from vggt.layers.lora import apply_lora
 
 
 class VGGT(nn.Module, PyTorchModelHubMixin):
@@ -43,6 +44,19 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                  tokdino_s_init=(1e-4, 1e-2), tokdino_sigma_init=1.0,
                  tokdino_s_range=(3e-5, 3e-2), tokdino_sigma_range=(0.3, 3.0),
                  enable_illu=False,
+                 # learned column mask on global attention (D1; aggregator colmask_*)
+                 enable_colmask=False, colmask_grid=(30, 37), colmask_init=5.0, colmask_rho=0.25,
+                 colmask_ramp_frac=0.6, colmask_st_frac=0.2, colmask_diag=True, colmask_mean="count",
+                 head_grad_checkpoint=False,   # checkpoint the DPT heads per frame chunk (memory only)
+                 colmask_path=None,            # fixed D1 mask from .npy (3-4 fine-tuning)
+                 # frame-distance tile mask (3-3; aggregator relmask_*)
+                 enable_relmask=False, relmask_path=None, relmask_buckets=(1, 2, 4, 8, 16),
+                 relmask_tile=(8, 8), relmask_start=8, relmask_grid=(30, 37), relmask_init=5.0,
+                 relmask_init_std=0.01, relmask_seed=0, relmask_rho=0.25, relmask_ramp_frac=0.6,
+                 relmask_st_frac=0.2, relmask_budget_S=64,
+                 # LoRA on pretrained linears (vggt/layers/lora.py); rank 0 = off, model unchanged
+                 lora_rank=0, lora_alpha=32.0,
+                 lora_targets=("aggregator.global_blocks.@(8|9|1?|2[0-3]).attn.@(qkv|proj)",),
                  # Removed 2026-09-23 with the DINO/gap dual-stream. Named explicitly so a config
                  # still carrying them fails with this message instead of a bare TypeError -- and
                  # so it can never be the other failure mode, a key silently ignored and the run
@@ -83,6 +97,19 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             tokdino_sigma_init=tokdino_sigma_init, tokdino_s_range=tuple(tokdino_s_range),
             tokdino_sigma_range=tuple(tokdino_sigma_range),
             enable_illu=enable_illu,
+            enable_colmask=enable_colmask or colmask_path is not None, colmask_grid=tuple(colmask_grid),
+            colmask_init=float(colmask_init), colmask_rho=float(colmask_rho),
+            colmask_ramp_frac=float(colmask_ramp_frac), colmask_st_frac=float(colmask_st_frac),
+            colmask_diag=bool(colmask_diag),
+            colmask_mean=colmask_mean if isinstance(colmask_mean, bool) else str(colmask_mean),
+            colmask_path=colmask_path,
+            enable_relmask=enable_relmask or relmask_path is not None, relmask_path=relmask_path,
+            relmask_buckets=tuple(relmask_buckets), relmask_tile=tuple(relmask_tile),
+            relmask_start=int(relmask_start), relmask_grid=tuple(relmask_grid),
+            relmask_init=float(relmask_init), relmask_init_std=float(relmask_init_std),
+            relmask_seed=int(relmask_seed), relmask_rho=float(relmask_rho),
+            relmask_ramp_frac=float(relmask_ramp_frac), relmask_st_frac=float(relmask_st_frac),
+            relmask_budget_S=int(relmask_budget_S),
             temporal_share_frame_weights=temporal_share_frame_weights,
             rope_3d=rope_3d, rope_3d_dims=rope_3d_dims, rope_3d_zero_time=rope_3d_zero_time,
             rope_time=rope_time, rope_time_base=rope_time_base,
@@ -91,9 +118,15 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None
         self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1") if enable_point else None
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1") if enable_depth else None
+        for _h in (self.point_head, self.depth_head):
+            if _h is not None:
+                _h.grad_checkpoint = bool(head_grad_checkpoint)
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size) if enable_track else None
         # illumination head: reads the aggregator's illumination token (enable_illu)
         self.illu_head = IlluminationHead(dim_in=2 * embed_dim) if enable_illu else None
+
+        if lora_rank > 0:
+            apply_lora(self, list(lora_targets), int(lora_rank), float(lora_alpha))
 
         # The v1/v2 motion_head (per-pixel dynamic probability) and flow_head (scene flow Δ) were
         # REMOVED 2026-08-31 together with the losses that consumed them: both lines were

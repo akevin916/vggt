@@ -146,20 +146,27 @@ class DPTHead(nn.Module):
         # Process frames in batches
         all_preds = []
         all_conf = []
+        # grad_checkpoint (off by default): recompute each chunk in backward instead of storing
+        # its full-resolution activations. Same numbers; needed when gradients must pass THROUGH
+        # a frozen head for long clips (colmask at S >= 32).
+        use_ckpt = bool(getattr(self, "grad_checkpoint", False)) and torch.is_grad_enabled()
+
+        def _impl(s0, s1):
+            if use_ckpt:
+                from torch.utils.checkpoint import checkpoint as _ckpt
+                return _ckpt(self._forward_impl, aggregated_tokens_list, images, patch_start_idx,
+                             s0, s1, use_reentrant=False)
+            return self._forward_impl(aggregated_tokens_list, images, patch_start_idx, s0, s1)
 
         for frames_start_idx in range(0, S, frames_chunk_size):
             frames_end_idx = min(frames_start_idx + frames_chunk_size, S)
 
             # Process batch of frames
             if self.feature_only:
-                chunk_output = self._forward_impl(
-                    aggregated_tokens_list, images, patch_start_idx, frames_start_idx, frames_end_idx
-                )
+                chunk_output = _impl(frames_start_idx, frames_end_idx)
                 all_preds.append(chunk_output)
             else:
-                chunk_preds, chunk_conf = self._forward_impl(
-                    aggregated_tokens_list, images, patch_start_idx, frames_start_idx, frames_end_idx
-                )
+                chunk_preds, chunk_conf = _impl(frames_start_idx, frames_end_idx)
                 all_preds.append(chunk_preds)
                 all_conf.append(chunk_conf)
 

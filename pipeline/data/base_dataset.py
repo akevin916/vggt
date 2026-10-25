@@ -234,7 +234,7 @@ class BaseDataset(Dataset):
             track,
         )
 
-    def get_nearby_ids(self, ids, full_seq_num, expand_ratio=None, expand_range=None):
+    def get_nearby_ids(self, ids, full_seq_num, expand_ratio=None, expand_range=None, replace=True):
         """
         TODO: add the function to sample the ids by pose similarity ranking.
 
@@ -291,6 +291,13 @@ class BaseDataset(Dataset):
         valid_range = np.arange(low_bound, high_bound)
 
         # Sample 'total_ids - 1' items, because we already have the start_idx
+        # replace=False draws distinct frames (and never re-draws start_idx); it falls back to
+        # replace=True when the window is too small to supply total_ids - 1 other frames.
+        if not replace:
+            candidates = valid_range[valid_range != start_idx]
+            if len(candidates) >= total_ids - 1:
+                sampled_ids = np.random.choice(candidates, size=(total_ids - 1), replace=False)
+                return np.insert(sampled_ids, 0, start_idx)
         sampled_ids = np.random.choice(
             valid_range,
             size=(total_ids - 1),
