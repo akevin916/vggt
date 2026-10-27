@@ -95,7 +95,7 @@ def split_tag(split: str) -> str:
 # CLI default layout (2026-10-05): outputs/eval/<exp>/<protocol>_<role>/results.json, so one
 # experiment's numbers live under one dir. The four reference protocols get the short names
 # pose / depth (c5 snippet pose, single-view afsfm depth); every other flag set spells itself
-# out (pose_c64, depth_multi, ..._gateoff). --out_dir keeps the old <out_dir>/<exp>_<stem>/.
+# out (pose_c64, depth_multi, ...). --out_dir keeps the old <out_dir>/<exp>_<stem>/.
 OUT_TOOL = "eval"
 CKPT_ROLE = {"last.pt": "last", "best_ate.pt": "best"}
 
@@ -117,8 +117,6 @@ def protocol_tag(args) -> str:
             tag += f"_{args.depth_protocol}"
     if args.n_frames > 0:
         tag += f"_{args.n_frames}f"
-    if args.gate_mode != "predicted":
-        tag += f"_gate{args.gate_mode}"
     for _f, _t in (("colmask", "cm"), ("relmask", "rm")):
         if getattr(args, _f, None):
             tag += f"_{_t}-" + os.path.splitext(os.path.basename(getattr(args, _f)))[0]
@@ -232,16 +230,6 @@ def eval_ckpt(ckpt, root, split, seqs, args, model=None):
         seq_dir = os.path.join(root, split, seq)
         try:
             paths, gt_tum, gt_ts, idx, vfs, scale, gt_E = load_sequence(seq_dir, args.n_frames)
-            override = None
-            if args.gate_mode == "off" and getattr(model.aggregator, "gate_predictor", None):
-                # zeros -> bias = clamp(log2 - softplus(0), max=0) = 0 exactly: gate disabled
-                import torch as _t
-                # SCARED is 1280x1024, so crop-mode gives 518x420 (not a square 518x518):
-                # the patch grid is 37x30 = 1110, and a hard-coded (518//14)**2 is wrong.
-                _m = compute_preprocess_meta(paths[0], target_size=args.img_size)
-                _h = min(_m.new_h, args.img_size)
-                n_patch = (args.img_size // 14) * (_h // 14)
-                override = _t.zeros(1, len(paths), n_patch, device=args.device)
             # Snippet ATE is only meaningful on stride-1 frames: its 5-frame windows are
             # supposed to span ~5 video frames. On test/depth (gaps of 1-296 frames) or any
             # subsampled run they span hundreds, and the metric silently returns a large,
@@ -284,9 +272,7 @@ def eval_ckpt(ckpt, root, split, seqs, args, model=None):
                 pred = {}
                 for st in starts:
                     sub = slice(st, min(st + chunk, len(paths)))
-                    ov_sub = override[:, sub] if override is not None else None
-                    pr = infer_sequence(model, paths[sub], device=args.device,
-                                        gate_logits_override=ov_sub)
+                    pr = infer_sequence(model, paths[sub], device=args.device)
                     parts.append((st, pr["extrinsic"]))
                     if "depth" in pr:
                         # Depth is per-frame, so chunking is harmless -- but take each frame
@@ -304,8 +290,7 @@ def eval_ckpt(ckpt, root, split, seqs, args, model=None):
                 per_seq_pose[seq]["n_chunks"] = len(starts)
                 per_seq_pose[seq]["full_seq_ate_reported"] = False
             else:
-                pred = infer_sequence(model, paths, device=args.device,
-                                      gate_logits_override=override)
+                pred = infer_sequence(model, paths, device=args.device)
                 per_seq_pose[seq] = eval_pose_metrics(pred["extrinsic"], gt_tum, gt_ts)
                 if contiguous:
                     per_seq_pose[seq].update(snippet_pose_metrics(pred["extrinsic"], gt_E))
@@ -375,9 +360,8 @@ def evaluate(args, model=None):
     """
     seqs = getattr(args, "seqs", None) or list_sequences(args.scared_root, args.split)
     seqs = [str(x) for x in seqs]   # config-supplied lists may be OmegaConf nodes (not JSON-able)
-    suffix = "" if getattr(args, "gate_mode", "predicted") == "predicted" else f"_gate{args.gate_mode}"
     args.out_dir = getattr(args, "out_dir", None) or output_dir_for_exp(
-        f"{split_tag(args.split)}_{args.n_frames}f{suffix}", TOOL)
+        f"{split_tag(args.split)}_{args.n_frames}f", TOOL)
     os.makedirs(args.out_dir, exist_ok=True)
 
     results = eval_ckpt(args.ckpt, args.scared_root, args.split, seqs, args, model=model)
@@ -388,7 +372,6 @@ def evaluate(args, model=None):
                              chunk_size=getattr(args, "chunk_size", 0),
                              overlap=getattr(args, "overlap", None),
                              single_view=bool(getattr(args, "single_view", False)),
-                             gate_mode=getattr(args, "gate_mode", "predicted"),
                              colmask_mode=getattr(args, "colmask_mode", "hard"),
                              colmask_seed=getattr(args, "colmask_seed", 0),
                              colmask_file=getattr(args, "colmask", None),
@@ -402,10 +385,7 @@ def evaluate(args, model=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpts", nargs="*", default=["checkpoints/VGGT-1B.pt",
-                                                  "checkpoints/inst_gate_init.pt",
-                                                  "checkpoints/inst_g.pt",
-                                                  "checkpoints/inst_gts.pt"])
+    ap.add_argument("--ckpts", nargs="*", default=["checkpoints/VGGT-1B.pt"])
     ap.add_argument("--scared_root", default=data_path("train", "scared"))
     ap.add_argument("--split", default="val",
                     choices=SPLITS,
@@ -433,8 +413,6 @@ def main():
                          "published SCARED depth tables use. Depth only; pose is skipped.")
     ap.add_argument("--no_depth", action="store_true")
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--gate_mode", default="predicted", choices=["predicted", "off"],
-                    help="'off' feeds zero gate logits, which makes the attention bias exactly 0")
     ap.add_argument("--colmask_mode", default="hard", choices=["hard", "soft", "off", "random"],
                     help="column-mask ckpts only: hard = top-k at rho* (default); soft = sigmoid "
                          "weights; off = mask removed; random = same per-layer counts, random positions")
