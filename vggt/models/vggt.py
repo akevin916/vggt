@@ -12,38 +12,15 @@ from vggt.models.aggregator import Aggregator
 from vggt.heads.camera_head import CameraHead
 from vggt.heads.dpt_head import DPTHead
 from vggt.heads.track_head import TrackHead
-from vggt.heads.illu_head import IlluminationHead
-from vggt.layers.lora import apply_lora
 
 
 class VGGT(nn.Module, PyTorchModelHubMixin):
     # MODIFIED: Dyn-VGGT extensions are all opt-in (default flags off) so plain VGGT() and pretrained
-    #           checkpoint loading are byte-for-byte unchanged. Set enable_temporal=True for the
-    #           temporal aggregator, enable_gate=True for motion-gated camera aggregation.
+    #           checkpoint loading are byte-for-byte unchanged. enable_temporal adds the temporal
+    #           blocks; enable_colmask / enable_relmask add the global-attention key masks.
     def __init__(self, img_size=518, patch_size=14, embed_dim=1024,
                  enable_camera=True, enable_point=True, enable_depth=True, enable_track=True,
                  enable_temporal=False,
-                 temporal_share_frame_weights=False,  # temporal steps borrow the frame block's weights
-                 rope_3d=False, rope_3d_dims=(24, 24, 16), rope_3d_zero_time=False,  # (y,x,t) RoPE
-                 rope_time=False, rope_time_base=10.0,  # (y,x) RoPE + added time phase
-                 # motion-gated camera aggregation
-                 enable_gate=False, gate_block_iter=7, gate_pose_grad=False, gate_leaky=0.0,
-                 gate_bias_zero_ref=False,
-                 gate_bias_scale=None, gate_bias_a=1.0, gate_bias_tau=0.0, gate_bias_learn=False,
-                 enable_dual_stream=False, dual_stream_scope="camera", dual_stream_start=8,
-                 dual_stream_flex=True,   # scope "all": bias inside flex_attention's kernel
-                 dual_stream_warmup_steps=3000, dual_stream_s_init=(0.09, 1.0),
-                 dual_stream_sigma_init=0.5, dual_stream_s_clamp=(0.02, 1.2),
-                 dual_stream_sigma_clamp=(0.3, 3.0),
-                 # band distance: 0 = |i-j|/(S-1), 1 = absolute frames, 2 = DINO odometer (aggregator)
-                 dual_stream_delta_mode=0, dual_stream_abs_span=11.0, dual_stream_odo_unit=1.91e-4,
-                 # dual v0 re-implemented: alternating-sign per-layer scalar (aggregator alt_stream)
-                 enable_alt_stream=False, alt_stream_start=8, alt_stream_init=0.01, alt_stream_signal="gap",
-                 # per-token DINO band (tokdino), all queries, one-hot SDPA
-                 enable_tokdino=False, tokdino_start=8, tokdino_warmup_steps=3000,
-                 tokdino_s_init=(1e-4, 1e-2), tokdino_sigma_init=1.0,
-                 tokdino_s_range=(3e-5, 3e-2), tokdino_sigma_range=(0.3, 3.0),
-                 enable_illu=False,
                  # learned column mask on global attention (D1; aggregator colmask_*)
                  enable_colmask=False, colmask_grid=(30, 37), colmask_init=5.0, colmask_rho=0.25,
                  colmask_ramp_frac=0.6, colmask_st_frac=0.2, colmask_diag=True, colmask_mean="count",
@@ -53,50 +30,13 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                  enable_relmask=False, relmask_path=None, relmask_buckets=(1, 2, 4, 8, 16),
                  relmask_tile=(8, 8), relmask_start=8, relmask_grid=(30, 37), relmask_init=5.0,
                  relmask_init_std=0.01, relmask_seed=0, relmask_rho=0.25, relmask_ramp_frac=0.6,
-                 relmask_st_frac=0.2, relmask_budget_S=64,
-                 # LoRA on pretrained linears (vggt/layers/lora.py); rank 0 = off, model unchanged
-                 lora_rank=0, lora_alpha=32.0,
-                 lora_targets=("aggregator.global_blocks.@(8|9|1?|2[0-3]).attn.@(qkv|proj)",),
-                 # Removed 2026-09-23 with the DINO/gap dual-stream. Named explicitly so a config
-                 # still carrying them fails with this message instead of a bare TypeError -- and
-                 # so it can never be the other failure mode, a key silently ignored and the run
-                 # quietly training as vanilla.
-                 dual_stream_signal=None, dual_stream_init=None):
+                 relmask_st_frac=0.2, relmask_budget_S=64):
         super().__init__()
-        if dual_stream_signal is not None or dual_stream_init is not None:
-            raise ValueError(
-                "dual_stream_signal / dual_stream_init were removed with the DINO-similarity "
-                "dual-stream. The bias is now a log-distance band configured by "
-                "dual_stream_warmup_steps / dual_stream_s_init / dual_stream_sigma_init, and its "
-                "parameters are dual_stream_beta / dual_stream_log_s / dual_stream_log_sigma "
-                "(see pipeline/training/config/scared_cam_dual_kern.yaml). The old forward lives "
-                "in commit 18aa9fc."
-            )
 
         # NEW: enable_temporal injects temporal attention into the aggregator (aa_order gains "temporal").
         aa_order = ["frame", "temporal", "global"] if enable_temporal else ["frame", "global"]
         self.aggregator = Aggregator(
             img_size=img_size, patch_size=patch_size, embed_dim=embed_dim, aa_order=aa_order,
-            enable_gate=enable_gate, gate_block_iter=gate_block_iter,
-            gate_pose_grad=gate_pose_grad, gate_leaky=gate_leaky,
-            gate_bias_zero_ref=gate_bias_zero_ref,
-            gate_bias_scale=gate_bias_scale, gate_bias_a=gate_bias_a, gate_bias_tau=gate_bias_tau,
-            gate_bias_learn=gate_bias_learn,
-            enable_dual_stream=enable_dual_stream, dual_stream_scope=dual_stream_scope,
-            dual_stream_flex=dual_stream_flex,
-            dual_stream_start=dual_stream_start,
-            dual_stream_warmup_steps=dual_stream_warmup_steps,
-            dual_stream_s_init=dual_stream_s_init, dual_stream_sigma_init=dual_stream_sigma_init,
-            dual_stream_s_clamp=dual_stream_s_clamp, dual_stream_sigma_clamp=dual_stream_sigma_clamp,
-            dual_stream_delta_mode=int(dual_stream_delta_mode),
-            dual_stream_abs_span=float(dual_stream_abs_span), dual_stream_odo_unit=float(dual_stream_odo_unit),
-            enable_alt_stream=enable_alt_stream, alt_stream_start=int(alt_stream_start),
-            alt_stream_init=float(alt_stream_init), alt_stream_signal=str(alt_stream_signal),
-            enable_tokdino=enable_tokdino, tokdino_start=tokdino_start,
-            tokdino_warmup_steps=tokdino_warmup_steps, tokdino_s_init=tuple(tokdino_s_init),
-            tokdino_sigma_init=tokdino_sigma_init, tokdino_s_range=tuple(tokdino_s_range),
-            tokdino_sigma_range=tuple(tokdino_sigma_range),
-            enable_illu=enable_illu,
             enable_colmask=enable_colmask or colmask_path is not None, colmask_grid=tuple(colmask_grid),
             colmask_init=float(colmask_init), colmask_rho=float(colmask_rho),
             colmask_ramp_frac=float(colmask_ramp_frac), colmask_st_frac=float(colmask_st_frac),
@@ -110,9 +50,6 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             relmask_seed=int(relmask_seed), relmask_rho=float(relmask_rho),
             relmask_ramp_frac=float(relmask_ramp_frac), relmask_st_frac=float(relmask_st_frac),
             relmask_budget_S=int(relmask_budget_S),
-            temporal_share_frame_weights=temporal_share_frame_weights,
-            rope_3d=rope_3d, rope_3d_dims=rope_3d_dims, rope_3d_zero_time=rope_3d_zero_time,
-            rope_time=rope_time, rope_time_base=rope_time_base,
         )
 
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None
@@ -122,11 +59,6 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             if _h is not None:
                 _h.grad_checkpoint = bool(head_grad_checkpoint)
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size) if enable_track else None
-        # illumination head: reads the aggregator's illumination token (enable_illu)
-        self.illu_head = IlluminationHead(dim_in=2 * embed_dim) if enable_illu else None
-
-        if lora_rank > 0:
-            apply_lora(self, list(lora_targets), int(lora_rank), float(lora_alpha))
 
         # The v1/v2 motion_head (per-pixel dynamic probability) and flow_head (scene flow Δ) were
         # REMOVED 2026-08-31 together with the losses that consumed them: both lines were
@@ -136,7 +68,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         # and everything still used (trunk, camera/depth/point) loads unchanged.
 
     def forward(self, images: torch.Tensor, query_points: torch.Tensor = None,
-                gate_logits_override: torch.Tensor = None, frame_pos: torch.Tensor = None):
+                frame_pos: torch.Tensor = None):
         """
         Forward pass of the VGGT model.
 
@@ -146,12 +78,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             query_points (torch.Tensor, optional): Query points for tracking, in pixel coordinates.
                 Shape: [N, 2] or [B, N, 2], where N is the number of query points.
                 Default: None
-            gate_logits_override (torch.Tensor, optional): [B, S, P_patch] eval-only override for
-                the gate bias (see Aggregator.forward docstring); bypasses the model's own
-                GatePredictor output when building the camera/register attention bias. Used for
-                oracle-mask gate ablations. Default: None (use the model's own predicted gate).
             frame_pos (torch.Tensor, optional): [B, S] real frame indices of the clip; only the
-                temporal blocks read it (see Aggregator.forward). Default: None (positions 0..S-1).
+                temporal blocks and relmask read it (see Aggregator.forward). Default: None (positions 0..S-1).
 
         Returns:
             dict: A dictionary containing the following predictions:
@@ -174,15 +102,9 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         if query_points is not None and len(query_points.shape) == 2:
             query_points = query_points.unsqueeze(0)
 
-        aggregated_tokens_list, patch_start_idx, gate_logits = self.aggregator(
-            images, gate_logits_override=gate_logits_override, frame_pos=frame_pos
-        )
+        aggregated_tokens_list, patch_start_idx = self.aggregator(images, frame_pos=frame_pos)
 
         predictions = {}
-
-        # expose gate logits for L_gate supervision (docs/method.md §3.4)
-        if gate_logits is not None:
-            predictions["gate_logits"] = gate_logits    # [B, S, P_patch], with gradients
 
         with torch.amp.autocast('cuda', enabled=False):
             if self.camera_head is not None:
@@ -203,15 +125,6 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 )
                 predictions["world_points"] = pts3d
                 predictions["world_points_conf"] = pts3d_conf
-
-            if self.illu_head is not None:
-                # the illumination token is the last special token, right before the patches
-                illu_tok = aggregated_tokens_list[-1][:, :, patch_start_idx - 1].float()
-                predictions["illu_log16"] = self.illu_head(illu_tok)  # [B, S, 16, 16], log
-                if not self.training:
-                    predictions["illu_map"] = IlluminationHead.upsample(
-                        predictions["illu_log16"], images.shape[-2], images.shape[-1]
-                    )
 
         if self.track_head is not None and query_points is not None:
             track_list, vis, conf = self.track_head(
