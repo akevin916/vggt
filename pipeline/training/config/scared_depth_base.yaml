@@ -164,10 +164,7 @@ loss:
     alpha: 0.02
   point: null
   track: null
-  static_photo: null
-  ego_flow: null
   camera_smooth: null
-  gate: null
 optim:
   param_group_modifiers: false
   optimizer:
@@ -227,8 +224,6 @@ model:
   enable_point: false
   enable_track: false
   enable_temporal: false
-  enable_gate: false
-  gate_block_iter: 7
 distributed:
   backend: nccl
   comms_dtype: None
