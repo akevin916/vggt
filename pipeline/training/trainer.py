@@ -41,8 +41,6 @@ from pipeline.training.train_utils.general import *
 from pipeline.training.train_utils.logging import setup_logging
 from pipeline.training.train_utils.normalization import normalize_camera_extrinsics_and_points_batch
 from pipeline.training.train_utils.optimizer import construct_optimizers
-from pipeline.training.loss import oracle_gate_logits_from_mask
-from pipeline.data.photometric_corruption import corrupt_batch
 
 # TensorBoard tag layout: "<phase>/<group>_<key>" -- train/loss_*, validation/loss_*,
 # validation/depth_*, validation/pose_*. The internal phase name is 'val'; TB spells it out.
@@ -85,8 +83,6 @@ class Trainer:
         pose_eval: Optional[Dict[str, Any]] = None,
         env_variables: Optional[Dict[str, Any]] = None,
         accum_steps: int = 1,
-        oracle_gate: Optional[Dict[str, Any]] = None,
-        corruption: Optional[Dict[str, Any]] = None,
         temporal_frame_pos: bool = False,
         resume: bool = False,
         **kwargs,
@@ -111,10 +107,6 @@ class Trainer:
             loss: Hydra config for the loss function.
             env_variables: Dictionary of environment variables to set.
             accum_steps: Number of steps to accumulate gradients before an optimizer step.
-            oracle_gate: If {"enabled": True, ...}, replaces the model's own gate bias with one
-                built directly from batch["motion_mask"] (GT dynamic mask) on every forward pass
-                (see loss.oracle_gate_logits_from_mask and the oracle_camera_only ablation).
-                Used to test the gate architectural bet in isolation from gate-predictor quality.
             resume: CLI-driven (--resume), not config-driven. False (default): always load
                 checkpoint.resume_checkpoint_path (the experiment's warm-start/base weights);
                 refuses to start if logs/<exp>/ckpts/last.pt already exists, so a forgotten flag
@@ -153,13 +145,6 @@ class Trainer:
         # The sole source of validation/{pose,depth}_* and the best_ate.pt selection signal --
         # channel A (val_epoch) never computes metrics, only loss. See val_epoch docstring.
         self.pose_eval_conf = pose_eval or {}
-        self.oracle_gate_conf = oracle_gate
-        # Illumination robustness. When enabled, every TRAIN step forwards the batch twice:
-        # once clean under no_grad (the teacher) and once with a few frames photometrically
-        # corrupted (the student, which is what L_sup is computed on -- so the corruption doubles
-        # as augmentation). loss.influence then scores how far the UNCORRUPTED frames moved.
-        # Config keys: enabled, warmup_steps, plus anything data.photometric_corruption reads.
-        self.corruption_conf = corruption
         # True: the temporal blocks' RoPE reads each frame's real offset from the clip's first frame
         # (batch["ids"]) instead of its position 0..S-1. With strided clips (contiguous_stride) this
         # trains offsets up to (S-1)*stride, so a stride-1 chunk of 64 at eval stays in range. Eval
@@ -171,9 +156,6 @@ class Trainer:
         #                report data; a complementary in-domain-generalization pick).
         self.best_ate = float("inf")
         self.best_loss = float("inf")
-        # Snapshot of the band centres at the first epoch boundary, so dual_stream.jsonl can
-        # report how far s has travelled from its (layer-symmetric) initialisation.
-        self._dual_stream_s0 = None
 
         # Store hyperparameters
         self.accum_steps = accum_steps
@@ -226,10 +208,6 @@ class Trainer:
             self._load_resuming_checkpoint(
                 self.checkpoint_conf.resume_checkpoint_path,
                 weights_only=bool(getattr(self.checkpoint_conf, "warm_start_weights_only", False)))
-            # Warm start ONLY -- never on --resume, where it would wipe the run's own progress
-            # every time it restarts.
-            if getattr(self.checkpoint_conf, "reset_gate_head", False):
-                self._reset_gate_head()
 
         # Column mask: the budget schedule's length is this run's optimizer-step count. Set
         # after any checkpoint load (the buffer travels with the ckpt; the config is the truth).
@@ -290,33 +268,6 @@ class Trainer:
             timeout=timedelta(minutes=distributed_conf.timeout_mins)
         )
         self.rank = dist.get_rank()
-
-    def _reset_gate_head(self):
-        """Zero the GatePredictor's output layer, sending g back to 0 for every patch.
-
-        Why this is nearly free: on a domain where the warm-started gate already sits far
-        below the clamp kink (SCARED: median logit -5.4, max -0.17), every bias is ALREADY
-        exactly 0, so zeroing the head leaves the forward pass unchanged -- while moving the
-        logits from a region with no usable gradient to the one point where it is largest
-        (d bias/dg = -0.5). Only the 257-number output projection is touched; the 262k-parameter
-        feature layer underneath is kept, so the gate relearns what to suppress, not how to see.
-
-        Pointless without optim.gate_pose_grad: with the bias detached there is no gradient to
-        collect at g=0 either.
-        """
-        agg = self.model.aggregator
-        gp = getattr(agg, "gate_predictor", None)
-        if gp is None:
-            raise ValueError("checkpoint.reset_gate_head set but the model has no gate_predictor")
-        with torch.no_grad():
-            gp.linear2.weight.zero_()
-            gp.linear2.bias.zero_()
-        if not getattr(agg, "gate_pose_grad", False):
-            logging.warning(
-                "reset_gate_head with gate_pose_grad=False: the gate is now a no-op AND still "
-                "has no gradient path, so it can never learn anything back."
-            )
-        logging.info("Reset gate_predictor output layer to zero (g == 0 for every patch).")
 
     def _load_resuming_checkpoint(self, ckpt_path: str, weights_only: bool = False):
         """Loads a checkpoint from the given path to resume training."""
@@ -427,7 +378,7 @@ class Trainer:
             )
 
         # Re-enable params by substring AFTER the freezes above, for params that live inside a
-        # frozen module (LoRA: freeze global_blocks whole, then train only its "lora_" params).
+        # frozen module.
         if getattr(self.optim_conf, "trainable_param_names", None):
             n = 0
             for name, param in self.model.named_parameters():
@@ -579,14 +530,11 @@ class Trainer:
           ``best_loss.pt`` -- lowest channel-A held-out (PO-test) camera loss (an unbiased
                               pick whose selection signal never touches the report data).
         """
-        self._snapshot_dual_stream_init()
         while self.epoch < self.max_epochs:
             set_seeds(self.seed_value + self.epoch * 100, self.max_epochs, self.distributed_rank)
 
             dataloader = self.train_dataset.get_loader(epoch=int(self.epoch + self.distributed_rank))
             self.train_epoch(dataloader)
-            self._log_dual_stream()
-            self._log_tokdino()
 
             # Clean up training memory before validation.
             del dataloader
@@ -721,7 +669,6 @@ class Trainer:
                         n_frames=int(cfg.get("n_frames", 50)),
                         max_depth=float(cfg.get("max_depth", 200.0)),
                         no_depth=bool(cfg.get("no_depth", False)),
-                        gate_mode=cfg.get("gate_mode", "predicted"),
                         img_size=int(cfg.get("img_size", 518)),
                         out_dir=out_dir,
                         device=device,
@@ -744,7 +691,6 @@ class Trainer:
                         n_frames=int(cfg.get("n_frames", 50)),
                         max_depth=float(cfg.get("max_depth", 100.0)),
                         no_depth=bool(cfg.get("no_depth", False)),
-                        gate_mode=cfg.get("gate_mode", "predicted"),
                         img_size=int(cfg.get("img_size", 518)),
                         out_dir=out_dir,
                         device=device,
@@ -809,7 +755,7 @@ class Trainer:
                       chunk_size=int(cfg.get("chunk_size", 64) or 64), overlap=int(cfg.get("overlap", 16)),
                       # None, as in the CLI: resolve_max_depth then applies each protocol's own cap
                       # (afsfm: 150 mm). Passing pose_eval.max_depth (200) here would NOT match the CLI.
-                      max_depth=None, gate_mode=cfg.get("gate_mode", "predicted"),
+                      max_depth=None,
                       img_size=int(cfg.get("img_size", 518)), single_view=False, device=device)
         pose = eval_evaluate(SimpleNamespace(**common, split="test/pose", no_depth=True, depth_protocol="monst3r",
                                              out_dir=os.path.join(out_dir, "pose_c64")), model=model)
@@ -1049,16 +995,6 @@ class Trainer:
                 self.scaler.step(optim.optimizer)
             self.scaler.update()
 
-            # Frame-distance band: range projection + schedule counter, one tick per OPTIMIZER
-            # step (so accum_steps cannot accelerate the ramp), outside any forward.
-            agg = self._dual_stream_module()
-            if agg is not None:
-                agg.dual_stream_post_step_()
-                # Extra samples inside the first epoch: the ramp is still climbing here, and
-                # "s never moved" is the failure this log exists to catch -- waiting for the
-                # epoch boundary to find out wastes the epoch.
-                if self.epoch == 0 and int(agg.dual_stream_steps) in (100, 300, 600, 1000):
-                    self._log_dual_stream()
             cm = self._colmask_module()
             if cm is not None:
                 for kind in ("colmask", "relmask"):
@@ -1068,11 +1004,6 @@ class Trainer:
                     n = int(getattr(cm, f"{kind}_steps"))
                     if n % 100 == 0 or n == 1:
                         logging.info(f"{kind} {getattr(cm, f'{kind}_stats')()}")
-            tok = self._tokdino_module()
-            if tok is not None:
-                tok.tokdino_post_step_()
-                if self.epoch == 0 and int(tok.tokdino_steps) in (100, 300, 600, 1000):
-                    self._log_tokdino()
 
             # Measure elapsed time
             batch_time.update(time.time() - end)
@@ -1205,100 +1136,20 @@ class Trainer:
             A dictionary containing the computed losses.
         """
         # Forward pass
-        gate_override = None
-        if self.oracle_gate_conf and self.oracle_gate_conf.get("enabled", False) and "motion_mask" in batch:
-            gate_override = oracle_gate_logits_from_mask(
-                batch["motion_mask"],
-                patch_size=self.oracle_gate_conf.get("patch_size", 14),
-                k=self.oracle_gate_conf.get("k", 30.0),
-            )
-        # Illumination robustness: the double forward.
-        #   teacher -- the CLEAN sequence under no_grad. no_grad is what keeps this cheap: no
-        #              activations are stored, so the extra pass costs compute, not the ~2x memory
-        #              a second differentiable forward would.
-        #   student -- the SAME sequence with 1-2 frames photometrically corrupted. L_sup is
-        #              computed on this one, so the corruption doubles as augmentation; setting
-        #              loss.influence.weight to 0 therefore leaves exactly the augmentation-only
-        #              ablation arm, with no other difference.
-        # Train phase only: validation must stay a plain single forward or its loss stops being
-        # comparable with every previous run's.
-        images_in = batch["images"]
         frame_pos = batch["ids"] if self.temporal_frame_pos else None
-        y_teacher = None
-        if (
-            phase == "train"
-            and self.corruption_conf is not None
-            and self.corruption_conf.get("enabled", False)
-            and self.steps[phase] >= int(self.corruption_conf.get("warmup_steps", 0))
-        ):
-            corrupted, corrupt_mask = corrupt_batch(batch["images"], self.corruption_conf)
-            if bool(corrupt_mask.any()):
-                # cache_enabled=False is REQUIRED, not a tuning choice. autocast caches the bf16
-                # casts of each weight for the lifetime of its context; the teacher pass would
-                # populate that cache, the student pass would then consume cached casts instead of
-                # producing them, and gradient checkpointing's recompute in the backward would save
-                # a different set of tensors than the forward did -- which surfaces as
-                # CheckpointError: "Recomputed values ... have different metadata". Disabling the
-                # cache for the teacher alone leaves the student pass byte-identical to the
-                # single-forward case.
-                with torch.no_grad(), torch.amp.autocast(
-                    "cuda",
-                    enabled=self.optim_conf.amp.enabled,
-                    dtype=(torch.bfloat16 if self.optim_conf.amp.amp_dtype == "bfloat16"
-                           else torch.float16),
-                    cache_enabled=False,
-                ):
-                    y_teacher = model(images=batch["images"], gate_logits_override=gate_override,
-                                      frame_pos=frame_pos)
-                    y_teacher = {
-                        k: v for k, v in y_teacher.items()
-                        if k in ("world_points", "world_points_conf", "depth", "pose_enc_list")
-                    }
-                images_in = corrupted
-                batch["_teacher"] = y_teacher
-                batch["corrupt_frame_mask"] = corrupt_mask
-
-        y_hat = model(images=images_in, gate_logits_override=gate_override, frame_pos=frame_pos)
+        y_hat = model(images=batch["images"], frame_pos=frame_pos)
         
         # Loss computation
         loss_dict = self.loss(y_hat, batch)
-        # Keep the teacher out of the logging merge below: it is a dict of prediction tensors,
-        # not batch data, and _update_and_log_scalars would try to .item() whatever it matched.
-        batch.pop("_teacher", None)
         
         # Combine all data for logging
         log_data = {**y_hat, **loss_dict, **batch}
-
-        # Gate telemetry. Kept OUT of loss_dict so it can never reach the backward pass.
-        # Without these two numbers a gate_pose_grad run is unreadable: the ATE curve cannot
-        # distinguish "the gate learned a useful mask" from "the gate switched itself off",
-        # and switching off is the outcome the pose loss is known to prefer here.
-        #   gate_g_median   -- where the logits sit; the clamp kink is at 0
-        #   gate_frac_active-- fraction of patches past that kink, i.e. actually suppressed
-        if y_teacher is not None:
-            # Without this the L_inf curve is unreadable: a falling loss_influence could mean the
-            # model got robust, or simply that fewer frames were being corrupted.
-            log_data["corrupt_frac"] = batch["corrupt_frame_mask"].float().mean()
-
-        if "gate_logits" in y_hat and y_hat["gate_logits"] is not None:
-            with torch.no_grad():
-                _g = y_hat["gate_logits"].detach().float()
-                log_data["gate_g_median"] = _g.median()
-                log_data["gate_frac_active"] = (_g > 0).float().mean()
 
         self._update_and_log_scalars(log_data, phase, self.steps[phase], loss_meters)
         self._log_tb_visuals(log_data, phase, self.steps[phase])
 
         self.steps[phase] += 1
         return loss_dict, y_hat
-
-    def _dual_stream_module(self):
-        """The aggregator, if this run has the frame-distance band bias; else None."""
-        model = self.model.module if isinstance(
-            self.model, torch.nn.parallel.DistributedDataParallel
-        ) else self.model
-        agg = getattr(model, "aggregator", None)
-        return agg if getattr(agg, "enable_dual_stream", False) else None
 
     def _colmask_module(self):
         """The aggregator, if this run has a column or frame-distance mask; else None."""
@@ -1307,112 +1158,6 @@ class Trainer:
         ) else self.model
         agg = getattr(model, "aggregator", None)
         return agg if (getattr(agg, "enable_colmask", False) or getattr(agg, "enable_relmask", False)) else None
-
-    def _tokdino_module(self):
-        """The aggregator, if this run has the per-token DINO band (tokdino); else None."""
-        model = self.model.module if isinstance(
-            self.model, torch.nn.parallel.DistributedDataParallel
-        ) else self.model
-        agg = getattr(model, "aggregator", None)
-        return agg if getattr(agg, "enable_tokdino", False) else None
-
-    def _log_tokdino(self) -> None:
-        """Append beta and the predicted (s, sigma) spread to logs/<exp>/tokdino.jsonl.
-
-        s and sigma are per-token predictions, so the readout is their distribution over the
-        tokens of the LAST training forward: 10/50/90% quantiles per (layer, head). The p10-p90
-        gap is the "did tokens learn different distances" reading; zero gap = a per-head band.
-        """
-        agg = self._tokdino_module()
-        if self.rank != 0 or agg is None:
-            return
-        warm = float(agg._tokdino_warm())
-        beta = agg.tokdino_beta.detach().float().cpu()
-        stats = {int(k): v.detach().float().cpu() for k, v in agg._tokdino_stats.items()}
-        rnd = lambda x: [round(float(a), 6) for a in x]  # noqa: E731
-        record = {
-            "epoch": int(self.epoch),
-            "train_steps": int(self.steps["train"]),
-            "tok_steps": int(agg.tokdino_steps),
-            "warm": warm,
-            "start": int(agg.tokdino_start),
-            "beta": rnd(beta),
-            "beta_eff": rnd(warm * beta),
-            # per layer: {"s": [p10[H], p50[H], p90[H]], "sigma": [...]}
-            "pred": {str(k): {"s": [rnd(v[i, 0]) for i in range(3)],
-                              "sigma": [rnd(v[i, 1]) for i in range(3)]}
-                     for k, v in sorted(stats.items())},
-        }
-        path = os.path.join(self.logging_conf.log_dir, "tokdino.jsonl")
-        with open(path, "a") as f:
-            f.write(json.dumps(record) + "\n")
-
-    def _snapshot_dual_stream_init(self) -> None:
-        """Band centres as training starts (after any resume), the baseline for s_shift_max.
-
-        Also checks the schedule counter against the trainer's own step count. The two are
-        counted independently (buffer in the model, self.steps in the checkpoint dict), so a
-        mismatch after a resume means the ramp is running off a different clock than the run --
-        which would otherwise produce no warning at all.
-        """
-        agg = self._dual_stream_module()
-        if agg is None:
-            return
-        self._dual_stream_s0 = agg.dual_stream_log_s.detach().float().exp().cpu()
-        band, trained = int(agg.dual_stream_steps), int(self.steps["train"])
-        if band != trained:
-            # A fresh start off VGGT-1B has neither key, so both are 0 and this stays quiet.
-            logging.warning(
-                "dual_stream_steps (%d) != trainer train steps (%d): the band schedule is "
-                "out of step with the run (checkpoint lacking the buffer?)", band, trained,
-            )
-
-    def _log_dual_stream(self) -> None:
-        """Dump the frame-distance band parameters, once per epoch, to logs/<exp>/dual_stream.jsonl.
-
-        Three readings the ATE curve cannot give: whether the model WANTS the band (beta), how the
-        per-head band centres s move away from their layer-symmetric init (the scatter plot), and
-        whether s moves at all in the first epochs (too-weak gradient => the schedule or the lr
-        group is wrong, and that is worth catching after epoch 1 rather than after epoch 10).
-        """
-        agg = self._dual_stream_module()
-        if self.rank != 0 or agg is None:
-            return
-
-        with torch.no_grad():
-            beta = agg.dual_stream_beta.detach().float().cpu()
-            s = agg.dual_stream_log_s.detach().float().exp().cpu()
-            sigma = agg.dual_stream_log_sigma.detach().float().exp().cpu()
-        start = agg.dual_stream_start
-        if self._dual_stream_s0 is None:          # init snapshot, for the "did s move" column
-            self._dual_stream_s0 = s.clone()
-        active = slice(start, s.shape[0])         # blocks below start never see the bias
-
-        warm = float(agg._dual_stream_warm())
-        record = {
-            "epoch": int(self.epoch),
-            "train_steps": int(self.steps["train"]),
-            "band_steps": int(agg.dual_stream_steps),
-            # warm and beta_eff make the line self-contained: beta alone cannot tell you the
-            # strength that was actually in force when the line was written.
-            "warm": warm,
-            "beta_eff": [round(warm * float(x), 5) for x in beta[active]],
-            "start": int(start),
-            "beta": [round(float(x), 5) for x in beta[active]],
-            "s": [[round(float(x), 5) for x in row] for row in s[active]],
-            "sigma": [[round(float(x), 5) for x in row] for row in sigma[active]],
-            "s_shift_max": float((s[active] / self._dual_stream_s0[active]).log().abs().max()),
-        }
-        path = os.path.join(self.logging_conf.log_dir, "dual_stream.jsonl")
-        with open(path, "a") as f:
-            f.write(json.dumps(record) + "\n")
-
-        step = self.steps["train"]
-        self.tb_writer.log("Dual/beta_median", float(beta[active].median()), step)
-        # spread of the 16 head centres WITHIN a layer: stays high = multi-scale division of
-        # labour, collapses = the heads agreed on one scale.
-        self.tb_writer.log("Dual/s_head_spread", float(s[active].log().std(dim=1).mean()), step)
-        self.tb_writer.log("Dual/s_shift_max", record["s_shift_max"], step)
 
     def _update_and_log_scalars(self, data: Mapping, phase: str, step: int, loss_meters: dict):
         """Updates average meters and logs scalar values to TensorBoard."""
