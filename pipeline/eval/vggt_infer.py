@@ -7,7 +7,6 @@ from typing import Dict, List, Optional
 import numpy as np
 import torch
 
-from vggt.layers.lora import merge_lora_state_dict
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
@@ -20,97 +19,48 @@ def _load_state_dict(ckpt: str) -> dict:
     return sd
 
 
+# Key prefixes of features removed in the slim-down (tag archive-pre-slim). A checkpoint carrying
+# any of them would load here with those weights dropped as "unexpected" under strict=False and be
+# scored as a different model -- silently -- so refuse it instead.
+_REMOVED_FEATURE_KEYS = {
+    "gate": ("aggregator.gate_predictor.", "aggregator.gate_bias_scale_p"),
+    "dual_stream": ("aggregator.dual_stream_",),
+    "alt_stream": ("aggregator.alt_stream_",),
+    "tokdino": ("aggregator.tokdino_",),
+    "3D RoPE": ("aggregator.rope_3d_dims",),
+    "time-phase RoPE": ("aggregator.rope_t.", "aggregator.rope_time_base"),
+    "shared temporal weights": ("aggregator.temporal_ls.",),
+    "illu token": ("aggregator.illu_token", "illu_head."),
+}
+
+
 def load_vggt_for_eval(
     ckpt: str,
     img_size: int = 518,
-    gate_block_iter: int = 7,
     device: str = "cuda",
-    require_gate: bool = False,
-    force_gate: bool = False,
     force_point: bool = False,
-    gate_leaky: float = 0.0,
-    gate_bias_zero_ref: bool = False,
-    gate_bias_scale: float | None = None,
-    gate_bias_a: float = 1.0,
-    gate_bias_tau: float = 0.0,
-    dual_stream_scope: str = "camera",
-    dual_stream_start: int = 8,
     verbose: bool = True,
 ) -> VGGT:
     """Build VGGT with architecture inferred from checkpoint keys.
 
-    Each head/block family is detected independently from its own key prefix, so any
-    combination (e.g. the pose-only oracle-gate ablation: temporal + camera, no gate,
-    no depth/point/motion/flow) reconstructs correctly -- not just the three presets
-    (plain VGGT / v1-v2 dyn / gate) this used to special-case.
+    Each head/block family is detected independently from its own key prefix: temporal blocks,
+    depth/point heads, learned colmask, learned relmask. A fixed relmask/colmask (.npy) carries no
+    weights and is set on the built model by the caller (set_relmask_fixed / set_colmask_fixed).
     """
-    # LoRA checkpoints are folded into plain weights; without this their deltas would be
-    # dropped as unexpected keys under strict=False and the base model scored instead.
-    sd = merge_lora_state_dict(_load_state_dict(ckpt))
+    sd = _load_state_dict(ckpt)
     keys = list(sd.keys())
-    # force_gate: build the gate mechanism even when the checkpoint has no gate_predictor
-    # weights (e.g. pretrained VGGT-1B). The GatePredictor is then random-init and only the
-    # oracle/off modes -- which override the predictor output -- are meaningful.
-    has_gate = any("gate_predictor" in k for k in keys) or force_gate
+    found = sorted({name for name, prefixes in _REMOVED_FEATURE_KEYS.items()
+                    for k in keys if k.startswith(prefixes)})
+    if any("lora_" in k for k in keys):
+        found.append("LoRA")
+    if found:
+        raise SystemExit(f"{ckpt} uses features removed from this build: {found}. "
+                         "Evaluate it from tag archive-pre-slim (or p3-cross-gate / mask-grid-wip for gate).")
     has_temporal = any("temporal" in k for k in keys)
-    # Weight-shared temporal variant: its ONLY weights are aggregator.temporal_ls.*, so the
-    # has_temporal test above fires but building 8 fresh blocks would score the checkpoint with
-    # random attention at LayerScale 0.01 (not identity) while temporal_ls is dropped as
-    # unexpected -- silently, under strict=False.
-    temporal_shared = any(k.startswith("aggregator.temporal_ls") for k in keys)
     has_depth = any(k.startswith("depth_head") for k in keys)
-    # force_point: same idea for the point head, which the gate configs disable entirely
-    # (method §7.2). The head is then random-init and only useful once real weights are
-    # grafted in -- see graft_point_head.
+    # force_point: build the point head even when the checkpoint has none. The head is then
+    # random-init and only useful once real weights are grafted in -- see graft_point_head.
     has_point = any(k.startswith("point_head") for k in keys) or force_point
-    # Frame-distance band bias. Without this detection its weights are dropped as "unexpected"
-    # under strict=False and the checkpoint is silently scored with the bias OFF. Scope/start are
-    # NOT stored in weights -- the defaults below match scared_cam_dual_kern.
-    has_dual = "aggregator.dual_stream_log_s" in sd
-    if "aggregator.dual_stream_p" in sd:
-        # Pre-2026-09-23 dual-stream: bias = sign_l * |p_l| * DINO-similarity. That forward no
-        # longer exists here; loading such a checkpoint would silently score it as plain VGGT.
-        raise SystemExit(
-            f"{ckpt} is a legacy dual-stream checkpoint (aggregator.dual_stream_p). Its forward "
-            "was replaced by the log-distance band bias; check out commit 18aa9fc to evaluate it."
-        )
-    if has_dual:
-        # Every buffer that decides the bias arithmetic must come from the checkpoint. Missing
-        # ones would fall back to this build's constructor defaults and reinterpret the trained
-        # log_s under different arithmetic -- with no error and no visible symptom.
-        need = ["aggregator.dual_stream_steps", "aggregator.dual_stream_warmup",
-                "aggregator.dual_stream_delta_mode", "aggregator.dual_stream_keep_mode"]
-        absent = [k for k in need if k not in sd]
-        if absent:
-            raise SystemExit(f"{ckpt} has dual_stream_log_s but lacks {absent}")
-    # delta_mode decides which extra buffers the Aggregator registers (abs_span / odo_unit), so it
-    # must be read BEFORE building; their values are then overwritten by load_state_dict.
-    dual_delta_mode = int(sd["aggregator.dual_stream_delta_mode"]) if has_dual else 0
-    # Alt-stream (dual v0 re-implemented): the signal id is a buffer, overwritten on load; start is
-    # not stored and must match training (8, as in every v0 config).
-    has_alt = "aggregator.alt_stream_p" in sd
-    # 3D (y,x,t) RoPE carries NO parameters, so only this persistent buffer distinguishes a 3D
-    # checkpoint from a 2D one; without it the weights would be scored under a different position
-    # code than they were trained with, silently.
-    rope_3d_dims = sd.get("aggregator.rope_3d_dims")
-    rope_3d = rope_3d_dims is not None
-    # Composed (y,x)+time RoPE: alpha lives in aggregator.rope_t.*, and the time base is a buffer.
-    # Both must come from the checkpoint or the trained alphas would be applied under a different
-    # frequency ladder than they were learned with.
-    rope_time = any(k.startswith("aggregator.rope_t.") for k in keys)
-    rope_time_base = float(sd["aggregator.rope_time_base"]) if "aggregator.rope_time_base" in sd else 10.0
-    # Illumination token: it shifts patch_start_idx by one, so loading an illu checkpoint without
-    # it would not merely drop a head -- every head would read the token grid off by one slot.
-    has_illu = "aggregator.illu_token" in sd
-    # tokdino: start and the squash ranges are buffers (all of them decide the forward), so the
-    # checkpoint alone reproduces it; start must be read BEFORE building (it sets how many
-    # predictors exist). Ranges/steps/warmup are overwritten by load_state_dict.
-    has_tokdino = "aggregator.tokdino_beta" in sd
-    tok_need = ["aggregator.tokdino_steps", "aggregator.tokdino_warmup", "aggregator.tokdino_start",
-                "aggregator.tokdino_log_s_range", "aggregator.tokdino_log_sigma_range"]
-    if has_tokdino and any(k not in sd for k in tok_need):
-        raise SystemExit(f"{ckpt} has tokdino_beta but lacks {[k for k in tok_need if k not in sd]}")
-    tokdino_start = int(sd["aggregator.tokdino_start"]) if has_tokdino else 8
 
     # Learned column mask (D1): grid shape and the mean-token mode decide what gets BUILT, so they
     # come from the checkpoint's buffers before construction (load_state_dict then sets the rest).
@@ -125,9 +75,6 @@ def load_vggt_for_eval(
     if "aggregator.relmask_theta" in sd:
         cm_kw = dict(cm_kw, enable_relmask=True)
 
-    if require_gate and not has_gate:
-        raise SystemExit(f"checkpoint has no gate_predictor weights: {ckpt}")
-
     model = VGGT(
         img_size=img_size,
         enable_camera=True,
@@ -135,64 +82,14 @@ def load_vggt_for_eval(
         enable_point=has_point,
         enable_track=False,
         enable_temporal=has_temporal,
-        temporal_share_frame_weights=temporal_shared,
-        rope_time=rope_time,
-        rope_time_base=rope_time_base,
-        rope_3d=rope_3d,
-        rope_3d_dims=tuple(int(x) for x in rope_3d_dims) if rope_3d else (24, 24, 16),
-        enable_gate=has_gate,
-        gate_block_iter=gate_block_iter,
-        gate_leaky=gate_leaky,
-        gate_bias_zero_ref=gate_bias_zero_ref,
-        gate_bias_scale=gate_bias_scale,
-        gate_bias_a=gate_bias_a,
-        gate_bias_tau=gate_bias_tau,
-        enable_dual_stream=has_dual,
-        dual_stream_scope=dual_stream_scope,
-        dual_stream_start=dual_stream_start,
-        dual_stream_delta_mode=dual_delta_mode,
-        enable_alt_stream=has_alt,
-        enable_tokdino=has_tokdino,
-        tokdino_start=tokdino_start,
-        enable_illu=has_illu,
         **cm_kw,
     )
     miss, unexp = model.load_state_dict(sd, strict=False)
     if verbose and has_colmask:
         print(f"colmask ON: {model.aggregator.colmask_stats()} diag={int(model.aggregator.colmask_diag)} "
               f"mean={cm_kw['colmask_mean']} (eval mode defaults to 'hard' top-k at rho*)")
-    if verbose and has_dual:
-        agg = model.aggregator
-        print(f"dual-stream ON: scope={dual_stream_scope} start={dual_stream_start} "
-              f"(not stored in ckpt), steps={int(agg.dual_stream_steps)} "
-              f"warmup={int(agg.dual_stream_warmup)} warm={agg._dual_stream_warm():.3f} "
-              f"delta_mode={int(agg.dual_stream_delta_mode)} "
-              f"keep_mode={int(agg.dual_stream_keep_mode)}")
-    if verbose and has_alt:
-        agg = model.aggregator
-        print(f"alt-stream ON: start={agg.alt_stream_start} (not stored in ckpt) "
-              f"signal_id={int(agg.alt_stream_signal_id)} |p| mean={agg.alt_stream_p[agg.alt_stream_start:].abs().mean().item():.4f}")
-    if verbose and has_tokdino:
-        agg = model.aggregator
-        print(f"tokdino ON: start={int(agg.tokdino_start)} steps={int(agg.tokdino_steps)} "
-              f"warmup={int(agg.tokdino_warmup)} warm={agg._tokdino_warm():.3f} "
-              f"s_range={agg.tokdino_log_s_range.exp().tolist()} "
-              f"sigma_range={agg.tokdino_log_sigma_range.exp().tolist()}")
-    if verbose and rope_time:
-        alphas = torch.cat([v.flatten() for k, v in sd.items() if k.startswith("aggregator.rope_t.")])
-        print(f"time RoPE ON: base={rope_time_base} |alpha| median={alphas.abs().median():.4f} "
-              f"max={alphas.abs().max():.4f}")
-    if verbose and rope_3d:
-        print(f"3D RoPE ON: dims={tuple(int(x) for x in rope_3d_dims)} (y, x, t)")
     if verbose:
-        if has_gate:
-            n_gate = sum(1 for k in sd if "gate_predictor" in k)
-            print(
-                f"loaded {ckpt}: gate_predictor keys={n_gate} "
-                f"missing={len(miss)} unexpected={len(unexp)}"
-            )
-        else:
-            print(f"loaded {ckpt}: missing={len(miss)} unexpected={len(unexp)}")
+        print(f"loaded {ckpt}: missing={len(miss)} unexpected={len(unexp)}")
     return model.to(device).eval()
 
 
@@ -229,7 +126,6 @@ def infer_sequence(
     image_paths: List[str],
     device: str = "cuda",
     dtype: Optional[torch.dtype] = None,
-    gate_logits_override: Optional[torch.Tensor] = None,
     want_point: bool = False,
     images: Optional[torch.Tensor] = None,
 ) -> Dict[str, np.ndarray]:
@@ -255,7 +151,7 @@ def infer_sequence(
         images = images.unsqueeze(0)
 
     with torch.cuda.amp.autocast(dtype=dtype, enabled=(device == "cuda")):
-        pred = model(images=images, gate_logits_override=gate_logits_override)
+        pred = model(images=images)
 
     h, w = images.shape[-2], images.shape[-1]
     extrinsic, intrinsic = pose_encoding_to_extri_intri(pred["pose_enc"], image_size_hw=(h, w))
@@ -272,10 +168,6 @@ def infer_sequence(
         if depth.ndim == 5 and depth.shape[-1] == 1:
             depth = depth[..., 0]
         out["depth"] = depth.squeeze(0).float().cpu().numpy()
-    if "gate_logits" in pred:
-        # [S, P_patch] fp32 — the model's own predicted gate logits (pre-bias), for
-        # reuse as a (possibly rescaled) gate_logits_override in follow-up ablations.
-        out["gate_logits"] = pred["gate_logits"].squeeze(0).float().cpu().numpy()
     if want_point and "world_points" in pred:
         # [S, H, W, 3] in the frame-0 camera frame, plus its [S, H, W] confidence.
         out["world_points"] = pred["world_points"].squeeze(0).float().cpu().numpy()
@@ -288,7 +180,6 @@ def infer_sequence_chunked(
     image_paths: List[str],
     device: str = "cuda",
     chunk_size: int = 32,
-    gate_logits_override: Optional[torch.Tensor] = None,
 ) -> Dict[str, np.ndarray]:
     """Chunked inference. ``chunk_size <= 0`` means one pass over the whole sequence.
 
@@ -301,15 +192,12 @@ def infer_sequence_chunked(
     the 32 default. This docstring is the authoritative statement of that trap.
     """
     if chunk_size <= 0 or len(image_paths) <= chunk_size:
-        return infer_sequence(model, image_paths, device=device, gate_logits_override=gate_logits_override)
+        return infer_sequence(model, image_paths, device=device)
 
     parts = []
     for start in range(0, len(image_paths), chunk_size):
         chunk_paths = image_paths[start : start + chunk_size]
-        chunk_override = (
-            gate_logits_override[:, start : start + chunk_size] if gate_logits_override is not None else None
-        )
-        parts.append(infer_sequence(model, chunk_paths, device=device, gate_logits_override=chunk_override))
+        parts.append(infer_sequence(model, chunk_paths, device=device))
 
     out = {
         "extrinsic": np.concatenate([p["extrinsic"] for p in parts], axis=0),
@@ -367,7 +255,6 @@ def infer_sequence_stitched(
     device: str = "cuda",
     chunk_size: int = 64,
     overlap: int = 16,
-    gate_logits_override: Optional[torch.Tensor] = None,
     want_depth: bool = False,
 ) -> Dict[str, np.ndarray]:
     """Whole-sequence poses from overlapping chunks joined by a per-seam Sim3.
@@ -386,8 +273,7 @@ def infer_sequence_stitched(
     """
     n = len(image_paths)
     if chunk_size <= 0 or n <= chunk_size:
-        return infer_sequence(model, image_paths, device=device,
-                              gate_logits_override=gate_logits_override)
+        return infer_sequence(model, image_paths, device=device)
     if not 0 < overlap < chunk_size:
         raise ValueError(f"overlap must be in (0, chunk_size); got {overlap} vs {chunk_size}")
 
@@ -405,8 +291,7 @@ def infer_sequence_stitched(
 
     for ci, st in enumerate(starts):
         sl = slice(st, min(st + chunk_size, n))
-        ov = (gate_logits_override[:, sl] if gate_logits_override is not None else None)
-        pred = infer_sequence(model, image_paths[sl], device=device, gate_logits_override=ov)
+        pred = infer_sequence(model, image_paths[sl], device=device)
         c2w = _extrinsic_to_c2w(pred["extrinsic"])
         s_chunk = 1.0
 
