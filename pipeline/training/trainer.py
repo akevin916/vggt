@@ -1004,6 +1004,12 @@ class Trainer:
                     n = int(getattr(cm, f"{kind}_steps"))
                     if n % 100 == 0 or n == 1:
                         logging.info(f"{kind} {getattr(cm, f'{kind}_stats')()}")
+            gm = self._gaussmask_module()
+            if gm is not None:
+                gm.post_step_()
+                n = int(gm.steps)
+                if n % 50 == 0 or n == 1:
+                    logging.info(f"gaussmask {gm.stats()}")
 
             # Measure elapsed time
             batch_time.update(time.time() - end)
@@ -1158,6 +1164,14 @@ class Trainer:
         ) else self.model
         agg = getattr(model, "aggregator", None)
         return agg if (getattr(agg, "enable_colmask", False) or getattr(agg, "enable_relmask", False)) else None
+
+    def _gaussmask_module(self):
+        """The aggregator's TRAINABLE Gaussian mask (3-10), else None."""
+        model = self.model.module if isinstance(
+            self.model, torch.nn.parallel.DistributedDataParallel
+        ) else self.model
+        gm = getattr(getattr(model, "aggregator", None), "gaussmask", None)
+        return gm if (gm is not None and not gm.fixed) else None
 
     def _update_and_log_scalars(self, data: Mapping, phase: str, step: int, loss_meters: dict):
         """Updates average meters and logs scalar values to TensorBoard."""

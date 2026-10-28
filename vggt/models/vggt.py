@@ -32,7 +32,9 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                  relmask_init_std=0.01, relmask_seed=0, relmask_rho=0.25, relmask_ramp_frac=0.6,
                  relmask_st_frac=0.2, relmask_budget_S=64,
                  relmask_budget="shared", relmask_rho_steps=0, relmask_T_start=1.0, relmask_T_end=0.05,
-                 relmask_T_steps=(0, 0), relmask_hard_from=0):
+                 relmask_T_steps=(0, 0), relmask_hard_from=0,
+                 # Gaussian spatio-temporal key mask (3-10): dict, see vggt/models/gaussmask.py
+                 gaussmask=None):
         super().__init__()
 
         # NEW: enable_temporal injects temporal attention into the aggregator (aa_order gains "temporal").
@@ -55,6 +57,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             relmask_budget=str(relmask_budget), relmask_rho_steps=int(relmask_rho_steps),
             relmask_T_start=float(relmask_T_start), relmask_T_end=float(relmask_T_end),
             relmask_T_steps=tuple(relmask_T_steps), relmask_hard_from=int(relmask_hard_from),
+            gaussmask=dict(gaussmask) if gaussmask is not None else None,
         )
 
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None

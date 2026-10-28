@@ -1,0 +1,36 @@
+# 3-10 stage A, ball: frozen tfs_abs, learn ONLY the Gaussian spatio-temporal key mask
+# (vggt/models/gaussmask.py; 3 params x 16 global layers 8-23). rho = 0.25 of the other-frame,
+# key-frame>=1 pairs in a 64-frame chunk; c^2 solved per layer per step, so sigma sets only shape.
+# Decision 2026-10-28 (option C): S=48 contiguous (S=64 OOMs), 500 steps instead of the spec's
+# 1500 -- the table-lookup flex backward costs ~4.3 s per layer at S=48. Schedule scaled 1/3:
+# T 2 -> 0.1 over steps 0-367, straight-through hard boundary from step 367; convergence check =
+# last 100 steps. Same setup as c3_pos_b25_A otherwise (tfs_abs warm start, lr 0.02, 518x420).
+# Written 2026-10-28.
+defaults:
+- c3_pos_b25_A
+- _self_
+exp_name: c3_gball_A
+max_epochs: 1
+limit_train_batches: 500
+max_img_per_gpu: 48
+model:
+  enable_relmask: false
+  gaussmask:
+    enable: true
+    cone: false
+    rho: 0.25
+    S_max: 64
+    start: 8
+    grid: [30, 37]
+    T_start: 2.0
+    T_end: 0.1
+    T_steps: [0, 367]
+    hard_from: 367
+    init: {sigma_s: 8.0, sigma_y: 6.0, sigma_x: 6.0, v: 0.0}
+optim:
+  gradient_clip:
+    configs:
+    - module_name:
+      - aggregator.gaussmask
+      max_norm: null
+      norm_type: 2

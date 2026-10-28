@@ -117,7 +117,7 @@ def protocol_tag(args) -> str:
             tag += f"_{args.depth_protocol}"
     if args.n_frames > 0:
         tag += f"_{args.n_frames}f"
-    for _f, _t in (("colmask", "cm"), ("relmask", "rm")):
+    for _f, _t in (("colmask", "cm"), ("relmask", "rm"), ("gaussmask", "gm")):
         if getattr(args, _f, None):
             tag += f"_{_t}-" + os.path.splitext(os.path.basename(getattr(args, _f)))[0]
     cm = getattr(args, "colmask_mode", "hard")
@@ -213,6 +213,9 @@ def eval_ckpt(ckpt, root, split, seqs, args, model=None):
     if getattr(args, "relmask", None):
         agg.set_relmask_fixed(np.load(args.relmask), buckets=args.relmask_buckets)
         print(f"relmask file {args.relmask}: {agg.relmask_stats()}")
+    if getattr(args, "gaussmask", None):
+        agg.set_gaussmask_fixed(args.gaussmask)
+        print(f"gaussmask file {args.gaussmask}: {agg.gaussmask.stats()}")
     cm_mode = getattr(args, "colmask_mode", "hard")
     if getattr(agg, "enable_colmask", False):
         # random = the learned mask's per-layer keep counts at random positions (the control)
@@ -376,6 +379,7 @@ def evaluate(args, model=None):
                              colmask_seed=getattr(args, "colmask_seed", 0),
                              colmask_file=getattr(args, "colmask", None),
                              relmask_file=getattr(args, "relmask", None),
+                             gaussmask_file=getattr(args, "gaussmask", None),
                              timestamp=datetime.now().isoformat(timespec="seconds")),
                    results=results)
     with open(os.path.join(args.out_dir, "results.json"), "w") as f:
@@ -422,6 +426,7 @@ def main():
     ap.add_argument("--colmask_diag", action="store_true", help="with --colmask: own key never masked")
     ap.add_argument("--relmask", default=None, help="FIXED frame-distance tile mask .npy bool [6, 8, 8] (3-3)")
     ap.add_argument("--relmask_buckets", type=int, nargs="+", default=[1, 2, 4, 8, 16])
+    ap.add_argument("--gaussmask", default=None, help="FIXED Gaussian spatio-temporal mask json (3-10)")
     ap.add_argument("--img_size", type=int, default=518)
     ap.add_argument("--out_dir", default=None)
     args = ap.parse_args()
