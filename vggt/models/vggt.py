@@ -54,6 +54,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                  relmask_tile=(8, 8), relmask_start=8, relmask_grid=(30, 37), relmask_init=5.0,
                  relmask_init_std=0.01, relmask_seed=0, relmask_rho=0.25, relmask_ramp_frac=0.6,
                  relmask_st_frac=0.2, relmask_budget_S=64,
+                 relmask_budget="shared", relmask_rho_steps=0, relmask_T_start=1.0, relmask_T_end=0.05,
+                 relmask_T_steps=(0, 0), relmask_hard_from=0,
                  # LoRA on pretrained linears (vggt/layers/lora.py); rank 0 = off, model unchanged
                  lora_rank=0, lora_alpha=32.0,
                  lora_targets=("aggregator.global_blocks.@(8|9|1?|2[0-3]).attn.@(qkv|proj)",),
@@ -110,6 +112,9 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             relmask_seed=int(relmask_seed), relmask_rho=float(relmask_rho),
             relmask_ramp_frac=float(relmask_ramp_frac), relmask_st_frac=float(relmask_st_frac),
             relmask_budget_S=int(relmask_budget_S),
+            relmask_budget=str(relmask_budget), relmask_rho_steps=int(relmask_rho_steps),
+            relmask_T_start=float(relmask_T_start), relmask_T_end=float(relmask_T_end),
+            relmask_T_steps=tuple(relmask_T_steps), relmask_hard_from=int(relmask_hard_from),
             temporal_share_frame_weights=temporal_share_frame_weights,
             rope_3d=rope_3d, rope_3d_dims=rope_3d_dims, rope_3d_zero_time=rope_3d_zero_time,
             rope_time=rope_time, rope_time_base=rope_time_base,

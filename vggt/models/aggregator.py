@@ -212,6 +212,14 @@ class Aggregator(nn.Module):
         relmask_ramp_frac: float = 0.6,
         relmask_st_frac: float = 0.2,
         relmask_budget_S: int = 64,          # budget weights = (query, key>=1) frame pairs per bucket at S
+        # 3-7: "per_bucket" = each bucket keeps rho of ITS keys (cell weight = keys per tile slot),
+        # tau_b solved in the forward, g = sigmoid((theta - tau_b) / T); "shared" = 3-3 projection.
+        relmask_budget: str = "shared",
+        relmask_rho_steps: int = 0,          # per_bucket: rho_t 1 -> rho over steps [0, rho_steps]
+        relmask_T_start: float = 1.0,
+        relmask_T_end: float = 0.05,
+        relmask_T_steps=(0, 0),              # T = T_start before T_steps[0], linear to T_end at [1]
+        relmask_hard_from: int = 0,          # per_bucket: straight-through hard mask from this step
     ):
         super().__init__()
 
@@ -612,6 +620,12 @@ class Aggregator(nn.Module):
             self.relmask_gh, self.relmask_gw = int(relmask_grid[0]), int(relmask_grid[1])
             self.register_buffer("relmask_cell_w", self._relmask_cell_weights(int(relmask_budget_S)),
                                  persistent=False)
+            assert relmask_budget in ("shared", "per_bucket"), relmask_budget
+            self.relmask_budget = str(relmask_budget)
+            self.relmask_rho_steps = int(relmask_rho_steps)
+            self.relmask_T_start, self.relmask_T_end = float(relmask_T_start), float(relmask_T_end)
+            self.relmask_T_steps = (int(relmask_T_steps[0]), int(relmask_T_steps[1]))
+            self.relmask_hard_from = int(relmask_hard_from)
             if relmask_path is not None:
                 import numpy as _np
                 keep = torch.as_tensor(_np.load(relmask_path)).bool()
@@ -1587,6 +1601,7 @@ class Aggregator(nn.Module):
         self.relmask_th, self.relmask_tw = int(tile[0]), int(tile[1])
         self.relmask_start = int(start)
         self.relmask_gh, self.relmask_gw = int(grid[0]), int(grid[1])
+        self.relmask_budget = "shared"
         keep = torch.as_tensor(keep).bool()
         assert keep.shape == (self.relmask_nb, self.relmask_th, self.relmask_tw), keep.shape
         dev = self.camera_token.device if hasattr(self, "camera_token") else torch.device("cpu")
@@ -1634,9 +1649,61 @@ class Aggregator(nn.Module):
         w = self.relmask_cell_w.to(g.device)
         return (w * g).sum() / w.sum()
 
+    # ---- 3-7 per-bucket budget -------------------------------------------------------------
+    def _relmask_key_w(self, device=None) -> torch.Tensor:
+        """[th*tw]: share of a bucket's keys each tile slot stands for (sums to 1)."""
+        c = self.relmask_cell_w[0].flatten()
+        return (c / c.sum()).to(device if device is not None else c.device)
+
+    def _relmask_pb_rho_t(self) -> float:
+        rho, n, r = float(self.relmask_rho), int(self.relmask_steps), int(self.relmask_rho_steps)
+        return rho if r <= 0 else 1.0 - (1.0 - rho) * min(1.0, n / r)
+
+    def _relmask_pb_T(self) -> float:
+        n, (a, b) = int(self.relmask_steps), self.relmask_T_steps
+        if n <= a or b <= a:
+            return self.relmask_T_start if n <= a else self.relmask_T_end
+        return self.relmask_T_start + (self.relmask_T_end - self.relmask_T_start) * min(1.0, (n - a) / (b - a))
+
+    def _relmask_pb_hard_on(self) -> bool:
+        return self.relmask_hard_from > 0 and int(self.relmask_steps) >= self.relmask_hard_from
+
+    @staticmethod
+    def _relmask_pb_hard_keep(theta2d: torch.Tensor, rho: float, W: torch.Tensor) -> torch.Tensor:
+        """[nb, n]: per bucket, cells by theta descending until the kept key share is closest to rho."""
+        h = torch.zeros_like(theta2d, dtype=torch.bool)
+        for b in range(theta2d.shape[0]):
+            order = theta2d[b].argsort(descending=True)
+            n = int((W[order].cumsum(0) - rho).abs().argmin()) + 1
+            h[b, order[:n]] = True
+        return h
+
+    def _relmask_pb_gate(self, rho: Optional[float] = None, T: Optional[float] = None):
+        """(g [nb, n] with grad, tau [nb, 1]): tau_b by bisection so sum_cells W * g = rho per bucket."""
+        th = self.relmask_theta.flatten(1)
+        W = self._relmask_key_w(th.device).to(th.dtype)
+        rho = self._relmask_pb_rho_t() if rho is None else float(rho)
+        T = self._relmask_pb_T() if T is None else float(T)
+        with torch.no_grad():
+            t = th.detach()
+            lo = t.min(1, keepdim=True).values - 20 * T
+            hi = t.max(1, keepdim=True).values + 20 * T
+            for _ in range(60):
+                mid = 0.5 * (lo + hi)
+                m = (torch.sigmoid((t - mid) / T) * W).sum(1, keepdim=True)
+                lo = torch.where(m > rho, mid, lo)
+                hi = torch.where(m > rho, hi, mid)
+            tau = 0.5 * (lo + hi)
+        z = (th - tau) / T
+        return torch.sigmoid(z), tau, z
+
     @torch.no_grad()
     def relmask_hard_keep(self, rho: Optional[float] = None) -> torch.Tensor:
         """theta descending, cells taken until their weighted share reaches rho. bool [nb, th, tw]."""
+        if self.relmask_budget == "per_bucket":
+            rho = float(self.relmask_rho) if rho is None else float(rho)
+            th = self.relmask_theta.detach()
+            return self._relmask_pb_hard_keep(th.flatten(1), rho, self._relmask_key_w(th.device)).view_as(th)
         th = self.relmask_theta.detach()
         rho = float(self.relmask_rho) if rho is None else float(rho)
         w = self.relmask_cell_w.to(th.device).flatten()
@@ -1651,6 +1718,8 @@ class Aggregator(nn.Module):
     def relmask_post_step_(self):
         """Counter + projection of theta onto the WEIGHTED budget (see colmask_post_step_)."""
         self.relmask_steps += 1
+        if self.relmask_budget == "per_bucket":
+            return      # budget lives in the forward (tau_b), theta is never shifted
         th = self.relmask_theta
         rho_t = self._relmask_rho_t()
         if self._relmask_wmean(torch.sigmoid(th)).item() <= rho_t:
@@ -1668,7 +1737,24 @@ class Aggregator(nn.Module):
     def relmask_stats(self) -> dict:
         if self.relmask_theta is None:
             keep = self.relmask_fixed
-            return {"fixed": True, "keep_per_bucket": [round(x, 4) for x in keep.float().flatten(1).mean(1).tolist()]}
+            W = self._relmask_key_w(keep.device)
+            return {"fixed": True, "keep_per_bucket": [round(x, 4) for x in keep.float().flatten(1).mean(1).tolist()],
+                    "keyfrac_per_bucket": [round(x, 4) for x in (keep.float().flatten(1) * W).sum(1).tolist()]}
+        if self.relmask_budget == "per_bucket":
+            W = self._relmask_key_w(self.relmask_theta.device)
+            g, _, _ = self._relmask_pb_gate()
+            keep = self.relmask_hard_keep().flatten(1)
+            hk = self._relmask_pb_hard_keep(self.relmask_theta.detach().flatten(1), self._relmask_pb_rho_t(), W)
+            return {"step": int(self.relmask_steps), "rho_t": round(self._relmask_pb_rho_t(), 5),
+                    "T": round(self._relmask_pb_T(), 5), "hard": self._relmask_pb_hard_on(),
+                    "g_keyfrac_per_bucket": [round(x, 5) for x in (g * W).sum(1).tolist()],
+                    "hard_t_keyfrac_per_bucket": [round(x, 4) for x in (hk.float() * W).sum(1).tolist()],
+                    "theta_std": self.relmask_theta.detach().std().item(),
+                    "g_mid_frac": ((g > 0.1) & (g < 0.9)).float().mean().item(),
+                    "cells_per_bucket": keep.sum(1).tolist(),
+                    "keyfrac_per_bucket": [round(x, 4) for x in (keep.float() * W).sum(1).tolist()],
+                    "keep_hash": int((keep.flatten().long() * torch.arange(1, keep.numel() + 1,
+                                      device=keep.device)).sum().item())}
         keep = self.relmask_hard_keep()
         g = torch.sigmoid(self.relmask_theta)
         return {"step": int(self.relmask_steps), "rho_t": self._relmask_rho_t(),
@@ -1689,6 +1775,22 @@ class Aggregator(nn.Module):
             return (torch.where(keep, 0.0, self.CM_DROP).flatten(1).float(),
                     (~keep).flatten(1).float())
         th = self.relmask_theta
+        if self.relmask_budget == "per_bucket":
+            if not self.training and self.relmask_eval_mode == "hard":
+                keep = (self.relmask_keep_override if self.relmask_keep_override is not None
+                        else self.relmask_hard_keep()).to(device)
+                return (torch.where(keep, 0.0, self.CM_DROP).flatten(1).float(), (~keep).flatten(1).float())
+            g, _, z = self._relmask_pb_gate()
+            # logsigmoid, not log(sigmoid): at T ~ 0.05 sigmoid underflows to exactly 0 and
+            # log(0).clamp backprops 0 * inf = NaN, which makes GradScaler skip every step.
+            soft_lw, soft_dw = F.logsigmoid(z).clamp(min=-30.0), torch.sigmoid(-z)
+            if not (self.training and self._relmask_pb_hard_on()):
+                return soft_lw, soft_dw
+            h = self._relmask_pb_hard_keep(th.detach().flatten(1), self._relmask_pb_rho_t(),
+                                           self._relmask_key_w(th.device))
+            hard_lw = torch.where(h, 0.0, self.CM_DROP).to(g.dtype)
+            hard_dw = (~h).to(g.dtype)
+            return hard_lw + soft_lw - soft_lw.detach(), hard_dw + soft_dw - soft_dw.detach()
         soft_lw, soft_dw = F.logsigmoid(th), 1.0 - torch.sigmoid(th)
         hard = (not self.training and self.relmask_eval_mode == "hard") or \
                (self.training and self._relmask_st_on())
