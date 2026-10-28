@@ -56,6 +56,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                  relmask_st_frac=0.2, relmask_budget_S=64,
                  relmask_budget="shared", relmask_rho_steps=0, relmask_T_start=1.0, relmask_T_end=0.05,
                  relmask_T_steps=(0, 0), relmask_hard_from=0,
+                 # Gaussian spatio-temporal key mask (3-10): dict, see vggt/models/gaussmask.py
+                 gaussmask=None,
                  # LoRA on pretrained linears (vggt/layers/lora.py); rank 0 = off, model unchanged
                  lora_rank=0, lora_alpha=32.0,
                  lora_targets=("aggregator.global_blocks.@(8|9|1?|2[0-3]).attn.@(qkv|proj)",),
@@ -115,6 +117,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             relmask_budget=str(relmask_budget), relmask_rho_steps=int(relmask_rho_steps),
             relmask_T_start=float(relmask_T_start), relmask_T_end=float(relmask_T_end),
             relmask_T_steps=tuple(relmask_T_steps), relmask_hard_from=int(relmask_hard_from),
+            gaussmask=dict(gaussmask) if gaussmask is not None else None,
             temporal_share_frame_weights=temporal_share_frame_weights,
             rope_3d=rope_3d, rope_3d_dims=rope_3d_dims, rope_3d_zero_time=rope_3d_zero_time,
             rope_time=rope_time, rope_time_base=rope_time_base,

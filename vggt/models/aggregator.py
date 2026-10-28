@@ -220,6 +220,9 @@ class Aggregator(nn.Module):
         relmask_T_end: float = 0.05,
         relmask_T_steps=(0, 0),              # T = T_start before T_steps[0], linear to T_end at [1]
         relmask_hard_from: int = 0,          # per_bucket: straight-through hard mask from this step
+        # Gaussian spatio-temporal key mask (3-10; vggt/models/gaussmask.py). dict of GaussMask
+        # kwargs (enable, cone, rho, T_*, hard_from, init, fixed_path, start, grid, S_max) or None.
+        gaussmask: Optional[dict] = None,
     ):
         super().__init__()
 
@@ -644,6 +647,13 @@ class Aggregator(nn.Module):
                                   ("relmask_total_steps", torch.zeros((), dtype=torch.long))):
                     self.register_buffer(name, val, persistent=True)
 
+        self.gaussmask = None
+        if gaussmask is not None and (gaussmask.get("enable", False) or gaussmask.get("fixed_path")):
+            if self.enable_relmask or enable_colmask or enable_gate or enable_dual_stream \
+                    or enable_tokdino or enable_alt_stream:
+                raise ValueError("gaussmask excludes relmask / colmask / gate / dual_stream / tokdino / alt_stream")
+            self.gaussmask = self._build_gaussmask(gaussmask, depth)
+
         # Note: We have two camera tokens, one for the first frame and one for the rest
         # The same applies for register tokens
         self.camera_token = nn.Parameter(torch.randn(1, 2, 1, embed_dim))
@@ -846,6 +856,12 @@ class Aggregator(nn.Module):
                 rp = frame_pos.to(images.device).long()
             rel_idx = self._relmask_index(rp, P, images.device)
 
+        gm_tab = None
+        if self.gaussmask is not None and S > 1 and (self.training or self.gaussmask.eval_mode != "off"):
+            if S > self.gaussmask.S_max:
+                raise ValueError(f"gaussmask table covers S <= {self.gaussmask.S_max}, got S={S}")
+            gm_tab = self.gaussmask.tables(self.training)
+
         alt_z = None
         if self.enable_alt_stream and S > 1:
             alt_z = self._alt_stream_z(patch_tokens, B, S)
@@ -879,7 +895,7 @@ class Aggregator(nn.Module):
                         tokens, B, S, P, C, global_idx, pos=pos, gate_logits=gate_bias_source,
                         pair_log_delta=pair_log_delta, pair_warm=pair_warm,
                         tok_logd=tok_logd, tok_keep=tok_keep, tok_warm=tok_warm, alt_z=alt_z,
-                        rel_idx=rel_idx,
+                        rel_idx=rel_idx, gm_tab=gm_tab,
                     )
                 elif attn_type == "temporal":
                     # NEW: run a temporal block once every `temporal_every` aa-blocks.
@@ -1032,7 +1048,8 @@ class Aggregator(nn.Module):
 
     def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None, gate_logits=None,
                                   pair_log_delta=None, pair_warm=0.0,
-                                  tok_logd=None, tok_keep=None, tok_warm=0.0, alt_z=None, rel_idx=None):
+                                  tok_logd=None, tok_keep=None, tok_warm=0.0, alt_z=None, rel_idx=None,
+                                  gm_tab=None):
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
 
@@ -1112,6 +1129,19 @@ class Aggregator(nn.Module):
                     tokens = self._gated_global_block_forward(
                         self.global_blocks[global_idx], tokens, pos, gate_bias, B, S, self.patch_start_idx
                     )
+            elif gm_tab is not None and global_idx >= self.gaussmask.start:
+                tab = gm_tab[global_idx - self.gaussmask.start]
+                blk = self.global_blocks[global_idx]
+                _B, _S = B, S
+
+                def _gm_fn(t, p, tb):  # noqa: E306
+                    return self._gaussmask_global_block_forward(blk, t, p, tb, _B, _S)
+
+                if self.training:
+                    # table as a checkpoint ARGUMENT so its gradient survives recomputation
+                    tokens = checkpoint(_gm_fn, tokens, pos, tab, use_reentrant=self.use_reentrant)
+                else:
+                    tokens = _gm_fn(tokens, pos, tab)
             elif rel_idx is not None and global_idx >= self.relmask_start:
                 lw_tab, dw_tab = self._relmask_tables(tokens.device)
                 blk = self.global_blocks[global_idx]
@@ -1890,6 +1920,56 @@ class Aggregator(nn.Module):
         _score_mod = self._relmask_table_score_mod(table, P)
         # default flex tiles need >101 KB shared memory for this captured table (RTX 5090)
         attn_out = self._flex_attention(q, k, v, score_mod=_score_mod, kernel_options=self.RM_FLEX_OPTS)
+        attn_out = block.attn.proj_drop(block.attn.proj(attn_out.permute(0, 2, 1, 3).reshape(B, N, C_dim)))
+        tokens = tokens + block.ls1(attn_out)
+        return tokens + block.ls2(block.mlp(block.norm2(tokens)))
+
+    # ---- Gaussian spatio-temporal mask (3-10) ---------------------------------------------------
+    def _build_gaussmask(self, cfg, depth):
+        from vggt.models.gaussmask import GaussMask
+        cfg = dict(cfg)
+        start = int(cfg.get("start", 8))
+        return GaussMask(
+            n_layers=int(depth) - start, start=start, grid=tuple(cfg.get("grid", (30, 37))),
+            S_max=int(cfg.get("S_max", 64)), cone=bool(cfg.get("cone", False)),
+            rho=float(cfg.get("rho", 0.25)), T_start=float(cfg.get("T_start", 2.0)),
+            T_end=float(cfg.get("T_end", 0.1)), T_steps=tuple(cfg.get("T_steps", (0, 1100))),
+            hard_from=int(cfg.get("hard_from", 1100)),
+            init=dict(cfg["init"]) if cfg.get("init") is not None else None,
+            fixed_path=cfg.get("fixed_path"))
+
+    def set_gaussmask_fixed(self, path, start=8):
+        """Attach a FIXED Gaussian mask (json from GaussMask.export) to any model (eval)."""
+        self.gaussmask = self._build_gaussmask(dict(fixed_path=path, start=start), len(self.global_blocks)) \
+            .to(self.camera_token.device)
+
+    def _gaussmask_score_mod(self, tab, P):
+        """score_mod: patch-patch scores in different frames, key frame >= 1, get tab[displacement]."""
+        gm, psi, GW = self.gaussmask, self.patch_start_idx, self.gaussmask.GW
+
+        def _score_mod(score, b, h, q_idx, kv_idx):
+            fq, fk = q_idx // P, kv_idx // P
+            pq, pk = q_idx % P - psi, kv_idx % P - psi
+            keep = (fq == fk) | (fk == 0) | (pk < 0) | (pq < 0)
+            idx = gm.index(fq, fk, pq // GW, pq % GW, pk // GW, pk % GW)
+            idx = torch.where(keep, 0, idx)
+            return score + torch.where(keep, 0.0, tab[idx])
+        return _score_mod
+
+    def _gaussmask_global_block_forward(self, block, tokens, pos, tab, B, S):
+        N, C_dim = tokens.shape[1], tokens.shape[2]
+        P = N // S
+        assert P - self.patch_start_idx == self.gaussmask.GH * self.gaussmask.GW, \
+            f"gaussmask grid {self.gaussmask.GH}x{self.gaussmask.GW} != {P - self.patch_start_idx} patches"
+        H, D = block.attn.num_heads, block.attn.head_dim
+        x_norm = block.norm1(tokens)
+        q, k, v = block.attn.qkv(x_norm).reshape(B, N, 3, H, D).permute(2, 0, 3, 1, 4).unbind(0)
+        q, k = block.attn.q_norm(q), block.attn.k_norm(k)
+        if block.attn.rope is not None and pos is not None:
+            q, k = block.attn.rope(q, pos), block.attn.rope(k, pos)
+        assert (block.attn.attn_drop.p if self.training else 0.0) == 0.0
+        q, k = q.to(v.dtype), k.to(v.dtype)
+        attn_out = self._flex_attention(q, k, v, score_mod=self._gaussmask_score_mod(tab.float(), P))
         attn_out = block.attn.proj_drop(block.attn.proj(attn_out.permute(0, 2, 1, 3).reshape(B, N, C_dim)))
         tokens = tokens + block.ls1(attn_out)
         return tokens + block.ls2(block.mlp(block.norm2(tokens)))

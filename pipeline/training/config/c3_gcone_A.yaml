@@ -1,0 +1,9 @@
+# 3-10 stage A, cone: c3_gball_A with a learned per-layer v (sigma_y(ds) = sigma_y0 + v |ds|).
+# Written 2026-10-28.
+defaults:
+- c3_gball_A
+- _self_
+exp_name: c3_gcone_A
+model:
+  gaussmask:
+    cone: true
