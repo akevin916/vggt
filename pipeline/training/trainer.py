@@ -203,28 +203,11 @@ class Trainer:
             self._load_resuming_checkpoint(get_resume_checkpoint(self.checkpoint_conf.save_dir))
         elif self.checkpoint_conf.resume_checkpoint_path is not None:
             # warm_start_weights_only: take the model weights and nothing else. Needed when the
-            # warm start is another run's TRAINER checkpoint (colmask on tfs): its optimizer
+            # warm start is another run's TRAINER checkpoint (a mask on tfs): its optimizer
             # state belongs to other parameters and its epoch counter would end this run at once.
             self._load_resuming_checkpoint(
                 self.checkpoint_conf.resume_checkpoint_path,
                 weights_only=bool(getattr(self.checkpoint_conf, "warm_start_weights_only", False)))
-
-        # Column mask: the budget schedule's length is this run's optimizer-step count. Set
-        # after any checkpoint load (the buffer travels with the ckpt; the config is the truth).
-        # `logging` is the logging-config argument inside __init__, not the module
-        import logging as _std_logging
-        cm = self._colmask_module()
-        for kind in ("colmask", "relmask"):
-            if cm is None or getattr(cm, f"{kind}_theta", None) is None:
-                if cm is not None and getattr(cm, f"enable_{kind}", False):
-                    _std_logging.info(f"{kind}: FIXED mask {getattr(cm, f'{kind}_stats')()}")
-                continue
-            if not self.limit_train_batches:
-                raise ValueError(f"{kind} runs need limit_train_batches (it sets the budget schedule)")
-            getattr(cm, f"{kind}_total_steps").fill_(
-                int(self.max_epochs) * int(self.limit_train_batches) // int(self.accum_steps))
-            _std_logging.info(f"{kind}: total_steps={int(getattr(cm, f'{kind}_total_steps'))} "
-                              f"{getattr(cm, f'{kind}_stats')()}")
 
         # Wrap the model with DDP
         self._setup_ddp_distributed_training(distributed, device)
@@ -995,15 +978,6 @@ class Trainer:
                 self.scaler.step(optim.optimizer)
             self.scaler.update()
 
-            cm = self._colmask_module()
-            if cm is not None:
-                for kind in ("colmask", "relmask"):
-                    if getattr(cm, f"{kind}_theta", None) is None:
-                        continue
-                    getattr(cm, f"{kind}_post_step_")()
-                    n = int(getattr(cm, f"{kind}_steps"))
-                    if n % 100 == 0 or n == 1:
-                        logging.info(f"{kind} {getattr(cm, f'{kind}_stats')()}")
             gm = self._gaussmask_module()
             if gm is not None:
                 gm.post_step_()
@@ -1156,14 +1130,6 @@ class Trainer:
 
         self.steps[phase] += 1
         return loss_dict, y_hat
-
-    def _colmask_module(self):
-        """The aggregator, if this run has a column or frame-distance mask; else None."""
-        model = self.model.module if isinstance(
-            self.model, torch.nn.parallel.DistributedDataParallel
-        ) else self.model
-        agg = getattr(model, "aggregator", None)
-        return agg if (getattr(agg, "enable_colmask", False) or getattr(agg, "enable_relmask", False)) else None
 
     def _gaussmask_module(self):
         """The aggregator's TRAINABLE Gaussian mask (3-10), else None."""

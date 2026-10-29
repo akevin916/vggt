@@ -4,17 +4,29 @@
 # Decision 2026-10-28 (option C): S=48 contiguous (S=64 OOMs), 500 steps instead of the spec's
 # 1500 -- the table-lookup flex backward costs ~4.3 s per layer at S=48. Schedule scaled 1/3:
 # T 2 -> 0.1 over steps 0-367, straight-through hard boundary from step 367; convergence check =
-# last 100 steps. Same setup as c3_pos_b25_A otherwise (tfs_abs warm start, lr 0.02, 518x420).
-# Written 2026-10-28.
+# last 100 steps. tfs_abs warm start, lr 0.02, 518x420, contiguous stride-1 clips.
+# Written 2026-10-28. Flattened 2026-10-29 when relmask / colmask left slim: it used to inherit
+# c3_pos_b25_A -> c3_reltile_b25_A -> scared_cam_depth_tfs_fpos_seed43_colmask_r25 (all removed);
+# every setting it took from them is written out below, nothing else changed.
 defaults:
-- c3_pos_b25_A
+- scared_cam_depth_tfs_fpos_seed43
 - _self_
+
 exp_name: c3_gball_A
+
+max_img_per_gpu: 48
 max_epochs: 1
 limit_train_batches: 500
-max_img_per_gpu: 48
+limit_val_batches: 20
+
+checkpoint:
+  resume_checkpoint_path: checkpoints/scared_tfs_abs/epoch_10.pt
+  warm_start_weights_only: true
+  strict: false
+  save_steps_freq: 100   # rolling last.pt every 100 steps: the host drops GPUs (Xid 79), resume with --resume
+
 model:
-  enable_relmask: false
+  head_grad_checkpoint: true   # gradients cross the frozen depth head; its activations scale with S
   gaussmask:
     enable: true
     cone: false
@@ -27,10 +39,68 @@ model:
     T_steps: [0, 367]
     hard_from: 367
     init: {sigma_s: 8.0, sigma_y: 6.0, sigma_x: 6.0, v: 0.0}
+
+# Sampling: contiguous stride-1 clips of S frames at the test crop (518x420 -> 30x37 patches);
+# the aspect augmentation is pinned to 0.82 (518*0.82 -> 420), the other train augs are tfs's.
+data:
+  train:
+    common_config:
+      img_nums: [ "${max_img_per_gpu}", "${max_img_per_gpu}" ]
+      max_img_per_gpu: ${max_img_per_gpu}
+      augs:
+        aspects: [0.82, 0.82]
+    dataset:
+      dataset_configs:
+      - _target_: pipeline.data.datasets.scared.ScaredDataset
+        split: train
+        SCARED_DIR: data/train/scared
+        len_train: 6000
+        depth_max: 655.35
+        dynamic_source: none
+        contiguous_stride: 1
+  val:
+    common_config:
+      img_nums: [ "${max_img_per_gpu}", "${max_img_per_gpu}" ]
+      augs:
+        aspects: [0.82, 0.82]
+    dataset:
+      dataset_configs:
+      - _target_: pipeline.data.datasets.scared.ScaredDataset
+        split: val
+        SCARED_DIR: data/train/scared
+        dynamic_source: none
+        contiguous_stride: 1
+
 optim:
+  # Freeze by SUBMODULE, never '*': a frozen module is locked in eval mode, and the aggregator
+  # must stay in train mode (gradient checkpointing + the soft-mask training forward).
+  frozen_module_names:
+  - '*aggregator.patch_embed*'
+  - '*aggregator.frame_blocks*'
+  - '*aggregator.global_blocks*'
+  - '*aggregator.temporal_blocks*'
+  - '*camera_head*'
+  - '*depth_head*'
+  frozen_param_names:
+  - aggregator.camera_token
+  - aggregator.register_token
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 2.0e-02
+    weight_decay: 0.0    # decay would pull the log-sigmas toward 0, i.e. sigma toward 1
+    eps: 1.0e-12
   gradient_clip:
     configs:
     - module_name:
       - aggregator.gaussmask
       max_norm: null
       norm_type: 2
+  options:
+    lr:
+    - scheduler:
+        _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+        value: 2.0e-02
+    weight_decay:
+    - scheduler:
+        _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+        value: 0.0

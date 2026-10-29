@@ -117,12 +117,10 @@ def protocol_tag(args) -> str:
             tag += f"_{args.depth_protocol}"
     if args.n_frames > 0:
         tag += f"_{args.n_frames}f"
-    for _f, _t in (("colmask", "cm"), ("relmask", "rm"), ("gaussmask", "gm")):
-        if getattr(args, _f, None):
-            tag += f"_{_t}-" + os.path.splitext(os.path.basename(getattr(args, _f)))[0]
-    cm = getattr(args, "colmask_mode", "hard")
-    if cm != "hard":
-        tag += f"_cm{cm}" + (f"{args.colmask_seed}" if cm == "random" else "")
+    if getattr(args, "frame_pos", False):
+        tag += "_fpos"
+    if getattr(args, "gaussmask", None):
+        tag += "_gm-" + os.path.splitext(os.path.basename(args.gaussmask))[0]
     if args.img_size != 518:
         tag += f"_img{args.img_size}"
     return tag
@@ -205,26 +203,9 @@ def eval_ckpt(ckpt, root, split, seqs, args, model=None):
     if owns_model:
         model = load_vggt_for_eval(ckpt, device=args.device)
     agg = model.aggregator
-    if getattr(args, "colmask", None):
-        # fixed D1 mask from file (3-4 ckpts carry no mask; also tfs + mask for the step-0 check)
-        agg.set_colmask_fixed(np.load(args.colmask), diag=args.colmask_diag, mean=args.colmask_mean)
-        print(f"colmask file {args.colmask}: keep {agg.colmask_fixed.float().mean().item():.4f} "
-              f"diag={args.colmask_diag} mean={args.colmask_mean}")
-    if getattr(args, "relmask", None):
-        agg.set_relmask_fixed(np.load(args.relmask), buckets=args.relmask_buckets)
-        print(f"relmask file {args.relmask}: {agg.relmask_stats()}")
     if getattr(args, "gaussmask", None):
         agg.set_gaussmask_fixed(args.gaussmask)
         print(f"gaussmask file {args.gaussmask}: {agg.gaussmask.stats()}")
-    cm_mode = getattr(args, "colmask_mode", "hard")
-    if getattr(agg, "enable_colmask", False):
-        # random = the learned mask's per-layer keep counts at random positions (the control)
-        agg.colmask_eval_mode = "hard" if cm_mode == "random" else cm_mode
-        agg.colmask_keep_override = (agg.colmask_random_keep(args.colmask_seed)
-                                     if cm_mode == "random" else None)
-        print(f"colmask eval mode: {cm_mode}")
-    elif cm_mode != "hard":
-        raise SystemExit(f"--colmask_mode {cm_mode} given but {ckpt} has no column mask")
     fids_all = {}
     per_seq_pose, per_seq_depth = {}, {}
     failed = []
@@ -239,6 +220,9 @@ def eval_ckpt(ckpt, root, split, seqs, args, model=None):
             # meaningless number instead of failing. Gate it on the frames actually selected.
             sel_fids = np.array([int(os.path.basename(p)[:-4]) for p in paths])
             contiguous = bool(len(sel_fids) > 1 and np.all(np.diff(sel_fids) == 1))
+            # --frame_pos: give the temporal blocks the real frame numbers (offsets from the
+            # first frame of each pass) instead of 0..S-1; differs only on non-contiguous frames.
+            fpos = sel_fids if getattr(args, "frame_pos", False) else None
 
             chunk = int(getattr(args, "chunk_size", 0) or 0)
             if getattr(args, "single_view", False):
@@ -275,7 +259,8 @@ def eval_ckpt(ckpt, root, split, seqs, args, model=None):
                 pred = {}
                 for st in starts:
                     sub = slice(st, min(st + chunk, len(paths)))
-                    pr = infer_sequence(model, paths[sub], device=args.device)
+                    pr = infer_sequence(model, paths[sub], device=args.device,
+                                        frame_pos=None if fpos is None else fpos[sub])
                     parts.append((st, pr["extrinsic"]))
                     if "depth" in pr:
                         # Depth is per-frame, so chunking is harmless -- but take each frame
@@ -293,7 +278,7 @@ def eval_ckpt(ckpt, root, split, seqs, args, model=None):
                 per_seq_pose[seq]["n_chunks"] = len(starts)
                 per_seq_pose[seq]["full_seq_ate_reported"] = False
             else:
-                pred = infer_sequence(model, paths, device=args.device)
+                pred = infer_sequence(model, paths, device=args.device, frame_pos=fpos)
                 per_seq_pose[seq] = eval_pose_metrics(pred["extrinsic"], gt_tum, gt_ts)
                 if contiguous:
                     per_seq_pose[seq].update(snippet_pose_metrics(pred["extrinsic"], gt_E))
@@ -375,10 +360,6 @@ def evaluate(args, model=None):
                              chunk_size=getattr(args, "chunk_size", 0),
                              overlap=getattr(args, "overlap", None),
                              single_view=bool(getattr(args, "single_view", False)),
-                             colmask_mode=getattr(args, "colmask_mode", "hard"),
-                             colmask_seed=getattr(args, "colmask_seed", 0),
-                             colmask_file=getattr(args, "colmask", None),
-                             relmask_file=getattr(args, "relmask", None),
                              gaussmask_file=getattr(args, "gaussmask", None),
                              timestamp=datetime.now().isoformat(timespec="seconds")),
                    results=results)
@@ -412,20 +393,13 @@ def main():
                     help="mm (SCARED p99.9 <= 165). Default: 200 for monst3r, 150 for afsfm")
     ap.add_argument("--depth_protocol", default="monst3r", choices=["monst3r", "afsfm"],
                     help="afsfm = AF-SfMLearner SCARED protocol (per-frame median, <=150mm)")
+    ap.add_argument("--frame_pos", action="store_true",
+                    help="pass real frame numbers to the temporal blocks (default: treat frames as contiguous)")
     ap.add_argument("--single_view", action="store_true",
                     help="predict each frame from ONE image (S=1), the monocular setting the "
                          "published SCARED depth tables use. Depth only; pose is skipped.")
     ap.add_argument("--no_depth", action="store_true")
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--colmask_mode", default="hard", choices=["hard", "soft", "off", "random"],
-                    help="column-mask ckpts only: hard = top-k at rho* (default); soft = sigmoid "
-                         "weights; off = mask removed; random = same per-layer counts, random positions")
-    ap.add_argument("--colmask_seed", type=int, default=0, help="seed for --colmask_mode random")
-    ap.add_argument("--colmask", default=None, help="FIXED column mask .npy bool [24, 1110] (3-4)")
-    ap.add_argument("--colmask_mean", action="store_true", help="with --colmask: mean token (count weight)")
-    ap.add_argument("--colmask_diag", action="store_true", help="with --colmask: own key never masked")
-    ap.add_argument("--relmask", default=None, help="FIXED frame-distance tile mask .npy bool [6, 8, 8] (3-3)")
-    ap.add_argument("--relmask_buckets", type=int, nargs="+", default=[1, 2, 4, 8, 16])
     ap.add_argument("--gaussmask", default=None, help="FIXED Gaussian spatio-temporal mask json (3-10)")
     ap.add_argument("--img_size", type=int, default=518)
     ap.add_argument("--out_dir", default=None)

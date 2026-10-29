@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-DROP = -1.0e4   # finite stand-in for log 0 (same as Aggregator.CM_DROP)
+DROP = -1.0e4   # finite stand-in for log 0 (kept keys get the Gaussian bias, dropped ones this)
 
 
 class GaussMask(nn.Module):

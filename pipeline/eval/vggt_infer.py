@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Sequence, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -31,6 +31,9 @@ _REMOVED_FEATURE_KEYS = {
     "time-phase RoPE": ("aggregator.rope_t.", "aggregator.rope_time_base"),
     "shared temporal weights": ("aggregator.temporal_ls.",),
     "illu token": ("aggregator.illu_token", "illu_head."),
+    # removed 2026-10-29: only the Gaussian mask (3-10) stays in slim
+    "colmask": ("aggregator.colmask_",),
+    "relmask": ("aggregator.relmask_",),
 }
 
 
@@ -44,8 +47,8 @@ def load_vggt_for_eval(
     """Build VGGT with architecture inferred from checkpoint keys.
 
     Each head/block family is detected independently from its own key prefix: temporal blocks,
-    depth/point heads, learned colmask, learned relmask. A fixed relmask/colmask (.npy) carries no
-    weights and is set on the built model by the caller (set_relmask_fixed / set_colmask_fixed).
+    depth/point heads. The Gaussian mask is NOT rebuilt here: a learned one is exported to json and
+    attached by the caller (Aggregator.set_gaussmask_fixed, eval_scared --gaussmask).
     """
     sd = _load_state_dict(ckpt)
     keys = list(sd.keys())
@@ -55,25 +58,12 @@ def load_vggt_for_eval(
         found.append("LoRA")
     if found:
         raise SystemExit(f"{ckpt} uses features removed from this build: {found}. "
-                         "Evaluate it from tag archive-pre-slim (or p3-cross-gate / mask-grid-wip for gate).")
+                         "Evaluate it from tag archive-pre-slim or branch illu-vggt (or p3-cross-gate / mask-grid-wip for gate).")
     has_temporal = any("temporal" in k for k in keys)
     has_depth = any(k.startswith("depth_head") for k in keys)
     # force_point: build the point head even when the checkpoint has none. The head is then
     # random-init and only useful once real weights are grafted in -- see graft_point_head.
     has_point = any(k.startswith("point_head") for k in keys) or force_point
-
-    # Learned column mask (D1): grid shape and the mean-token mode decide what gets BUILT, so they
-    # come from the checkpoint's buffers before construction (load_state_dict then sets the rest).
-    has_colmask = "aggregator.colmask_theta" in sd
-    cm_kw = {}
-    if has_colmask:
-        cm_kw = dict(enable_colmask=True,
-                     colmask_grid=tuple(int(x) for x in sd["aggregator.colmask_grid"]),
-                     colmask_mean={0: "none", 1: "one", 2: "count"}[int(sd["aggregator.colmask_mean_id"])])
-
-    # Frame-distance tile mask, stage A (learned theta): rebuild it, or the theta is silently dropped.
-    if "aggregator.relmask_theta" in sd:
-        cm_kw = dict(cm_kw, enable_relmask=True)
 
     model = VGGT(
         img_size=img_size,
@@ -82,12 +72,12 @@ def load_vggt_for_eval(
         enable_point=has_point,
         enable_track=False,
         enable_temporal=has_temporal,
-        **cm_kw,
     )
     miss, unexp = model.load_state_dict(sd, strict=False)
-    if verbose and has_colmask:
-        print(f"colmask ON: {model.aggregator.colmask_stats()} diag={int(model.aggregator.colmask_diag)} "
-              f"mean={cm_kw['colmask_mean']} (eval mode defaults to 'hard' top-k at rho*)")
+    if any(k.startswith("aggregator.gaussmask.") for k in keys):
+        print(f"WARNING: {ckpt} carries a learned Gaussian mask (aggregator.gaussmask.*) that this "
+              "loader drops; pass its exported json (eval_scared --gaussmask) or the model runs "
+              "WITHOUT the mask.")
     if verbose:
         print(f"loaded {ckpt}: missing={len(miss)} unexpected={len(unexp)}")
     return model.to(device).eval()
@@ -128,8 +118,12 @@ def infer_sequence(
     dtype: Optional[torch.dtype] = None,
     want_point: bool = False,
     images: Optional[torch.Tensor] = None,
+    frame_pos: Optional[Sequence[int]] = None,
 ) -> Dict[str, np.ndarray]:
     """Run VGGT on one sequence.
+
+    ``frame_pos`` (length S) is each frame's index in its source sequence; only the temporal
+    blocks read it (offset from the first frame). None = treat the frames as contiguous.
 
     ``want_point`` opts in to returning the point head's ``world_points`` /
     ``world_points_conf``. It is off by default because those are [S,H,W,3] fp32
@@ -151,7 +145,9 @@ def infer_sequence(
         images = images.unsqueeze(0)
 
     with torch.cuda.amp.autocast(dtype=dtype, enabled=(device == "cuda")):
-        pred = model(images=images)
+        fp = None if frame_pos is None else torch.as_tensor(np.asarray(frame_pos), dtype=torch.long,
+                                                            device=images.device).view(1, -1)
+        pred = model(images=images, frame_pos=fp)
 
     h, w = images.shape[-2], images.shape[-1]
     extrinsic, intrinsic = pose_encoding_to_extri_intri(pred["pose_enc"], image_size_hw=(h, w))
