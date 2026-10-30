@@ -121,6 +121,12 @@ def protocol_tag(args) -> str:
         tag += f"_gate{args.gate_mode}"
     if getattr(args, "key_mask", None):
         tag += f"_km{args.key_mask}_s{args.key_mask_start}"
+    for _f, _t in (("colmask", "cm"), ("relmask", "rm"), ("gaussmask", "gm")):
+        if getattr(args, _f, None):
+            tag += f"_{_t}-" + os.path.splitext(os.path.basename(getattr(args, _f)))[0]
+    cm = getattr(args, "colmask_mode", "hard")
+    if cm != "hard":
+        tag += f"_cm{cm}" + (f"{args.colmask_seed}" if cm == "random" else "")
     if args.img_size != 518:
         tag += f"_img{args.img_size}"
     return tag
@@ -226,6 +232,27 @@ def eval_ckpt(ckpt, root, split, seqs, args, model=None):
         model = load_vggt_for_eval(ckpt, device=args.device)
     if getattr(args, "key_mask", None):
         model.aggregator.key_mask_start = int(getattr(args, "key_mask_start", 8))
+    agg = model.aggregator
+    if getattr(args, "colmask", None):
+        # fixed D1 mask from file (3-4 ckpts carry no mask; also tfs + mask for the step-0 check)
+        agg.set_colmask_fixed(np.load(args.colmask), diag=args.colmask_diag, mean=args.colmask_mean)
+        print(f"colmask file {args.colmask}: keep {agg.colmask_fixed.float().mean().item():.4f} "
+              f"diag={args.colmask_diag} mean={args.colmask_mean}")
+    if getattr(args, "relmask", None):
+        agg.set_relmask_fixed(np.load(args.relmask), buckets=args.relmask_buckets)
+        print(f"relmask file {args.relmask}: {agg.relmask_stats()}")
+    if getattr(args, "gaussmask", None):
+        agg.set_gaussmask_fixed(args.gaussmask)
+        print(f"gaussmask file {args.gaussmask}: {agg.gaussmask.stats()}")
+    cm_mode = getattr(args, "colmask_mode", "hard")
+    if getattr(agg, "enable_colmask", False):
+        # random = the learned mask's per-layer keep counts at random positions (the control)
+        agg.colmask_eval_mode = "hard" if cm_mode == "random" else cm_mode
+        agg.colmask_keep_override = (agg.colmask_random_keep(args.colmask_seed)
+                                     if cm_mode == "random" else None)
+        print(f"colmask eval mode: {cm_mode}")
+    elif cm_mode != "hard":
+        raise SystemExit(f"--colmask_mode {cm_mode} given but {ckpt} has no column mask")
     fids_all = {}
     per_seq_pose, per_seq_depth = {}, {}
     failed = []
@@ -408,6 +435,11 @@ def evaluate(args, model=None):
                              key_mask=getattr(args, "key_mask", None),
                              key_mask_start=getattr(args, "key_mask_start", None),
                              fid_step=getattr(args, "fid_step", 1),
+                             colmask_mode=getattr(args, "colmask_mode", "hard"),
+                             colmask_seed=getattr(args, "colmask_seed", 0),
+                             colmask_file=getattr(args, "colmask", None),
+                             relmask_file=getattr(args, "relmask", None),
+                             gaussmask_file=getattr(args, "gaussmask", None),
                              timestamp=datetime.now().isoformat(timespec="seconds")),
                    results=results)
     with open(os.path.join(args.out_dir, "results.json"), "w") as f:
@@ -450,6 +482,16 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--gate_mode", default="predicted", choices=["predicted", "off"],
                     help="'off' feeds zero gate logits, which makes the attention bias exactly 0")
+    ap.add_argument("--colmask_mode", default="hard", choices=["hard", "soft", "off", "random"],
+                    help="column-mask ckpts only: hard = top-k at rho* (default); soft = sigmoid "
+                         "weights; off = mask removed; random = same per-layer counts, random positions")
+    ap.add_argument("--colmask_seed", type=int, default=0, help="seed for --colmask_mode random")
+    ap.add_argument("--colmask", default=None, help="FIXED column mask .npy bool [24, 1110] (3-4)")
+    ap.add_argument("--colmask_mean", action="store_true", help="with --colmask: mean token (count weight)")
+    ap.add_argument("--colmask_diag", action="store_true", help="with --colmask: own key never masked")
+    ap.add_argument("--relmask", default=None, help="FIXED frame-distance tile mask .npy bool [6, 8, 8] (3-3)")
+    ap.add_argument("--relmask_buckets", type=int, nargs="+", default=[1, 2, 4, 8, 16])
+    ap.add_argument("--gaussmask", default=None, help="FIXED Gaussian spatio-temporal mask json (3-10)")
     ap.add_argument("--img_size", type=int, default=518)
     ap.add_argument("--key_mask", default=None, choices=["inst", "random"],
                     help="方向 3: hide instrument (or size-matched random) patches of other frames "

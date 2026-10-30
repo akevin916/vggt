@@ -237,11 +237,33 @@ class Trainer:
         if self.resume_flag:
             self._load_resuming_checkpoint(get_resume_checkpoint(self.checkpoint_conf.save_dir))
         elif self.checkpoint_conf.resume_checkpoint_path is not None:
-            self._load_resuming_checkpoint(self.checkpoint_conf.resume_checkpoint_path)
+            # warm_start_weights_only: take the model weights and nothing else. Needed when the
+            # warm start is another run's TRAINER checkpoint (colmask on tfs): its optimizer
+            # state belongs to other parameters and its epoch counter would end this run at once.
+            self._load_resuming_checkpoint(
+                self.checkpoint_conf.resume_checkpoint_path,
+                weights_only=bool(getattr(self.checkpoint_conf, "warm_start_weights_only", False)))
             # Warm start ONLY -- never on --resume, where it would wipe the run's own progress
             # every time it restarts.
             if getattr(self.checkpoint_conf, "reset_gate_head", False):
                 self._reset_gate_head()
+
+        # Column mask: the budget schedule's length is this run's optimizer-step count. Set
+        # after any checkpoint load (the buffer travels with the ckpt; the config is the truth).
+        # `logging` is the logging-config argument inside __init__, not the module
+        import logging as _std_logging
+        cm = self._colmask_module()
+        for kind in ("colmask", "relmask"):
+            if cm is None or getattr(cm, f"{kind}_theta", None) is None:
+                if cm is not None and getattr(cm, f"enable_{kind}", False):
+                    _std_logging.info(f"{kind}: FIXED mask {getattr(cm, f'{kind}_stats')()}")
+                continue
+            if not self.limit_train_batches:
+                raise ValueError(f"{kind} runs need limit_train_batches (it sets the budget schedule)")
+            getattr(cm, f"{kind}_total_steps").fill_(
+                int(self.max_epochs) * int(self.limit_train_batches) // int(self.accum_steps))
+            _std_logging.info(f"{kind}: total_steps={int(getattr(cm, f'{kind}_total_steps'))} "
+                              f"{getattr(cm, f'{kind}_stats')()}")
 
         # Wrap the model with DDP
         self._setup_ddp_distributed_training(distributed, device)
@@ -313,7 +335,7 @@ class Trainer:
             )
         logging.info("Reset gate_predictor output layer to zero (g == 0 for every patch).")
 
-    def _load_resuming_checkpoint(self, ckpt_path: str):
+    def _load_resuming_checkpoint(self, ckpt_path: str, weights_only: bool = False):
         """Loads a checkpoint from the given path to resume training."""
         logging.info(f"Resuming training from {ckpt_path} (rank {self.rank})")
 
@@ -327,6 +349,9 @@ class Trainer:
         )
         if self.rank == 0:
             logging.info(f"Model state loaded. Missing keys: {missing or 'None'}. Unexpected keys: {unexpected or 'None'}.")
+        if weights_only:
+            logging.info("warm_start_weights_only: optimizer / epoch / steps / scaler NOT loaded")
+            return
 
         # Load optimizer state if available and in training mode
         if "optimizer" in checkpoint:
@@ -417,6 +442,20 @@ class Trainer:
                 f"[Done] Freezing {frozen_count} individual params matching: "
                 f"{list(self.optim_conf.frozen_param_names)} on rank {self.distributed_rank}"
             )
+
+        # Re-enable params by substring AFTER the freezes above, for params that live inside a
+        # frozen module (LoRA: freeze global_blocks whole, then train only its "lora_" params).
+        if getattr(self.optim_conf, "trainable_param_names", None):
+            n = 0
+            for name, param in self.model.named_parameters():
+                if any(pat in name for pat in self.optim_conf.trainable_param_names):
+                    param.requires_grad = True
+                    n += 1
+            if n == 0:
+                raise ValueError(f"trainable_param_names matched nothing: "
+                                 f"{list(self.optim_conf.trainable_param_names)}")
+            logging.info(f"[Done] Re-enabled {n} params matching "
+                         f"{list(self.optim_conf.trainable_param_names)}")
 
         # Log model summary on rank 0
         if self.rank == 0:
@@ -1070,6 +1109,21 @@ class Trainer:
                 # epoch boundary to find out wastes the epoch.
                 if self.epoch == 0 and int(agg.dual_stream_steps) in (100, 300, 600, 1000):
                     self._log_dual_stream()
+            cm = self._colmask_module()
+            if cm is not None:
+                for kind in ("colmask", "relmask"):
+                    if getattr(cm, f"{kind}_theta", None) is None:
+                        continue
+                    getattr(cm, f"{kind}_post_step_")()
+                    n = int(getattr(cm, f"{kind}_steps"))
+                    if n % 100 == 0 or n == 1:
+                        logging.info(f"{kind} {getattr(cm, f'{kind}_stats')()}")
+            gm = self._gaussmask_module()
+            if gm is not None:
+                gm.post_step_()
+                n = int(gm.steps)
+                if n % 50 == 0 or n == 1:
+                    logging.info(f"gaussmask {gm.stats()}")
             tok = self._tokdino_module()
             if tok is not None:
                 tok.tokdino_post_step_()
@@ -1338,6 +1392,22 @@ class Trainer:
         ) else self.model
         agg = getattr(model, "aggregator", None)
         return agg if getattr(agg, "enable_dual_stream", False) else None
+
+    def _colmask_module(self):
+        """The aggregator, if this run has a column or frame-distance mask; else None."""
+        model = self.model.module if isinstance(
+            self.model, torch.nn.parallel.DistributedDataParallel
+        ) else self.model
+        agg = getattr(model, "aggregator", None)
+        return agg if (getattr(agg, "enable_colmask", False) or getattr(agg, "enable_relmask", False)) else None
+
+    def _gaussmask_module(self):
+        """The aggregator's TRAINABLE Gaussian mask (3-10), else None."""
+        model = self.model.module if isinstance(
+            self.model, torch.nn.parallel.DistributedDataParallel
+        ) else self.model
+        gm = getattr(getattr(model, "aggregator", None), "gaussmask", None)
+        return gm if (gm is not None and not gm.fixed) else None
 
     def _tokdino_module(self):
         """The aggregator, if this run has the per-token DINO band (tokdino); else None."""

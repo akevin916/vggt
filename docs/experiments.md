@@ -1,8 +1,8 @@
 # 實驗登記表
 
 > **建立 2026-08-31。每個跑過的 run 一列：身分、下場、以及失敗的話病因是什麼。**
-> 這裡不放完整數字表（那在 [results/natural.md](results/natural.md) / [results/medical.md](results/medical.md)），
-> 也不下跨 run 的結論（那在 [status.md](status.md)）。這份回答的是
+> 這裡不放完整數字表（那在 [archive/results/natural.md](archive/results/natural.md) / [results/scared.md](results/scared.md)），
+> 也不下跨 run 的結論（那在 [README.md](README.md)）。這份回答的是
 > **「這個 ckpt 是誰、從哪來、能不能用」**。
 >
 > checkpoint 的舊名對照與已刪除清單見 [archive/checkpoints.md](checkpoints.md)。
@@ -31,7 +31,7 @@ warm-start 鏈：`VGGT-1B` → `inst_gate_init` → `inst_g` → `inst_gts`。
 | **`inst_gts`（run 2）** | `inst_gts` | `inst_g` best | 同上 | **`epoch_30`** | **0.1343** | ✅ 完成。**目前自然場景最佳**，但因子未拆 |
 | `inst_g_hard` | `inst_g_hard` | `inst_gate_init` | 只跑 3 ep | `epoch_2` | 0.1641 | ⚪ null result（見 §6.1） |
 | `inst_gts_photo`（run 3） | `inst_g_photo` | `inst_g` | — | `epoch_10` | 0.1583 | ❌ 負結果（見 §6.2） |
-| `inst_gts_egoflow` 系（4 個 run） | `inst_gts_egoflow*` | `inst_gts` | 20 ep | — | 0.1325–0.1346 | ❌ 陰性收束，見 [ego_flow.md](topics/ego_flow.md) |
+| `inst_gts_egoflow` 系（4 個 run） | `inst_gts_egoflow*` | `inst_gts` | 20 ep | — | 0.1325–0.1346 | ❌ 陰性收束，見 [ego_flow.md](archive/topics/ego_flow.md) |
 | `inst_gtsp_buginit`（run 4 舊版） | — | **buggy-init** | 48 ep | — | 0.1743 | ❌ lineage 汙染，已棄（見 §6.3） |
 | `inst_g_buggy` | — | — | — | — | — | 🔒 刻意保留作 bug 世代對照 |
 
@@ -52,7 +52,7 @@ ep30 後平台化在 0.134–0.136。ep40 的 ATE 看似平手但 ATE(12) 差 19
 | 產出 | 內容 |
 |---|---|
 | `outputs/gate_quality/inst_gts/quality_f50.json` | macro AUC 0.844 / F1 0.177；micro AUC 0.823 / F1 0.228；calibration 顯示欠自信 |
-| `outputs/gate_bias_ablation/inst_gts/baseline/` | off / predicted / oracle / hard@τ / top-k 的 ATE（見 [status.md](status.md) A.2） |
+| `outputs/gate_bias_ablation/inst_gts/baseline/` | off / predicted / oracle / hard@τ / top-k 的 ATE（見 [archive/status.md](archive/status.md) A.2） |
 | `outputs/gate_bias_ablation/inst_gts/leaky1.0/` | `gate_leaky=1.0` 變體 |
 | `outputs/gate_bias_ablation/inst_gts/zero_ref/` | `gate_bias_zero_ref=True` 變體 |
 
@@ -75,7 +75,7 @@ train = keyframe1/2、val = keyframe3、test = keyframe4。`val ATE` = channel B
 | **`wide`（arm 3）** | `..._wide` | 唯一 delta：`nearby_expand_range: 120` | **0.8150** / 0.8240 | ✅ 完成。**val ATE 與 depth 多張最佳** |
 | `depth` | `..._depth` | `loss.depth` 開 + `depth_head` 解凍 | 0.8566 / 0.9246 | ❌ **負結果**（見 §6.4） |
 | `depth_lowalpha` | `..._depth_lowalpha` | 同上但 `alpha: 0.2 → 0.02` | — | ⬜ **尚未跑** |
-| **Colon版** | `scared_selfsup_ca3` | **無 GT 監督**（`camera: null`）：photometric + ColonAdapter 式光流跨幀 3D 一致性、光流遮擋遮罩、conf 加權；warm start `VGGT-1B`、`depth_head` 解凍 | 1.8062（best） | ✅ 完成。自監督線代表版，test 數字見 [results/medical.md](results/medical.md) §1 |
+| **Colon版** | `scared_selfsup_ca3` | **無 GT 監督**（`camera: null`）：photometric + ColonAdapter 式光流跨幀 3D 一致性、光流遮擋遮罩、conf 加權；warm start `VGGT-1B`、`depth_head` 解凍 | 1.8062（best） | ✅ 完成。自監督線代表版，test 數字見 [results/scared.md](results/scared.md) §3 |
 
 **逐 epoch val ATE**（channel B，full-seq SCARED）：
 
@@ -89,10 +89,10 @@ train = keyframe1/2、val = keyframe3、test = keyframe4。`val ATE` = channel B
 | `depth` | 1.3271 | 1.1123 | 1.0902 | 0.9514 | 1.1050 | 0.9805 | **0.8566** | 0.9064 | 0.9352 | 0.9246 |
 
 > ⚠️ **選 ckpt 的指標與 test 不一致**：`wide` 的 val ATE 最好（0.8150）但 test pose 較差
-> （0.0705 vs `smooth_temporal` 的 0.0597）。這件事沒解決，見 [status.md](status.md) B.2。
+> （0.0705 vs `smooth_temporal` 的 0.0597）。這件事沒解決，見 [archive/status.md](archive/status.md) B.2。
 
-test 數字（depth / pose，含輸入張數與協定）一律看 [results/medical.md](results/medical.md) §1，
-對外的 published 方法對照看 [results/sota.md](results/sota.md)。
+test 數字（depth / pose，含輸入張數與協定）一律看 [results/scared.md](results/scared.md) §3，
+對外的 published 方法對照看 [results/scared.md](results/scared.md) §2。
 
 ---
 
@@ -110,7 +110,7 @@ test 數字（depth / pose，含輸入張數與協定）一律看 [results/medic
 這是一個需要解釋的現象，目前沒查。
 
 ⚠️ `c3vd_cam_gts` 的 `best_loss.pt` 在 2026-08-25 08:29 被 ep6 覆寫，
-[results/medical.md](results/medical.md) §2.1 那一列**重跑不可復現**。
+[results/c3vd.md](results/c3vd.md) §1 那一列**重跑不可復現**。
 
 ---
 

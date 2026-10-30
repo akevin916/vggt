@@ -1,0 +1,9 @@
+# 3-6 (old way): c3_ft_reltile_b25 with the UNIFORM frame-distance mask reluniform_b25.npy (25% per
+# bucket, cells chosen by the 3-3 stage-A theta order; +13% c64 untrained). Same as 3-3 B otherwise:
+# tfs_fpos_seed43 weights, 4500 steps, lr peak 1e-5, 518x420. Control = c3_ft_ctrl. Written 2026-10-26.
+defaults:
+- c3_ft_reltile_b25
+- _self_
+exp_name: c3_ft_reluni_b25
+model:
+  relmask_path: outputs/colmask/reluniform_b25.npy

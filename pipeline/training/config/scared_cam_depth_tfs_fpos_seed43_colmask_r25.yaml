@@ -1,0 +1,109 @@
+# D1 column mask, step "freeze the model, learn only the mask" (decision 2026-10-20/21).
+# Warm start = the finished tfs_fpos_seed43 run (last.pt, weights only). EVERY model weight is
+# frozen; the only trainable tensor is aggregator.colmask_theta [24, 1110] (one keep logit per
+# global block x patch position, shared by all non-reference frames; frame 0 never masked).
+#
+# Budget: target mean keep ratio rho* = 0.25 across all 24 layers together (per-layer split is
+# learned). Not a loss term -- the aggregator shifts theta after each step so mean g <= rho_t,
+# rho_t: 1 -> rho* over the first 60% of steps. Last 20%: straight-through on the exact top-k.
+# AVGGT patches on: diagonal (own key always visible) + mean token (dropped keys' summary).
+# Loss: tfs's full loss unchanged (camera + depth + flow_geom + camera_smooth).
+#
+# Sampling: contiguous stride-1 clips of S frames at the test crop (518x420 -> 30x37 patches),
+# because theta is indexed by patch position and the test protocol is stride-1 c64. The aspect
+# augmentation is pinned to 0.82 (518*0.82 -> 420); the other train augs are tfs's.
+# Contiguous frames also make abs and rel frame positions agree (the fpos train/eval mismatch).
+#
+# S = 32: the largest that fits one 5090 (smoke 2026-10-21: S=32 peak 25.3 GB alloc, 16.2 s/step;
+# S=48 OOMs in flow_geom's RAFT, S=64 OOMs inside global attention).
+# Written 2026-10-21.
+defaults:
+- scared_cam_depth_tfs_fpos_seed43
+- _self_
+
+exp_name: scared_cam_depth_tfs_fpos_seed43_colmask_r25
+
+max_img_per_gpu: 32
+max_epochs: 2
+limit_train_batches: 500
+limit_val_batches: 20
+
+checkpoint:
+  resume_checkpoint_path: logs/scared_cam_depth_tfs_fpos_seed43/ckpts/last.pt
+  warm_start_weights_only: true
+  strict: false
+  save_steps_freq: 100   # rolling last.pt every 100 steps: the host drops GPUs (Xid 79), resume with --resume
+
+model:
+  enable_colmask: true
+  colmask_grid: [30, 37]
+  colmask_init: 5.0
+  colmask_rho: 0.25
+  colmask_ramp_frac: 0.6
+  colmask_st_frac: 0.2
+  colmask_diag: true
+  colmask_mean: count
+  head_grad_checkpoint: true   # gradients cross the frozen depth head; its activations scale with S
+
+data:
+  train:
+    common_config:
+      img_nums: [ "${max_img_per_gpu}", "${max_img_per_gpu}" ]
+      max_img_per_gpu: ${max_img_per_gpu}
+      augs:
+        aspects: [0.82, 0.82]
+    dataset:
+      dataset_configs:
+      - _target_: pipeline.data.datasets.scared.ScaredDataset
+        split: train
+        SCARED_DIR: data/train/scared
+        len_train: 6000
+        depth_max: 655.35
+        dynamic_source: none
+        contiguous_stride: 1
+  val:
+    common_config:
+      img_nums: [ "${max_img_per_gpu}", "${max_img_per_gpu}" ]
+      augs:
+        aspects: [0.82, 0.82]
+    dataset:
+      dataset_configs:
+      - _target_: pipeline.data.datasets.scared.ScaredDataset
+        split: val
+        SCARED_DIR: data/train/scared
+        dynamic_source: none
+        contiguous_stride: 1
+
+optim:
+  # Freeze by SUBMODULE, never '*': a frozen module is locked in eval mode, and the aggregator
+  # must stay in train mode (gradient checkpointing + the soft-mask training forward).
+  frozen_module_names:
+  - '*aggregator.patch_embed*'
+  - '*aggregator.frame_blocks*'
+  - '*aggregator.global_blocks*'
+  - '*aggregator.temporal_blocks*'
+  - '*camera_head*'
+  - '*depth_head*'
+  frozen_param_names:
+  - aggregator.camera_token
+  - aggregator.register_token
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 2.0e-02
+    weight_decay: 0.0    # decay would pull theta toward 0, i.e. g toward 0.5
+    eps: 1.0e-12         # theta's gradients are tiny (d log g / d theta = 1 - g ~ 7e-3 at init)
+  gradient_clip:
+    configs:
+    - module_name:
+      - aggregator.colmask_theta
+      max_norm: null
+      norm_type: 2
+  options:
+    lr:
+    - scheduler:
+        _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+        value: 2.0e-02
+    weight_decay:
+    - scheduler:
+        _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+        value: 0.0

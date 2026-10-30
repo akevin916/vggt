@@ -1,0 +1,10 @@
+# 3-7 stage B (rho = 0.50): c3_ft_reluni_b25 with the learned per-bucket mask pos_b50.npy.
+# tfs_abs weights, 4500 steps, lr peak 1e-5, 518x420. Control = c3_ft_ctrl. Written 2026-10-26.
+defaults:
+- c3_ft_reluni_b25
+- _self_
+exp_name: c3_ft_pos_b50
+checkpoint:
+  resume_checkpoint_path: checkpoints/scared_tfs_abs/epoch_10.pt
+model:
+  relmask_path: outputs/colmask/pos_b50.npy

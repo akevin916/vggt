@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import torch
 
+from vggt.layers.lora import merge_lora_state_dict
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
@@ -43,7 +44,9 @@ def load_vggt_for_eval(
     no depth/point/motion/flow) reconstructs correctly -- not just the three presets
     (plain VGGT / v1-v2 dyn / gate) this used to special-case.
     """
-    sd = _load_state_dict(ckpt)
+    # LoRA checkpoints are folded into plain weights; without this their deltas would be
+    # dropped as unexpected keys under strict=False and the base model scored instead.
+    sd = merge_lora_state_dict(_load_state_dict(ckpt))
     keys = list(sd.keys())
     # force_gate: build the gate mechanism even when the checkpoint has no gate_predictor
     # weights (e.g. pretrained VGGT-1B). The GatePredictor is then random-init and only the
@@ -115,6 +118,19 @@ def load_vggt_for_eval(
         raise SystemExit(f"{ckpt} has tokdino_beta but lacks {[k for k in tok_need if k not in sd]}")
     tokdino_start = int(sd["aggregator.tokdino_start"]) if has_tokdino else 8
 
+    # Learned column mask (D1): grid shape and the mean-token mode decide what gets BUILT, so they
+    # come from the checkpoint's buffers before construction (load_state_dict then sets the rest).
+    has_colmask = "aggregator.colmask_theta" in sd
+    cm_kw = {}
+    if has_colmask:
+        cm_kw = dict(enable_colmask=True,
+                     colmask_grid=tuple(int(x) for x in sd["aggregator.colmask_grid"]),
+                     colmask_mean={0: "none", 1: "one", 2: "count"}[int(sd["aggregator.colmask_mean_id"])])
+
+    # Frame-distance tile mask, stage A (learned theta): rebuild it, or the theta is silently dropped.
+    if "aggregator.relmask_theta" in sd:
+        cm_kw = dict(cm_kw, enable_relmask=True)
+
     if require_gate and not has_gate:
         raise SystemExit(f"checkpoint has no gate_predictor weights: {ckpt}")
 
@@ -149,8 +165,12 @@ def load_vggt_for_eval(
         enable_tokdino=has_tokdino,
         tokdino_start=tokdino_start,
         enable_illu=has_illu,
+        **cm_kw,
     )
     miss, unexp = model.load_state_dict(sd, strict=False)
+    if verbose and has_colmask:
+        print(f"colmask ON: {model.aggregator.colmask_stats()} diag={int(model.aggregator.colmask_diag)} "
+              f"mean={cm_kw['colmask_mean']} (eval mode defaults to 'hard' top-k at rho*)")
     if verbose and has_dual:
         agg = model.aggregator
         print(f"dual-stream ON: scope={dual_stream_scope} start={dual_stream_start} "
