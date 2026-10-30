@@ -39,7 +39,8 @@ from pipeline.training.train_utils.distributed import get_machine_local_and_dist
 from pipeline.training.train_utils.freeze import freeze_modules
 from pipeline.training.train_utils.general import *
 from pipeline.training.train_utils.logging import setup_logging
-from pipeline.training.train_utils.normalization import normalize_camera_extrinsics_and_points_batch
+from pipeline.training.train_utils.normalization import (normalize_camera_extrinsics_and_points_batch,
+                                                         normalize_extrinsics_by_trajectory)
 from pipeline.training.train_utils.optimizer import construct_optimizers
 from pipeline.training.loss import oracle_gate_logits_from_mask
 from pipeline.data.photometric_corruption import corrupt_batch
@@ -88,6 +89,8 @@ class Trainer:
         oracle_gate: Optional[Dict[str, Any]] = None,
         corruption: Optional[Dict[str, Any]] = None,
         temporal_frame_pos: bool = False,
+        train_mask: Optional[Dict[str, Any]] = None,
+        grad_probe: Optional[Dict[str, Any]] = None,
         resume: bool = False,
         **kwargs,
     ):
@@ -165,6 +168,20 @@ class Trainer:
         # trains offsets up to (S-1)*stride, so a stride-1 chunk of 64 at eval stays in range. Eval
         # passes nothing, which on contiguous frames is the same thing (offset == position).
         self.temporal_frame_pos = bool(temporal_frame_pos)
+        # 方向 3 (planning/方向3_StereoMIS器械遮罩訓練.md).
+        #   data.no_depth: the dataset has no depth (StereoMIS). GT translation is normalised by
+        #     the trajectory instead of the points, and the camera loss is forced on for every
+        #     sample (otherwise point_masks would silently switch it off).
+        #   train_mask: {mode: inst | random, start: 8}. Every train AND val forward hides the
+        #     flagged patches of other frames in global blocks >= start (Aggregator key_mask, M3).
+        #     Flags come from batch["motion_mask"] (the instrument pixel mask on StereoMIS).
+        #   grad_probe: {every: 250, n_frames: 6}. See pipeline/training/grad_probe.py.
+        self.no_depth = bool(data.get("no_depth", False))
+        self.train_mask_conf = train_mask
+        if train_mask is not None and train_mask.get("mode") not in ("inst", "random"):
+            raise ValueError(f"train_mask.mode must be 'inst' or 'random', got {train_mask.get('mode')!r}")
+        self.grad_probe_conf = grad_probe
+        self._grad_probe = None
         # Two independently-selected best checkpoints, both restored on resume:
         #   best_ate  -> lowest channel-B full-sequence Sintel ATE (the report metric).
         #   best_loss -> lowest channel-A held-out (PO-test) camera loss (unbiased vs the
@@ -648,6 +665,11 @@ class Trainer:
 
         was_training = model.training
         model.eval()
+        # Epoch boundary: the last optimizer step is done and the next train step zeroes grads
+        # anyway, so dropping them here only frees ~3 GB for the c64 eval (方向 3 masked eval
+        # did not fit beside them).
+        for optim in self.optims:
+            optim.zero_grad(set_to_none=True)
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -687,6 +709,34 @@ class Trainer:
                         out_dir=out_dir,
                         device=device,
                     )
+                elif dataset == "stereomis":
+                    # 方向 3: the held-out train sequence (P2_5) as val, whole sequence in
+                    # 64-frame chunks overlap 16 -> 5-frame snippet ATE (metres). best_ate.pt is
+                    # selected on THIS, never on test. eval_mask applies the run's own key_mask
+                    # at inference (R1/R2 are selected with the mask on, R0 with it off).
+                    from pipeline.benchmark.eval_scared import evaluate as eval_evaluate
+                    from pipeline.data.paths import data_path
+
+                    em = cfg.get("eval_mask", None)
+                    args = SimpleNamespace(
+                        ckpt=f"live_epoch_{int(self.epoch) + 1}",
+                        scared_root=cfg.get("root", None) or data_path("train", "stereomis"),
+                        split=cfg.get("split", "train"),
+                        seqs=list(cfg.get("seqs", ["P2_5"])),
+                        n_frames=0, chunk_size=int(cfg.get("chunk_size", 64)),
+                        overlap=int(cfg.get("overlap", 16)), fid_step=int(cfg.get("fid_step", 2)),
+                        max_depth=None, no_depth=True, single_view=False,
+                        key_mask=em, key_mask_start=int(cfg.get("eval_mask_start", 8)),
+                        gate_mode=cfg.get("gate_mode", "predicted"),
+                        img_size=int(cfg.get("img_size", 518)),
+                        out_dir=out_dir, device=device,
+                    )
+                    results = eval_evaluate(args, model=model)
+                    snip = results.get("pose", {}).get("mean", {}).get("snippet_ate", None)
+                    if snip is not None and snip > 0:
+                        ate_val[0] = float(snip)
+                    logging.info("StereoMIS val at epoch %s: c64 snippet ATE=%.4e m (mask %s)",
+                                 self.epoch, ate_val.item(), em)
                 elif dataset == "c3vd":
                     # Same converted layout and the same scorer as SCARED; only the root,
                     # the split and the depth ceiling differ. max_depth is millimetres and
@@ -1026,6 +1076,14 @@ class Trainer:
                 if self.epoch == 0 and int(tok.tokdino_steps) in (100, 300, 600, 1000):
                     self._log_tokdino()
 
+            if self.grad_probe_conf is not None:
+                every = int(self.grad_probe_conf.get("every", 250))
+                if (self.steps[phase] - 1) % every == 0:
+                    from pipeline.training.grad_probe import GradProbe
+                    if self._grad_probe is None:
+                        self._grad_probe = GradProbe(self, batch, self.grad_probe_conf)
+                    self._grad_probe.run(self.steps[phase] - 1)
+
             # Measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
@@ -1130,6 +1188,13 @@ class Trainer:
     def _process_batch(self, batch: Mapping):      
         if self.data_conf.train.common_config.repeat_batch:
             batch = self._apply_batch_repetition(batch)
+
+        if self.no_depth:
+            if "traj_step" not in batch:
+                raise RuntimeError("data.no_depth needs batch['traj_step'] (StereoMISDataset provides it)")
+            batch["extrinsics"] = normalize_extrinsics_by_trajectory(batch["extrinsics"], batch["traj_step"])
+            batch["cam_valid"] = torch.ones(batch["extrinsics"].shape[0], dtype=torch.bool)
+            return batch
         
         # Normalize camera extrinsics and points. The function returns new tensors.
         normalized_extrinsics, normalized_cam_points, normalized_world_points, normalized_depths = \
@@ -1176,6 +1241,7 @@ class Trainer:
         # comparable with every previous run's.
         images_in = batch["images"]
         frame_pos = batch["ids"] if self.temporal_frame_pos else None
+        key_mask = self._train_key_mask(batch) if self.train_mask_conf is not None else None
         y_teacher = None
         if (
             phase == "train"
@@ -1210,7 +1276,11 @@ class Trainer:
                 batch["_teacher"] = y_teacher
                 batch["corrupt_frame_mask"] = corrupt_mask
 
-        y_hat = model(images=images_in, gate_logits_override=gate_override, frame_pos=frame_pos)
+        if key_mask is not None:
+            y_hat = model(images=images_in, gate_logits_override=gate_override, frame_pos=frame_pos,
+                          key_mask=key_mask)
+        else:
+            y_hat = model(images=images_in, gate_logits_override=gate_override, frame_pos=frame_pos)
         
         # Loss computation
         loss_dict = self.loss(y_hat, batch)
@@ -1227,6 +1297,8 @@ class Trainer:
         # and switching off is the outcome the pose loss is known to prefer here.
         #   gate_g_median   -- where the logits sit; the clamp kink is at 0
         #   gate_frac_active-- fraction of patches past that kink, i.e. actually suppressed
+        if key_mask is not None:
+            log_data["train_mask_frac"] = key_mask.float().mean()
         if y_teacher is not None:
             # Without this the L_inf curve is unreadable: a falling loss_influence could mean the
             # model got robust, or simply that fewer frames were being corrupted.
@@ -1243,6 +1315,21 @@ class Trainer:
 
         self.steps[phase] += 1
         return loss_dict, y_hat
+
+    def _train_key_mask(self, batch) -> torch.Tensor:
+        """[B, S, P_patch] bool patch flags for train_mask (方向 3). Sets the aggregator's start
+        block from the config on every call so a resumed / re-instantiated model cannot drift."""
+        from pipeline.data.instrument_mask import patch_flags, random_flags_like
+        model = self.model.module if isinstance(
+            self.model, torch.nn.parallel.DistributedDataParallel) else self.model
+        model.aggregator.key_mask_start = int(self.train_mask_conf.get("start", 8))
+        flags = patch_flags(batch["motion_mask"], patch_size=14)               # [B, S, P]
+        if self.train_mask_conf["mode"] == "random":
+            ids = batch["ids"].tolist()
+            names = [str(n).split("_", 1)[-1] for n in batch["seq_name"]]
+            flags = torch.stack([random_flags_like(flags[b], [f"{names[b]}:{i}" for i in ids[b]])
+                                 for b in range(flags.shape[0])])
+        return flags
 
     def _dual_stream_module(self):
         """The aggregator, if this run has the frame-distance band bias; else None."""

@@ -152,6 +152,9 @@ class ComposedDataset(Dataset, ABC):
         if motion_mask is None:
             motion_mask = torch.zeros_like(depths)
         sample["motion_mask"] = motion_mask
+        # no-depth datasets (StereoMIS): median adjacent camera step, the trajectory-scale floor
+        if batch.get("traj_step", None) is not None:
+            sample["traj_step"] = torch.tensor(float(batch["traj_step"]))
 
         # --- Track Processing (if enabled) ---
         if self.load_track:

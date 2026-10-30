@@ -601,6 +601,8 @@ class Aggregator(nn.Module):
             self.register_buffer(name, torch.FloatTensor(value).view(1, 1, 3, 1, 1), persistent=False)
 
         self.use_reentrant = False # hardcoded to False
+        # 方向 3 training mask: first global block where key_mask applies (blocks 0-7 are frozen).
+        self.key_mask_start = 8
 
     def __build_patch_embed__(
         self,
@@ -648,6 +650,8 @@ class Aggregator(nn.Module):
         images: torch.Tensor,
         gate_logits_override: Optional[torch.Tensor] = None,
         frame_pos: Optional[torch.Tensor] = None,
+        key_mask: Optional[torch.Tensor] = None,
+        probe: Optional[dict] = None,
     ) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
@@ -662,6 +666,14 @@ class Aggregator(nn.Module):
                 uses each frame's offset from the clip's first frame instead of its position 0..S-1
                 (identical on contiguous frames). Nothing else reads it: the time-phase RoPE, the
                 distance band and alt_stream still use positions.
+            key_mask: [B, S, P_patch] bool, True = hide this patch (方向 3, train and eval). In
+                global blocks >= key_mask_start every query stops seeing the flagged patches of
+                OTHER frames (M3); special-token keys and same-frame keys stay visible. A boolean
+                SDPA attn_mask, so hidden keys get exactly zero weight. All-False (or None) takes
+                the unmasked path, so the output is bit-identical to the model without the flag.
+            probe: gradient-probe dict from the trainer (pipeline/training/grad_probe.py). Every
+                global block then runs the masked path with a float bias b[l] * hide, records its
+                q/k into probe["qk"] and its output into probe["out"].
 
         Returns:
             (list[torch.Tensor], int):
@@ -743,6 +755,11 @@ class Aggregator(nn.Module):
         global_idx = 0
         temporal_idx = 0
         output_list = []
+        if key_mask is not None:
+            if key_mask.shape != (B, S, P - self.patch_start_idx):
+                raise ValueError(f"key_mask {tuple(key_mask.shape)} != {(B, S, P - self.patch_start_idx)}")
+            if not bool(key_mask.any()):
+                key_mask = None
 
         # gate logits computed lazily after gate_block_iter; None until then
         gate_logits: Optional[torch.Tensor] = None
@@ -801,6 +818,7 @@ class Aggregator(nn.Module):
                         tokens, B, S, P, C, global_idx, pos=pos, gate_logits=gate_bias_source,
                         pair_log_delta=pair_log_delta, pair_warm=pair_warm,
                         tok_logd=tok_logd, tok_keep=tok_keep, tok_warm=tok_warm, alt_z=alt_z,
+                        key_mask=key_mask, probe=probe,
                     )
                 elif attn_type == "temporal":
                     # NEW: run a temporal block once every `temporal_every` aa-blocks.
@@ -954,7 +972,8 @@ class Aggregator(nn.Module):
 
     def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None, gate_logits=None,
                                   pair_log_delta=None, pair_warm=0.0,
-                                  tok_logd=None, tok_keep=None, tok_warm=0.0, alt_z=None):
+                                  tok_logd=None, tok_keep=None, tok_warm=0.0, alt_z=None,
+                                  key_mask=None, probe=None):
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
 
@@ -974,7 +993,26 @@ class Aggregator(nn.Module):
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
-            if tok_logd is not None and global_idx >= int(self.tokdino_start):
+            masked = key_mask is not None and global_idx >= self.key_mask_start
+            if masked or probe is not None:
+                blk = self.global_blocks[global_idx]
+                flags = key_mask if masked else None
+                _B, _S, _gi = B, S, global_idx
+
+                def _km_fn(t, p, f):  # noqa: E306
+                    return self._keymask_global_block_forward(blk, t, p, f, _B, _S, probe, _gi)
+
+                # checkpoint whenever a graph is built (the probe runs in train mode too); the
+                # mask is a checkpoint ARGUMENT so the backward recompute sees the same one
+                if torch.is_grad_enabled() and self.training:
+                    tokens = checkpoint(_km_fn, tokens, pos, flags, use_reentrant=self.use_reentrant)
+                else:
+                    tokens = _km_fn(tokens, pos, flags)
+                if probe is not None:
+                    if tokens.requires_grad:
+                        tokens.retain_grad()
+                    probe["out"][global_idx] = tokens
+            elif tok_logd is not None and global_idx >= int(self.tokdino_start):
                 blk = self.global_blocks[global_idx]
                 _B, _S, _gi, _w = B, S, global_idx, tok_warm
 
@@ -1049,6 +1087,63 @@ class Aggregator(nn.Module):
             intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, global_idx, intermediates
+
+    def _keymask_global_block_forward(self, block, tokens, pos, flags, B, S, probe=None, layer=None):
+        """One global block where every query skips the flagged patches of OTHER frames (方向 3, M3).
+
+        flags [B, S, P_patch] bool or None. Same qkv/norm/rope/ls algebra as Block.forward. With
+        flags only: boolean attn_mask (True = visible). With a probe: float mask b[layer] * hide
+        (b = 0, requires_grad) so dL/db is the pose loss's pull on the cross-frame instrument keys;
+        -inf where flags also hide. hide uses probe["flags"], not `flags`.
+        """
+        N, C = tokens.shape[1], tokens.shape[2]
+        P = N // S
+        H, D = block.attn.num_heads, block.attn.head_dim
+
+        q, k, v = block.attn.qkv(block.norm1(tokens)).reshape(B, N, 3, H, D).permute(2, 0, 3, 1, 4).unbind(0)
+        q, k = block.attn.q_norm(q), block.attn.k_norm(k)
+        if block.attn.rope is not None and pos is not None:
+            q, k = block.attn.rope(q, pos), block.attn.rope(k, pos)
+
+        frame = torch.arange(N, device=tokens.device) // P
+
+        def _hidden(f):                       # [B, S, P_patch] -> [B, 1, N, N] bool
+            ft = f.new_zeros(B, S, P)
+            ft[:, :, self.patch_start_idx:] = f
+            return ft.view(B, 1, 1, N) & cross
+
+        if flags is not None and probe is None and not torch.is_grad_enabled():
+            # Eval (64-frame chunks: N ~ 71k, an N x N mask is ~5 GB). Same semantics, no mask:
+            # per query frame, DROP the hidden keys (other frames' flagged patches) and attend
+            # to the rest. Exactly the boolean mask's result, frame by frame.
+            ft = flags.new_zeros(B, S, P)
+            ft[:, :, self.patch_start_idx:] = flags
+            ft = ft.view(B, N)
+            out = torch.empty_like(q)
+            for b in range(B):
+                for f in range(S):
+                    keep = ~(ft[b] & (frame != f))
+                    sl = slice(f * P, (f + 1) * P)
+                    out[b:b + 1, :, sl] = F.scaled_dot_product_attention(
+                        q[b:b + 1, :, sl], k[b:b + 1, :, keep], v[b:b + 1, :, keep]).to(out.dtype)
+            del q, k, v
+            out = block.attn.proj_drop(block.attn.proj(out.transpose(1, 2).reshape(B, N, C)))
+            tokens = tokens + block.ls1(out)
+            return tokens + block.ls2(block.mlp(block.norm2(tokens)))
+
+        cross = frame[:, None] != frame[None, :]                                  # [N, N]
+        attn_mask = None if flags is None else ~_hidden(flags)
+        if probe is not None:
+            bias = probe["b"][layer].to(q.dtype) * _hidden(probe["flags"]).to(q.dtype)
+            if attn_mask is not None:
+                bias = bias.masked_fill(~attn_mask, float("-inf"))
+            attn_mask = bias
+            probe["qk"][layer] = (q.detach(), k.detach())
+
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        out = block.attn.proj_drop(block.attn.proj(out.transpose(1, 2).reshape(B, N, C)))
+        tokens = tokens + block.ls1(out)
+        return tokens + block.ls2(block.mlp(block.norm2(tokens)))
 
     def _gated_global_block_forward(
         self,

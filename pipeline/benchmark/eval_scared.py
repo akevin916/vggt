@@ -84,7 +84,7 @@ def resolve_max_depth(args) -> float:
     return AFSFM_MAX_DEPTH if getattr(args, "depth_protocol", "monst3r") == "afsfm" else 200.0
 
 
-SPLITS = ("val", "train", "test/depth", "test/pose")
+SPLITS = ("val", "train", "test/depth", "test/pose", "test")   # "test": StereoMIS layout
 
 
 def split_tag(split: str) -> str:
@@ -119,6 +119,8 @@ def protocol_tag(args) -> str:
         tag += f"_{args.n_frames}f"
     if args.gate_mode != "predicted":
         tag += f"_gate{args.gate_mode}"
+    if getattr(args, "key_mask", None):
+        tag += f"_km{args.key_mask}_s{args.key_mask_start}"
     if args.img_size != 518:
         tag += f"_img{args.img_size}"
     return tag
@@ -193,6 +195,28 @@ def load_gt_depths(seq_dir: str, fids_sel):
     return out
 
 
+def load_key_mask(seq_dir, seq, paths, idx, args):
+    """方向 3 patch flags [1, S, P_patch] for the frames in `paths`, from mask_left (0 = instrument)
+    on the inference crop. args.key_mask: inst | random (pipeline/data/instrument_mask.py)."""
+    import torch
+    from pipeline.data.instrument_mask import patch_flags, random_flags_like
+    from pipeline.data.sintel_io import resize_gt_to_pred
+    meta = compute_preprocess_meta(paths[0], target_size=args.img_size)
+    model_hw = (min(meta.new_h, args.img_size), meta.new_w)
+    pix = []
+    for p in paths:
+        m = cv2.imread(os.path.join(seq_dir, "mask_left", os.path.basename(p)), cv2.IMREAD_UNCHANGED)
+        if m is None:
+            raise FileNotFoundError(f"{seq}: no mask_left for {os.path.basename(p)}")
+        pix.append(resize_gt_to_pred((m == 0).astype(np.float32), meta, model_hw))
+    flags = patch_flags(torch.from_numpy(np.stack(pix)), patch_size=14)          # [S, P]
+    if args.key_mask == "random":
+        flags = random_flags_like(flags, [f"{os.path.basename(seq)}:{int(i)}" for i in idx])
+    elif args.key_mask != "inst":
+        raise ValueError(f"key_mask must be inst | random, got {args.key_mask!r}")
+    return flags.unsqueeze(0)
+
+
 def eval_ckpt(ckpt, root, split, seqs, args, model=None):
     """Score one checkpoint. ``model``: optional preloaded (in-memory) VGGT -- when given,
     nothing is loaded from disk and the model is left alive for the caller (the trainer
@@ -200,6 +224,8 @@ def eval_ckpt(ckpt, root, split, seqs, args, model=None):
     owns_model = model is None
     if owns_model:
         model = load_vggt_for_eval(ckpt, device=args.device)
+    if getattr(args, "key_mask", None):
+        model.aggregator.key_mask_start = int(getattr(args, "key_mask_start", 8))
     fids_all = {}
     per_seq_pose, per_seq_depth = {}, {}
     failed = []
@@ -223,7 +249,12 @@ def eval_ckpt(ckpt, root, split, seqs, args, model=None):
             # subsampled run they span hundreds, and the metric silently returns a large,
             # meaningless number instead of failing. Gate it on the frames actually selected.
             sel_fids = np.array([int(os.path.basename(p)[:-4]) for p in paths])
-            contiguous = bool(len(sel_fids) > 1 and np.all(np.diff(sel_fids) == 1))
+            # StereoMIS is converted at every 2nd video frame: fid_step=2 is its stride-1.
+            fid_step = int(getattr(args, "fid_step", 1) or 1)
+            contiguous = bool(len(sel_fids) > 1 and np.all(np.diff(sel_fids) == fid_step))
+            kmask = None
+            if getattr(args, "key_mask", None):
+                kmask = load_key_mask(seq_dir, seq, paths, idx, args)
 
             chunk = int(getattr(args, "chunk_size", 0) or 0)
             if getattr(args, "single_view", False):
@@ -262,7 +293,8 @@ def eval_ckpt(ckpt, root, split, seqs, args, model=None):
                     sub = slice(st, min(st + chunk, len(paths)))
                     ov_sub = override[:, sub] if override is not None else None
                     pr = infer_sequence(model, paths[sub], device=args.device,
-                                        gate_logits_override=ov_sub)
+                                        gate_logits_override=ov_sub,
+                                        key_mask=kmask[:, sub] if kmask is not None else None)
                     parts.append((st, pr["extrinsic"]))
                     if "depth" in pr:
                         # Depth is per-frame, so chunking is harmless -- but take each frame
@@ -277,11 +309,17 @@ def eval_ckpt(ckpt, root, split, seqs, args, model=None):
                     pred["depth"] = np.stack(depth_by_frame)
                 per_seq_pose[seq] = (snippet_metrics_from_chunks(parts, gt_E) if contiguous
                                      else {"snippet_skipped": "frames not stride-1"})
+                if getattr(args, "save_pred", False):
+                    # per-chunk predicted extrinsics + GT, for trajectory plots (方向 3 vis)
+                    np.savez(os.path.join(args.out_dir, f"pred_{seq.replace('/', '__')}.npz"),
+                             starts=np.array([st for st, _ in parts]),
+                             lens=np.array([len(E) for _, E in parts]),   # last chunk is shorter
+                             extr=np.concatenate([E for _, E in parts]), gt=np.asarray(gt_E))
                 per_seq_pose[seq]["n_chunks"] = len(starts)
                 per_seq_pose[seq]["full_seq_ate_reported"] = False
             else:
                 pred = infer_sequence(model, paths, device=args.device,
-                                      gate_logits_override=override)
+                                      gate_logits_override=override, key_mask=kmask)
                 per_seq_pose[seq] = eval_pose_metrics(pred["extrinsic"], gt_tum, gt_ts)
                 if contiguous:
                     per_seq_pose[seq].update(snippet_pose_metrics(pred["extrinsic"], gt_E))
@@ -289,6 +327,8 @@ def eval_ckpt(ckpt, root, split, seqs, args, model=None):
                     per_seq_pose[seq]["snippet_skipped"] = "frames not stride-1"
                 per_seq_pose[seq]["full_seq_ate_reported"] = True
             per_seq_pose[seq]["n_frames"] = len(paths)
+            if kmask is not None:
+                per_seq_pose[seq]["key_mask_frac"] = float(kmask.float().mean())
             per_seq_pose[seq]["contiguous"] = contiguous
             per_seq_pose[seq]["valid_frac_mean"] = float(np.mean(vfs))
             per_seq_pose[seq].update(scale)
@@ -365,6 +405,9 @@ def evaluate(args, model=None):
                              overlap=getattr(args, "overlap", None),
                              single_view=bool(getattr(args, "single_view", False)),
                              gate_mode=getattr(args, "gate_mode", "predicted"),
+                             key_mask=getattr(args, "key_mask", None),
+                             key_mask_start=getattr(args, "key_mask_start", None),
+                             fid_step=getattr(args, "fid_step", 1),
                              timestamp=datetime.now().isoformat(timespec="seconds")),
                    results=results)
     with open(os.path.join(args.out_dir, "results.json"), "w") as f:
@@ -408,6 +451,14 @@ def main():
     ap.add_argument("--gate_mode", default="predicted", choices=["predicted", "off"],
                     help="'off' feeds zero gate logits, which makes the attention bias exactly 0")
     ap.add_argument("--img_size", type=int, default=518)
+    ap.add_argument("--key_mask", default=None, choices=["inst", "random"],
+                    help="方向 3: hide instrument (or size-matched random) patches of other frames "
+                         "in global blocks >= --key_mask_start; reads <seq>/mask_left (StereoMIS)")
+    ap.add_argument("--key_mask_start", type=int, default=8)
+    ap.add_argument("--save_pred", action="store_true",
+                    help="chunked runs: save each sequence's per-chunk extrinsics + GT as pred_<seq>.npz")
+    ap.add_argument("--fid_step", type=int, default=1,
+                    help="frame-id step that counts as contiguous (StereoMIS: 2)")
     ap.add_argument("--out_dir", default=None)
     args = ap.parse_args()
 

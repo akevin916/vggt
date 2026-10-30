@@ -125,3 +125,26 @@ def normalize_camera_extrinsics_and_points_batch(
 
 
 
+
+
+def normalize_extrinsics_by_trajectory(extrinsics: torch.Tensor, traj_step: torch.Tensor) -> torch.Tensor:
+    """No-depth normalisation (方向 3, StereoMIS): same first-camera re-centring as
+    normalize_camera_extrinsics_and_points_batch, but the unit is set by the GT TRAJECTORY.
+
+    s_gt = mean distance of the clip's camera centres (frames 1..S-1) to the first camera,
+    floored at traj_step * S (traj_step = the sequence's median adjacent camera step) so a
+    clip whose camera barely moves cannot blow its translations up. It only fixes the units
+    of the loss; the camera loss itself is scale-invariant in this mode (loss.py).
+
+    extrinsics (B, S, 3, 4) world-to-cam; traj_step (B,). Returns (B, S, 3, 4).
+    """
+    B, S = extrinsics.shape[:2]
+    homog = torch.cat([extrinsics, torch.zeros((B, S, 1, 4), dtype=extrinsics.dtype)], dim=-2)
+    homog[:, :, -1, -1] = 1.0
+    new = torch.matmul(homog, closed_form_inverse_se3(homog[:, 0]).unsqueeze(1))[:, :, :3]
+    R, t = new[..., :3], new[..., 3]
+    centres = -(R.transpose(-1, -2) @ t.unsqueeze(-1)).squeeze(-1)          # (B, S, 3)
+    s_gt = centres[:, 1:].norm(dim=-1).mean(dim=1) if S > 1 else torch.zeros(B)
+    s_gt = torch.maximum(s_gt, traj_step.to(s_gt.dtype) * S).clamp(min=1e-12)
+    new[..., 3] = t / s_gt.view(B, 1, 1)
+    return check_and_fix_inf_nan(new, "new_extrinsics", hard_max=None)

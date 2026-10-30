@@ -22,6 +22,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
     def __init__(self, img_size=518, patch_size=14, embed_dim=1024,
                  enable_camera=True, enable_point=True, enable_depth=True, enable_track=True,
                  enable_temporal=False,
+                 temporal_every=3,   # one temporal block per `temporal_every` aa-blocks: 3 -> 8 blocks, 1 -> 24
                  temporal_share_frame_weights=False,  # temporal steps borrow the frame block's weights
                  rope_3d=False, rope_3d_dims=(24, 24, 16), rope_3d_zero_time=False,  # (y,x,t) RoPE
                  rope_time=False, rope_time_base=10.0,  # (y,x) RoPE + added time phase
@@ -88,6 +89,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             tokdino_sigma_range=tuple(tokdino_sigma_range),
             enable_illu=enable_illu,
             temporal_share_frame_weights=temporal_share_frame_weights,
+            temporal_every=int(temporal_every),
             rope_3d=rope_3d, rope_3d_dims=rope_3d_dims, rope_3d_zero_time=rope_3d_zero_time,
             rope_time=rope_time, rope_time_base=rope_time_base,
         )
@@ -107,7 +109,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         # and everything still used (trunk, camera/depth/point) loads unchanged.
 
     def forward(self, images: torch.Tensor, query_points: torch.Tensor = None,
-                gate_logits_override: torch.Tensor = None, frame_pos: torch.Tensor = None):
+                gate_logits_override: torch.Tensor = None, frame_pos: torch.Tensor = None,
+                key_mask: torch.Tensor = None, probe: dict = None):
         """
         Forward pass of the VGGT model.
 
@@ -123,6 +126,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 oracle-mask gate ablations. Default: None (use the model's own predicted gate).
             frame_pos (torch.Tensor, optional): [B, S] real frame indices of the clip; only the
                 temporal blocks read it (see Aggregator.forward). Default: None (positions 0..S-1).
+            key_mask, probe: 方向 3 training-time patch masking and gradient probe; see
+                Aggregator.forward. Default: None (byte-identical to the unmasked model).
 
         Returns:
             dict: A dictionary containing the following predictions:
@@ -146,7 +151,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             query_points = query_points.unsqueeze(0)
 
         aggregated_tokens_list, patch_start_idx, gate_logits = self.aggregator(
-            images, gate_logits_override=gate_logits_override, frame_pos=frame_pos
+            images, gate_logits_override=gate_logits_override, frame_pos=frame_pos,
+            key_mask=key_mask, probe=probe,
         )
 
         predictions = {}

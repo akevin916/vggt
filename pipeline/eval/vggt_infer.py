@@ -222,8 +222,11 @@ def infer_sequence(
     gate_logits_override: Optional[torch.Tensor] = None,
     want_point: bool = False,
     images: Optional[torch.Tensor] = None,
+    key_mask: Optional[torch.Tensor] = None,
 ) -> Dict[str, np.ndarray]:
     """Run VGGT on one sequence.
+
+    ``key_mask`` [1, S, P_patch] bool: 方向 3 patch masking (Aggregator.forward key_mask).
 
     ``want_point`` opts in to returning the point head's ``world_points`` /
     ``world_points_conf``. It is off by default because those are [S,H,W,3] fp32
@@ -245,7 +248,11 @@ def infer_sequence(
         images = images.unsqueeze(0)
 
     with torch.cuda.amp.autocast(dtype=dtype, enabled=(device == "cuda")):
-        pred = model(images=images, gate_logits_override=gate_logits_override)
+        if key_mask is not None:
+            pred = model(images=images, gate_logits_override=gate_logits_override,
+                         key_mask=key_mask.to(device))
+        else:
+            pred = model(images=images, gate_logits_override=gate_logits_override)
 
     h, w = images.shape[-2], images.shape[-1]
     extrinsic, intrinsic = pose_encoding_to_extri_intri(pred["pose_enc"], image_size_hw=(h, w))

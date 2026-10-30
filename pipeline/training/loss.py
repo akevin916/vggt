@@ -197,14 +197,17 @@ def compute_camera_loss(
     weight_trans=1.0,       # weight for translation loss
     weight_rot=1.0,         # weight for rotation loss
     weight_focal=0.5,       # weight for focal length loss
+    scale_invariant=False,  # 方向 3 no-depth: compare s*·T̂ with T, s* = <T̂,T>/<T̂,T̂> per sample, detached
     **kwargs
 ):
     # List of predicted pose encodings per stage
     pred_pose_encodings = pred_dict['pose_enc_list']
     # Binary mask for valid points per frame (B, N, H, W)
     point_masks = batch_data['point_masks']
-    # Only consider frames with enough valid points (>100)
-    valid_frame_mask = point_masks[:, 0].sum(dim=[-1, -2]) > 100
+    # Only consider frames with enough valid points (>100). No-depth data (StereoMIS) has no
+    # points at all; the trainer then sets batch["cam_valid"] and that replaces the test.
+    valid_frame_mask = batch_data["cam_valid"] if "cam_valid" in batch_data \
+        else point_masks[:, 0].sum(dim=[-1, -2]) > 100
     # Number of prediction stages
     n_stages = len(pred_pose_encodings)
 
@@ -220,12 +223,17 @@ def compute_camera_loss(
 
     # Initialize loss accumulators for translation, rotation, focal length
     total_loss_T = total_loss_R = total_loss_FL = 0
+    si_scales, si_tiny = [], 0
 
     # Compute loss for each prediction stage with temporal weighting
     for stage_idx in range(n_stages):
         # Later stages get higher weight (gamma^0 = 1.0 for final stage)
         stage_weight = gamma ** (n_stages - stage_idx - 1)
         pred_pose_stage = pred_pose_encodings[stage_idx]
+        if scale_invariant:
+            pred_pose_stage, s_star, tiny = _scale_align_translation(pred_pose_stage, gt_pose_encoding)
+            si_scales.append(s_star)
+            si_tiny += int(tiny[valid_frame_mask].sum())
 
         if valid_frame_mask.sum() == 0:
             # If no valid frames, set losses to zero to avoid gradient issues
@@ -257,12 +265,38 @@ def compute_camera_loss(
     )
 
     # Return loss dictionary with individual components
-    return {
+    out = {
         "loss_camera": total_camera_loss,
         "loss_T": avg_loss_T,
         "loss_R": avg_loss_R,
         "loss_FL": avg_loss_FL
     }
+    out["cam_valid_count"] = valid_frame_mask.sum().float().detach()
+    if scale_invariant:
+        # camera_smooth must scale T̂ by the SAME s*: otherwise shrinking T̂ lowers the smoothness
+        # penalty for free and the prediction drifts towards T̂ -> 0.
+        batch_data["_si_scale"] = si_scales
+        s_last = si_scales[-1][valid_frame_mask].float()
+        if s_last.numel():
+            q = torch.quantile(s_last, torch.tensor([0.05, 0.5, 0.95], device=s_last.device))
+            out.update(si_scale_p5=q[0], si_scale_p50=q[1], si_scale_p95=q[2])
+        out["si_tiny_count"] = torch.tensor(float(si_tiny))
+    return out
+
+
+def _scale_align_translation(pred_pose_enc, gt_pose_enc, eps=1e-6):
+    """Scale-invariant translation (方向 3): replace T̂ by s*·T̂ with s* = <T̂,T>/<T̂,T̂> over the
+    sample's S frames, DETACHED and clamped to [0.01, 100]. Always prediction -> GT, never GT ->
+    prediction (that one lets T̂ -> 0 drive the loss to 0). Samples with ||T̂|| < eps get T̂ := T,
+    i.e. a zero translation term (counted by the caller). Rotation / FoV entries untouched.
+    Returns (aligned pose enc (B,S,9), s* (B,), tiny (B,) bool)."""
+    Tp, Tg = pred_pose_enc[..., :3], gt_pose_enc[..., :3]
+    den = (Tp.detach() ** 2).sum(dim=(1, 2))
+    num = (Tp.detach() * Tg).sum(dim=(1, 2))
+    tiny = den.sqrt() < eps
+    s_star = (num / den.clamp(min=eps ** 2)).clamp(0.01, 100.0)
+    Ts = torch.where(tiny.view(-1, 1, 1), Tg.to(Tp.dtype), Tp * s_star.view(-1, 1, 1).to(Tp.dtype))
+    return torch.cat([Ts, pred_pose_enc[..., 3:]], dim=-1), s_star, tiny
 
 def camera_loss_single(pred_pose_enc, gt_pose_enc, loss_type="l1"):
     """
@@ -718,7 +752,8 @@ def compute_self_photo_loss(predictions, batch, src_offsets=(-1, 1), alpha_ssim=
 
 
 def compute_flow_geom_loss(predictions, batch, src_offsets=(-1, 1), flow_proc=256,
-                           occ_thresh=0.95, min_valid=100, **kwargs):
+                           occ_thresh=0.95, min_valid=100, exclude_motion_mask=False,
+                           exclude_dilate_px=2, **kwargs):
     """Cross-frame 3D consistency through optical-flow correspondence (ColonAdapter's
     `geometry_loss`, reference/ColonAdapter/trainer.py:579-602, re-expressed for VGGT).
 
@@ -748,6 +783,11 @@ def compute_flow_geom_loss(predictions, batch, src_offsets=(-1, 1), flow_proc=25
     compute_self_photo_loss, so the loss is invariant to global scale and cannot be lowered by
     shrinking the scene. Gradient reaches depth and pose of BOTH frames; flow and the visibility
     mask are constants.
+
+    exclude_motion_mask (方向 4, StereoMIS): drop pixels whose target OR flow-matched source
+    position lies in batch["motion_mask"] (the instrument mask there), dilated by
+    exclude_dilate_px. The static-scene assumption above is false on a moving instrument.
+    Off by default -> byte-identical to the original term.
     """
     pose_enc = predictions["pose_enc_list"][-1]
     images = batch["images"]
@@ -776,6 +816,11 @@ def compute_flow_geom_loss(predictions, batch, src_offsets=(-1, 1), flow_proc=25
     flows = pair_flows(batch, offsets, proc=flow_proc, occ_thresh=occ_thresh)
     total = images.new_tensor(0.0)
     n_terms, n_used, n_all = 0, 0, 0
+    excl = None
+    if exclude_motion_mask:
+        k = 2 * int(exclude_dilate_px) + 1
+        excl = F.max_pool2d(batch["motion_mask"].float(), k, stride=1, padding=k // 2)   # (B,S,H,W)
+        n_vis, n_excl = 0, 0
     for off, (tgt, flow, visible) in flows.items():
         n = tgt.numel()
         src = tgt + off
@@ -789,6 +834,12 @@ def compute_flow_geom_loss(predictions, batch, src_offsets=(-1, 1), flow_proc=25
                             align_corners=True, padding_mode="border")
         X_s = X_s.reshape(B, n, 3, H, W).permute(0, 1, 3, 4, 2)
         m = (visible & inb).detach()
+        if excl is not None:
+            e_src = F.grid_sample(excl[:, src].reshape(B * n, 1, H, W), grid.reshape(B * n, H, W, 2),
+                                  mode="bilinear", align_corners=True, padding_mode="zeros").reshape(B, n, H, W)
+            e = (excl[:, tgt] > 0) | (e_src > 0)
+            n_vis += int(m.sum()); n_excl += int((m & e).sum())
+            m = (m & ~e).detach()
         n_all += m.numel()
         if m.sum() < min_valid:
             continue
@@ -799,8 +850,11 @@ def compute_flow_geom_loss(predictions, batch, src_offsets=(-1, 1), flow_proc=25
 
     if n_terms == 0:
         return zero
-    return {"loss_flow_geom": total / n_terms,
-            "flow_geom_valid_frac": images.new_tensor(n_used / max(n_all, 1))}
+    out = {"loss_flow_geom": total / n_terms,
+           "flow_geom_valid_frac": images.new_tensor(n_used / max(n_all, 1))}
+    if excl is not None:
+        out["flow_geom_excl_frac"] = images.new_tensor(n_excl / max(n_vis, 1))
+    return out
 
 
 def compute_smooth_loss(predictions, batch, **kwargs):
@@ -1045,7 +1099,7 @@ def compute_ego_flow_loss(predictions, batch, beta=1.0, per_pixel_thre=50.0, dyn
 
 
 def compute_camera_smooth_loss(predictions, batch, weight_trans=1.0, weight_rot=1.0, gamma=0.6,
-                               orders=(2,), order_weights=None, **kwargs):
+                               orders=(2,), order_weights=None, scale_invariant=False, **kwargs):
     """
     Extension: camera-trajectory smoothness regularizer (conversation notes, not yet folded
     into method.md). Penalises k-th order discontinuities in the PREDICTED pose
@@ -1100,7 +1154,10 @@ def compute_camera_smooth_loss(predictions, batch, weight_trans=1.0, weight_rot=
     n_stages = len(pred_pose_encodings)
 
     point_masks = batch["point_masks"]
-    valid_frame_mask = point_masks[:, 0].sum(dim=[-1, -2]) > 100  # same convention as compute_camera_loss
+    valid_frame_mask = batch["cam_valid"] if "cam_valid" in batch \
+        else point_masks[:, 0].sum(dim=[-1, -2]) > 100  # same convention as compute_camera_loss
+    if scale_invariant and "_si_scale" not in batch:
+        raise RuntimeError("camera_smooth.scale_invariant needs loss.camera.scale_invariant (s* comes from it)")
 
     ids = batch["ids"]
     B, S = ids.shape
@@ -1115,7 +1172,11 @@ def compute_camera_smooth_loss(predictions, batch, weight_trans=1.0, weight_rot=
 
     # An order-k difference needs k+1 frames (and k+1 chronologically increasing ids).
     if S < max_order + 1 or valid_frame_mask.sum() == 0:
-        zero = (pred_pose_encodings[-1] * 0).mean()
+        # Touch EVERY stage, not just the last: the camera head detaches between refine stages,
+        # so stage-0-only parameters (empty_pose_tokens) get gradient solely from a loss that
+        # reads stage 0. With loss.camera off this term is the only such loss, and a zero built
+        # from the last stage alone trips DDP's unused-parameter check.
+        zero = sum((p * 0).mean() for p in pred_pose_encodings)
         out = {"loss_camera_smooth": zero, "loss_smooth_T": zero, "loss_smooth_R": zero}
         out.update({f"loss_smooth_{c}{o}": zero for o in orders for c in ("T", "R")})
         return out
@@ -1145,6 +1206,8 @@ def compute_camera_smooth_loss(predictions, batch, weight_trans=1.0, weight_rot=
         stage_weight = gamma ** (n_stages - stage_idx - 1)
         pose = pred_pose_encodings[stage_idx][valid_frame_mask]   # (B', S, 9)
         T = pose[..., :3]
+        if scale_invariant:   # the camera loss's s* for this stage (detached)
+            T = T * batch["_si_scale"][stage_idx][valid_frame_mask].view(-1, 1, 1).to(T.dtype)
         quat = pose[..., 3:7]
 
         # Sign-fix quaternion hemisphere so consecutive frames don't spuriously flip.
