@@ -1,0 +1,11 @@
+# scared_cam_depth_tfs_fpos_seed43 + temporal_every 1: a temporal block after EVERY aa-block
+# (24 blocks, ~302M fresh params) instead of every 3rd (8 blocks, 100.8M). Nothing else differs.
+# Compare against tfs_fpos_seed43. Cannot separate "time info at every layer" from "3x params".
+# Written 2026-10-28.
+defaults:
+- scared_cam_depth_tfs_fpos_seed43
+- _self_
+exp_name: scared_cam_depth_tfs_fpos_seed43_tall
+model:
+  temporal_every: 1
+  head_grad_checkpoint: true   # memory only: 24 temporal blocks OOM at 12 frames in the DPT head without it (smoke 2026-10-28)

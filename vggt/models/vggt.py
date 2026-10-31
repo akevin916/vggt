@@ -23,6 +23,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
     def __init__(self, img_size=518, patch_size=14, embed_dim=1024,
                  enable_camera=True, enable_point=True, enable_depth=True, enable_track=True,
                  enable_temporal=False,
+                 temporal_every=3,   # 1 = a temporal block after every aa-block (24); 3 = original 8
                  temporal_share_frame_weights=False,  # temporal steps borrow the frame block's weights
                  rope_3d=False, rope_3d_dims=(24, 24, 16), rope_3d_zero_time=False,  # (y,x,t) RoPE
                  rope_time=False, rope_time_base=10.0,  # (y,x) RoPE + added time phase
@@ -110,6 +111,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             relmask_seed=int(relmask_seed), relmask_rho=float(relmask_rho),
             relmask_ramp_frac=float(relmask_ramp_frac), relmask_st_frac=float(relmask_st_frac),
             relmask_budget_S=int(relmask_budget_S),
+            temporal_every=int(temporal_every),
             temporal_share_frame_weights=temporal_share_frame_weights,
             rope_3d=rope_3d, rope_3d_dims=rope_3d_dims, rope_3d_zero_time=rope_3d_zero_time,
             rope_time=rope_time, rope_time_base=rope_time_base,

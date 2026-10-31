@@ -1,0 +1,9 @@
+# Smoke for scared_cam_depth_tfs_fpos_seed43_tall -- VRAM, s/step, and that the epoch-end
+# pose_eval (c64) fits with the optimizer state parked on CPU, and training resumes after it (2 epochs).
+defaults:
+  - scared_cam_depth_tfs_fpos_seed43_tall
+  - _self_
+
+exp_name: scared_cam_depth_tfs_fpos_seed43_tall_smoke
+max_epochs: 2
+limit_train_batches: 30
