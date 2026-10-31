@@ -17,7 +17,7 @@ import numpy as np
 from tqdm import tqdm
 
 from pipeline.eval.metrics_depth import average_depth_results, eval_sequence_depth
-from pipeline.eval.paths import EVAL_SINTEL, default_output_dir
+from pipeline.eval.paths import output_dirs_from_ckpt
 from pipeline.eval.metrics_pose import eval_pose_metrics
 from pipeline.data.sintel_io import (
     SINTEL_EVAL_SEQUENCES,
@@ -33,12 +33,14 @@ from pipeline.data.sintel_io import (
 )
 from pipeline.eval.vggt_infer import infer_sequence, infer_sequence_chunked, load_vggt_for_eval
 
+TOOL = "eval_sintel"
+
 
 def parse_args():
     ap = argparse.ArgumentParser(description="Sintel pose + depth benchmark")
     ap.add_argument("--ckpt", type=str, required=True)
     ap.add_argument("--sintel_root", type=str, default=None, help="Auto-detected from repo data/ if omitted")
-    ap.add_argument("--out_dir", type=str, default=None, help=f"Default: outputs/{EVAL_SINTEL}/<exp>")
+    ap.add_argument("--out_dir", type=str, default=None, help=f"Default: outputs/<kind>/{TOOL}/<exp>/")
     ap.add_argument("--seq_list", type=str, nargs="*", default=None)
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--chunk_size", type=int, default=0, help="0 = full sequence; else chunk inference")
@@ -62,9 +64,9 @@ def evaluate(args, model=None) -> Dict[str, Any]:
     building a second model on the GPU (see trainer.run_pose_eval). When None, the model
     is loaded from ``args.ckpt`` as in standalone CLI use.
     """
-    args.out_dir = args.out_dir or default_output_dir(args.ckpt, EVAL_SINTEL)
+    out = output_dirs_from_ckpt(args.ckpt, TOOL, override=args.out_dir)
     args.sintel_root = resolve_sintel_root(args.sintel_root)
-    print(f"Output dir: {args.out_dir}")
+    print(f"Output dir: {out.metrics}")
     print(f"Sintel root: {args.sintel_root}")
     if model is None:
         model = load_vggt_for_eval(args.ckpt, device=args.device)
@@ -77,8 +79,7 @@ def evaluate(args, model=None) -> Dict[str, Any]:
     else:
         depth_sequences = list_sintel_full_sequences(args.sintel_root)
         pose_set = set(SINTEL_EVAL_SEQUENCES)
-    os.makedirs(args.out_dir, exist_ok=True)
-    error_log = os.path.join(args.out_dir, "_error_log.txt")
+    error_log = os.path.join(out.runlogs, "_error_log.txt")
 
     pose_per_seq: Dict[str, Dict[str, float]] = {}
     depth_per_seq: Dict[str, Dict[str, float]] = {}
@@ -116,6 +117,7 @@ def evaluate(args, model=None) -> Dict[str, Any]:
         except Exception as e:
             msg = f"{seq}: {e}\n{traceback.format_exc()}"
             errors.append(msg)
+            os.makedirs(out.runlogs, exist_ok=True)
             with open(error_log, "a", encoding="utf-8") as f:
                 f.write(msg + "\n")
 
@@ -135,7 +137,7 @@ def evaluate(args, model=None) -> Dict[str, Any]:
         "errors": errors,
     }
 
-    json_path = os.path.join(args.out_dir, "results.json")
+    json_path = out.metrics_file("results.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
 

@@ -139,7 +139,7 @@ illu corr（光照 token 預測與 MSR 目標的相關，val 累積平均）：`
 | `dual_kern_wide` | 0.0552 / 0.0543 | 0.0447 / 0.0436 | 0.0703 / 0.0712 | 0.0769 / 0.0755 |
 | `dual_gap（frame_time）` | 0.0541 / 0.0546 | 0.0458 / 0.0512 | 0.0676 / 0.0687 | 0.0789 / 0.0807 |
 
-來源 `outputs/eval_scared/{test_depth_0f_single_afsfm,test_depth_0f_afsfm,test_pose_0f,test_pose_0f_chunk5}/<exp>_<ckpt>/results.json`。
+來源 `outputs/_archive/legacy_2026-10-20/eval_scared/{test_depth_0f_single_afsfm,test_depth_0f_afsfm,test_pose_0f,test_pose_0f_chunk5}/<exp>_<ckpt>/results.json`。
 
 ### A.3 pose 的逐序列值（`epoch_10`，ds3 / ds5）
 

@@ -29,9 +29,10 @@ answers "does fine-tuning help", which nobody is asking. It stays in ``--ckpts``
 sanity reference (does the pipeline produce sane geometry at all), and any table built
 from it must be labelled as such -- never as the baseline row.
 
-Everything lands in ``outputs/eval_lesion/<exp>/``, one subdirectory per mode and folder,
-with the raw float arrays alongside the figures' inputs -- redrawing must never need the
-GPU again.
+Output keys are ``<exp>__<mode>/<folder>/`` under ``outputs/{metrics,vis,cache}/eval_lesion/``:
+raw float arrays and clouds go to cache, clips / warped frames / .ply to vis, and the
+per-checkpoint ``summary.json`` to ``metrics/eval_lesion/<exp>/``. Redrawing must never need
+the GPU again.
 
 Usage:
   python -m pipeline.benchmark.eval_lesion \
@@ -51,7 +52,7 @@ from tqdm import tqdm
 
 from pipeline.data.paths import data_path
 from pipeline.eval.media_io import write_video
-from pipeline.eval.paths import default_output_dir
+from pipeline.eval.paths import exp_name_from_ckpt, output_dirs
 from pipeline.eval.ply_io import write_ply
 from pipeline.eval.vggt_infer import infer_sequence, load_vggt_for_eval
 from pipeline.eval.warp_psnr import score_pair, unproject_to_world
@@ -76,12 +77,13 @@ def preprocessed(paths):
     return t.permute(0, 2, 3, 1).numpy().astype(np.float32)
 
 
-def save_cloud(out_stem, depth, intrinsic, extrinsic, images, max_points, depth_pct):
+def save_cloud(out, stem, depth, intrinsic, extrinsic, images, max_points, depth_pct):
     """Point cloud by unprojecting the predicted depth -- not the point head, which the
     fine-tuned checkpoints do not carry. Same arrays the depth figures use, so the cloud
     and the depth maps can never disagree.
 
-    Writes two files. The ``.ply`` is for a viewer. The ``.npz`` additionally carries a
+    Writes two files under ``out`` (an OutputDirs). The ``.ply`` (vis) is for a viewer. The
+    ``.npz`` (cache, beside seq.npz so timeline.py --blend finds both) additionally carries a
     per-point ``frame_id``, which is what makes the timeline visualisation possible: "the
     reconstruction at time t" is the slice ``frame_id <= t``, so no re-inference is ever
     needed to scrub through it.
@@ -113,10 +115,10 @@ def save_cloud(out_stem, depth, intrinsic, extrinsic, images, max_points, depth_
     cols = np.concatenate(cols) if cols else np.zeros((0, 3), np.float32)
     fids = np.concatenate(fids) if fids else np.zeros((0,), np.int16)
 
-    np.savez_compressed(out_stem + ".npz", points=pts.astype(np.float32),
+    np.savez_compressed(out.cache_file(stem + ".npz"), points=pts.astype(np.float32),
                         colors=(np.clip(cols, 0, 1) * 255).astype(np.uint8),
                         frame_id=fids, n_frames=np.int32(len(depth)))
-    return write_ply(out_stem + ".ply", pts, cols)
+    return write_ply(out.vis_file(stem + ".ply"), pts, cols)
 
 
 def dump_arrays(path, pred, extra=None):
@@ -127,13 +129,9 @@ def dump_arrays(path, pred, extra=None):
     np.savez_compressed(path, **payload)
 
 
-def run_pair(model, folder_dir, out_dir, args):
+def run_pair(model, folder_dir, out, args):
     names = left_frames(folder_dir)
     rows, strips = [], []
-    warped_dir = os.path.join(out_dir, "warped")
-    ply_dir = os.path.join(out_dir, "ply")
-    os.makedirs(warped_dir, exist_ok=True)
-    os.makedirs(ply_dir, exist_ok=True)
 
     for n in tqdm(names, desc=f"pair {os.path.basename(folder_dir)}", leave=False):
         lp = os.path.join(folder_dir, n)
@@ -155,13 +153,13 @@ def run_pair(model, folder_dir, out_dir, args):
         )
         stem = n[:-6]
         Image.fromarray((np.clip(res["warped"], 0, 1) * 255).astype(np.uint8)).save(
-            os.path.join(warped_dir, f"{stem}_warpedR.png"))
-        dump_arrays(os.path.join(out_dir, f"{stem}.npz"), pred,
+            out.vis_file(f"warped/{stem}_warpedR.png"))
+        dump_arrays(out.cache_file(f"{stem}.npz"), pred,
                     extra=dict(valid=res["valid"]))
         if args.ply:
             # A pair reconstructs too -- two views, one cloud. Without this the pair and
             # sequence runs would not be comparable as *reconstructions*, only as numbers.
-            save_cloud(os.path.join(ply_dir, stem), pred["depth"], pred["intrinsic"],
+            save_cloud(out, f"ply/{stem}", pred["depth"], pred["intrinsic"],
                        pred["extrinsic"], imgs, args.max_points, args.depth_pct)
         rows.append(dict(pair=stem, psnr=res["psnr"],
                          psnr_no_specular=res["psnr_no_specular"],
@@ -172,7 +170,7 @@ def run_pair(model, folder_dir, out_dir, args):
             [imgs[0], imgs[1], np.clip(res["warped"], 0, 1)], axis=1))
 
     if strips:
-        write_video(os.path.join(out_dir, "pairs_LRwarp.mp4"), strips, fps=args.fps)
+        write_video(out.vis_file("pairs_LRwarp.mp4"), strips, fps=args.fps)
 
     finite = [r["psnr"] for r in rows if np.isfinite(r["psnr"])]
     return dict(per_pair=rows,
@@ -183,43 +181,45 @@ def run_pair(model, folder_dir, out_dir, args):
                 n_pairs=len(rows))
 
 
-def run_sequence(model, folder_dir, out_dir, args, stride):
+def run_sequence(model, folder_dir, out, args, stride):
     names = left_frames(folder_dir)[::stride]
     paths = [os.path.join(folder_dir, n) for n in names]
     pred = infer_sequence(model, paths, device=args.device)
     imgs = preprocessed(paths)
-    dump_arrays(os.path.join(out_dir, "seq.npz"), pred,
+    dump_arrays(out.cache_file("seq.npz"), pred,
                 extra=dict(frames=np.array(names), images=(imgs * 255).astype(np.uint8)))
-    # The clip lives next to the cloud: a point cloud with no footage beside it cannot be
+    # The clip shares the cloud's key: a point cloud with no footage beside it cannot be
     # judged by anyone who was not there when it was made.
-    write_video(os.path.join(out_dir, "input.mp4"), imgs, fps=args.fps)
+    write_video(out.vis_file("input.mp4"), imgs, fps=args.fps)
 
     info = dict(n_frames=len(paths), stride=stride, frames=names)
     if args.ply and "depth" in pred:
-        stem = os.path.join(out_dir, "cloud")
-        info["ply_points"] = save_cloud(stem, pred["depth"], pred["intrinsic"],
+        info["ply_points"] = save_cloud(out, "cloud", pred["depth"], pred["intrinsic"],
                                         pred["extrinsic"], imgs,
                                         args.max_points, args.depth_pct)
-        info["ply"] = stem + ".ply"
+        info["ply"] = os.path.join(out.vis, "cloud.ply")
     return info
 
 
 def eval_ckpt(ckpt, args):
     model = load_vggt_for_eval(ckpt, device=args.device)
-    base = args.out_dir or default_output_dir(ckpt, TOOL)
+    exp = exp_name_from_ckpt(ckpt)
+    summary_dirs = output_dirs(TOOL, exp, override=args.out_dir)
     results = {}
 
     for folder in args.folders:
         folder_dir = os.path.join(args.lesion_root, folder)
         res = {}
         for mode in args.modes:
-            out_dir = os.path.join(base, mode, folder)
-            os.makedirs(out_dir, exist_ok=True)
+            if args.out_dir:
+                out = summary_dirs.sub(mode).sub(folder)
+            else:
+                out = output_dirs(TOOL, exp, mode).sub(folder)
             try:
                 if mode == "pair":
-                    res[mode] = run_pair(model, folder_dir, out_dir, args)
+                    res[mode] = run_pair(model, folder_dir, out, args)
                 else:
-                    res[mode] = run_sequence(model, folder_dir, out_dir, args,
+                    res[mode] = run_sequence(model, folder_dir, out, args,
                                              stride=2 if mode == "seq2" else 1)
             except Exception:
                 traceback.print_exc()
@@ -234,10 +234,10 @@ def eval_ckpt(ckpt, args):
                              note="no calibration in this set; PSNR is depth-vs-pose "
                                   "self-consistency, not metric accuracy"),
                    results=results)
-    os.makedirs(base, exist_ok=True)
-    with open(os.path.join(base, "summary.json"), "w") as f:
+    summary_path = summary_dirs.metrics_file("summary.json")
+    with open(summary_path, "w") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
-    print(f"-> {os.path.join(base, 'summary.json')}")
+    print(f"-> {summary_path}")
     return payload
 
 
@@ -258,7 +258,7 @@ def main():
     ap.add_argument("--fps", type=float, default=4.0, help="playback fps for the dumped clips")
     ap.add_argument("--depth_pct", type=float, default=99.0,
                     help="drop points beyond this depth percentile (far-field noise)")
-    ap.add_argument("--out_dir", default=None, help="override; otherwise outputs/<tool>/<exp>/")
+    ap.add_argument("--out_dir", default=None, help="put everything in one dir; otherwise outputs/<kind>/<tool>/<exp>[__<mode>]/")
     args = ap.parse_args()
 
     args.folders = args.folders or list_folders(args.lesion_root)

@@ -471,7 +471,7 @@ def main():
     ap.add_argument("--fov_sweep", metavar="SEQ", default=None)
     ap.add_argument("--fov_list", nargs="*", type=float, default=[60, 70, 80, 90, 100, 110, 120, 130])
     ap.add_argument("--sweep_out", default=None,
-                    help="default: outputs/c3vd_convert/fov_sweep/")
+                    help="default: outputs/vis/c3vd_convert/fov_sweep/")
     args = ap.parse_args()
 
     if args.inspect:
@@ -479,8 +479,8 @@ def main():
     if args.verify:
         verify(osp.join(args.raw_dir, args.verify), args.verify_gap, args.verify_cull); return
     if args.fov_sweep:
-        out = args.sweep_out or osp.join(osp.dirname(osp.dirname(osp.dirname(osp.dirname(osp.abspath(__file__))))),
-                                         "outputs", "c3vd_convert", "fov_sweep")
+        from pipeline.eval.paths import output_dirs
+        out = args.sweep_out or output_dirs("c3vd_convert", "fov_sweep").vis
         fov_sweep(osp.join(args.raw_dir, args.fov_sweep), osp.abspath(out),
                   args.fov_list, args.out_w, args.out_h); return
 

@@ -31,6 +31,7 @@ from dust3r.utils.image import load_images
 
 from pipeline.data.paths import data_path
 from pipeline.eval.media_io import write_video
+from pipeline.eval.paths import output_dirs
 from pipeline.eval.ply_io import write_ply
 from pipeline.eval.seq_io import dump_seq_npz
 from pipeline.benchmark.eval_monst3r_lesion import MONST3R_VIDEO_OPTS
@@ -67,7 +68,7 @@ def c2w_to_extrinsic(c2w_4x4):
     return torch.cat([R_inv, t_inv[:, None]], dim=1)
 
 
-def save_cloud(out_stem, depth_list, intrinsic_list, extrinsic_list,
+def save_cloud(out, stem, depth_list, intrinsic_list, extrinsic_list,
                images_np, max_points, depth_pct):
     from pipeline.eval.warp_psnr import unproject_to_world
     per_frame = max(1, max_points // max(1, len(depth_list)))
@@ -92,13 +93,13 @@ def save_cloud(out_stem, depth_list, intrinsic_list, extrinsic_list,
     cols = np.concatenate(cols) if cols else np.zeros((0, 3), np.float32)
     fids = np.concatenate(fids) if fids else np.zeros((0,),   np.int16)
     np.savez_compressed(
-        out_stem + ".npz",
+        out.cache_file(stem + ".npz"),
         points=pts.astype(np.float32),
         colors=(np.clip(cols, 0, 1) * 255).astype(np.uint8),
         frame_id=fids,
         n_frames=np.int32(len(depth_list)),
     )
-    return write_ply(out_stem + ".ply", pts, cols)
+    return write_ply(out.vis_file(stem + ".ply"), pts, cols)
 
 
 def scene_to_arrays(scene, imgs_raw):
@@ -118,7 +119,7 @@ def scene_to_arrays(scene, imgs_raw):
 # per-segment
 # ---------------------------------------------------------------------------
 
-def run_segment(model, seg_dir, out_dir, args):
+def run_segment(model, seg_dir, out, args):
     img_dir = os.path.join(seg_dir, "image")
     paths = sorted(
         os.path.join(img_dir, f) for f in os.listdir(img_dir) if f.endswith(".png")
@@ -149,14 +150,12 @@ def run_segment(model, seg_dir, out_dir, args):
 
     depths, Ks, Es, imgs_np = scene_to_arrays(scene, imgs)
 
-    os.makedirs(out_dir, exist_ok=True)
-    write_video(os.path.join(out_dir, "input.mp4"), imgs_np, fps=args.fps)
-    dump_seq_npz(os.path.join(out_dir, "seq.npz"), depths, Ks, Es, imgs_np,
+    write_video(out.vis_file("input.mp4"), imgs_np, fps=args.fps)
+    dump_seq_npz(out.cache_file("seq.npz"), depths, Ks, Es, imgs_np,
                  frames=np.array([os.path.basename(p) for p in paths]))
 
-    stem = os.path.join(out_dir, "cloud")
-    n_pts = save_cloud(stem, depths, Ks, Es, imgs_np, args.max_points, args.depth_pct)
-    print(f"    -> {n_pts:,} points  {stem}.ply")
+    n_pts = save_cloud(out, "cloud", depths, Ks, Es, imgs_np, args.max_points, args.depth_pct)
+    print(f"    -> {n_pts:,} points  {os.path.join(out.vis, 'cloud.ply')}")
     return dict(seg=seg_name, n_frames=len(paths), ply_points=n_pts)
 
 
@@ -186,9 +185,7 @@ def main():
     args = ap.parse_args()
 
     segs = args.segs or DEFAULT_SEGS
-    repo_root = os.path.normpath(
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-    base = args.out_dir or os.path.join(repo_root, "outputs", TOOL, MODEL_SUBDIR)
+    base = output_dirs(TOOL, MODEL_SUBDIR, override=args.out_dir)
 
     print(f"MonST3R gastric  |  {len(segs)} segments  |  max_frames={args.max_frames}")
 
@@ -202,15 +199,13 @@ def main():
             print(f"  [skip] {seg_dir} not found")
             results[seg] = dict(error="not found")
             continue
-        out_dir = os.path.join(base, seg)
         try:
-            results[seg] = run_segment(model, seg_dir, out_dir, args)
+            results[seg] = run_segment(model, seg_dir, base.sub(seg), args)
         except Exception:
             traceback.print_exc()
             results[seg] = dict(error=True)
 
-    os.makedirs(base, exist_ok=True)
-    summary_path = os.path.join(base, "summary.json")
+    summary_path = base.metrics_file("summary.json")
     with open(summary_path, "w") as f:
         json.dump(dict(ckpt=args.ckpt, segs=segs, results=results),
                   f, indent=2, ensure_ascii=False)

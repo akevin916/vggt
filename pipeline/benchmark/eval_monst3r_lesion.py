@@ -51,7 +51,7 @@ from dust3r.utils.image import load_images
 
 from pipeline.data.paths import data_path
 from pipeline.eval.media_io import write_video
-from pipeline.eval.paths import default_output_dir
+from pipeline.eval.paths import output_dirs
 from pipeline.eval.ply_io import write_ply
 from pipeline.eval.seq_io import dump_seq_npz
 
@@ -89,7 +89,7 @@ def c2w_to_extrinsic(c2w_4x4):
     return torch.cat([R_inv, t_inv[:, None]], dim=1)          # (3,4)
 
 
-def save_cloud(out_stem, depth_list, intrinsic_list, extrinsic_list,
+def save_cloud(out, stem, depth_list, intrinsic_list, extrinsic_list,
                images_np, max_points, depth_pct):
     """Unproject MonST3R depthmaps to world-frame point cloud.
 
@@ -127,13 +127,13 @@ def save_cloud(out_stem, depth_list, intrinsic_list, extrinsic_list,
     fids = np.concatenate(fids) if fids else np.zeros((0,),   np.int16)
 
     np.savez_compressed(
-        out_stem + ".npz",
+        out.cache_file(stem + ".npz"),
         points=pts.astype(np.float32),
         colors=(np.clip(cols, 0, 1) * 255).astype(np.uint8),
         frame_id=fids,
         n_frames=np.int32(len(depth_list)),
     )
-    return write_ply(out_stem + ".ply", pts, cols)
+    return write_ply(out.vis_file(stem + ".ply"), pts, cols)
 
 
 # ---------------------------------------------------------------------------
@@ -242,12 +242,11 @@ def scene_to_arrays(scene, imgs_raw, device):
 # per-folder runners
 # ---------------------------------------------------------------------------
 
-def run_pair_folder(model, folder_dir, out_dir, args):
+def run_pair_folder(model, folder_dir, out, args):
     """Run MonST3R in 2-frame mode for each (L,R) pair in the folder."""
     from tqdm import tqdm
     names = left_frames(folder_dir)
-    ply_dir = os.path.join(out_dir, "ply")
-    os.makedirs(ply_dir, exist_ok=True)
+    ply_dir = os.path.join(out.vis, "ply")
     n_ok = 0
     for n in tqdm(names, desc=f"pair {os.path.basename(folder_dir)}", leave=False):
         lp = os.path.join(folder_dir, n)
@@ -258,7 +257,7 @@ def run_pair_folder(model, folder_dir, out_dir, args):
         try:
             scene, imgs_raw = run_monst3r_pair(model, lp, rp, args.device)
             depths, Ks, Es, imgs_np = scene_to_arrays(scene, imgs_raw, args.device)
-            save_cloud(os.path.join(ply_dir, stem), depths, Ks, Es,
+            save_cloud(out, f"ply/{stem}", depths, Ks, Es,
                        imgs_np, args.max_points, args.depth_pct)
             n_ok += 1
         except Exception:
@@ -267,7 +266,7 @@ def run_pair_folder(model, folder_dir, out_dir, args):
     return dict(n_pairs=len(names), n_ok=n_ok, ply_dir=ply_dir)
 
 
-def run_folder(model, folder_dir, out_dir, args):
+def run_folder(model, folder_dir, out, args):
     names  = left_frames(folder_dir)
     paths  = [os.path.join(folder_dir, n) for n in names]
 
@@ -279,20 +278,18 @@ def run_folder(model, folder_dir, out_dir, args):
         scene_graph=args.scene_graph, video_opts=not args.no_video_opts)
     depths, Ks, Es, imgs_np = scene_to_arrays(scene, imgs_raw, args.device)
 
-    os.makedirs(out_dir, exist_ok=True)
-    write_video(os.path.join(out_dir, "input.mp4"), imgs_np, fps=args.fps)
+    write_video(out.vis_file("input.mp4"), imgs_np, fps=args.fps)
     # seq.npz as well as the cloud: without it this arm cannot be drawn by the polished
     # renderer that the VGGT arms use, and a 2x2 comparison would be mixing two renderers.
-    dump_seq_npz(os.path.join(out_dir, "seq.npz"), depths, Ks, Es, imgs_np,
+    dump_seq_npz(out.cache_file("seq.npz"), depths, Ks, Es, imgs_np,
                  frames=np.array(names))
 
     info = dict(n_frames=len(paths), niter=args.niter)
-    stem = os.path.join(out_dir, "cloud")
-    n_pts = save_cloud(stem, depths, Ks, Es, imgs_np,
+    n_pts = save_cloud(out, "cloud", depths, Ks, Es, imgs_np,
                        args.max_points, args.depth_pct)
     info["ply_points"] = n_pts
-    info["ply"]        = stem + ".ply"
-    print(f"    -> {n_pts:,} points  {stem}.ply")
+    info["ply"]        = os.path.join(out.vis, "cloud.ply")
+    print(f"    -> {n_pts:,} points  {info['ply']}")
     return info
 
 
@@ -336,8 +333,7 @@ def main():
     print(f"MonST3R  |  {len(folders)} folders  |  modes={args.modes}")
 
     model  = load_model(args.ckpt, args.device)
-    repo_root = os.path.normpath(os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+    summary_dirs = output_dirs(TOOL, MODEL_SUBDIR, override=args.out_dir)
     results = {}
 
     for folder in folders:
@@ -345,25 +341,21 @@ def main():
         res = {}
         for mode in args.modes:
             if args.out_dir:
-                base = os.path.join(args.out_dir, mode)
+                out = summary_dirs.sub(mode).sub(folder)
             else:
-                base = os.path.join(repo_root, "outputs", TOOL, MODEL_SUBDIR, mode)
-            out_dir = os.path.join(base, folder)
+                out = output_dirs(TOOL, MODEL_SUBDIR, mode).sub(folder)
             try:
                 if mode == "seq":
-                    res[mode] = run_folder(model, folder_dir, out_dir, args)
+                    res[mode] = run_folder(model, folder_dir, out, args)
                 else:
-                    res[mode] = run_pair_folder(model, folder_dir, out_dir, args)
+                    res[mode] = run_pair_folder(model, folder_dir, out, args)
             except Exception:
                 traceback.print_exc()
                 res[mode] = dict(error=True)
         results[folder] = res
 
     import json
-    summary_base = args.out_dir or os.path.join(
-        repo_root, "outputs", TOOL, MODEL_SUBDIR)
-    os.makedirs(summary_base, exist_ok=True)
-    summary_path = os.path.join(summary_base, "summary.json")
+    summary_path = summary_dirs.metrics_file("summary.json")
     with open(summary_path, "w") as f:
         json.dump(dict(ckpt=args.ckpt, folders=folders, modes=args.modes,
                        results=results), f, indent=2, ensure_ascii=False)

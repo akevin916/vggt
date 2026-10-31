@@ -63,7 +63,7 @@ from pipeline.data.sintel_io import compute_preprocess_meta, resize_pred_to_gt
 from pipeline.eval.metrics_depth import average_depth_results, eval_sequence_depth
 from pipeline.eval.metrics_pose import (eval_pose_metrics, snippet_metrics_from_chunks,
                                      snippet_pose_metrics)
-from pipeline.eval.paths import exp_name_from_ckpt, output_dir_for_exp
+from pipeline.eval.paths import exp_name_from_ckpt, output_dirs
 from pipeline.eval.vggt_infer import infer_sequence, infer_sequence_stitched, load_vggt_for_eval
 
 TOOL = "eval_scared"
@@ -92,11 +92,10 @@ def split_tag(split: str) -> str:
     return split.replace("/", "_")
 
 
-# CLI default layout (2026-10-05): outputs/eval/<exp>/<protocol>_<role>/results.json, so one
-# experiment's numbers live under one dir. The four reference protocols get the short names
-# pose / depth (c5 snippet pose, single-view afsfm depth); every other flag set spells itself
-# out (pose_c64, depth_multi, ..._gateoff). --out_dir keeps the old <out_dir>/<exp>_<stem>/.
-OUT_TOOL = "eval"
+# CLI default layout (2026-10-20): outputs/metrics/eval_scared/<exp>__<protocol>_<role>/results.json.
+# The four reference protocols get the short names pose / depth (c5 snippet pose, single-view
+# afsfm depth); every other flag set spells itself out (pose_c64, depth_multi, ..._gateoff).
+# --out_dir keeps the old <out_dir>/<exp>_<stem>/.
 CKPT_ROLE = {"last.pt": "last", "best_ate.pt": "best"}
 
 
@@ -419,8 +418,8 @@ def evaluate(args, model=None):
     seqs = getattr(args, "seqs", None) or list_sequences(args.scared_root, args.split)
     seqs = [str(x) for x in seqs]   # config-supplied lists may be OmegaConf nodes (not JSON-able)
     suffix = "" if getattr(args, "gate_mode", "predicted") == "predicted" else f"_gate{args.gate_mode}"
-    args.out_dir = getattr(args, "out_dir", None) or output_dir_for_exp(
-        f"{split_tag(args.split)}_{args.n_frames}f{suffix}", TOOL)
+    args.out_dir = getattr(args, "out_dir", None) or output_dirs(
+        TOOL, exp_name_from_ckpt(args.ckpt), f"{split_tag(args.split)}_{args.n_frames}f{suffix}").metrics
     os.makedirs(args.out_dir, exist_ok=True)
 
     results = eval_ckpt(args.ckpt, args.scared_root, args.split, seqs, args, model=model)
@@ -508,12 +507,12 @@ def main():
     base_out = args.out_dir
     if base_out is None:
         tag = protocol_tag(args)
-        out_dirs = {c: os.path.join(output_dir_for_exp(exp_name_from_ckpt(c), OUT_TOOL),
-                                    f"{tag}_{ckpt_role(c)}") for c in args.ckpts}
+        out_dirs = {c: output_dirs(TOOL, exp_name_from_ckpt(c), f"{tag}_{ckpt_role(c)}").metrics
+                    for c in args.ckpts}
         if len(set(out_dirs.values())) != len(out_dirs):
             raise SystemExit(f"two ckpts map to one output dir: {out_dirs}")
     print(f"{len(args.ckpts)} ckpts x {len(seqs)} sequences ({args.split}), "
-          f"{args.n_frames} frames each -> {base_out or 'outputs/eval/<exp>/'}")
+          f"{args.n_frames} frames each -> {base_out or f'outputs/metrics/{TOOL}/<exp>__{tag}_<role>/'}")
 
     results = {}
     for ckpt in args.ckpts:
