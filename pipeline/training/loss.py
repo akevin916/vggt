@@ -1329,14 +1329,88 @@ def illu_msr_target(images, sigmas=(15.0, 80.0, 250.0), down=4):
     return log_s, torch.ones_like(log_s, dtype=torch.bool)
 
 
+def illu_xframe_target(images, depths, extrinsics, intrinsics, point_masks, min_valid=100):
+    """Per-frame log-illumination level from a CHAIN of GT-geometry cross-frame brightness
+    ratios -- the thing illu_shading_target/illu_msr_target cannot give: a target grounded in
+    real appearance change, not a per-frame self-referential decomposition.
+
+    For each t -> t+1: warp frame t's own pixels with GT depth + GT pose (not predicted -- this
+    is a label, no gradient must flow through the geometry) into frame t+1's camera, sample
+    frame t+1's real luma at those points, and compare against frame t's own luma at the same
+    pixels. Both samples are the SAME set of 3D points seen in two frames, so (ignoring
+    non-Lambertian effects) their log-ratio IS the illumination change -- geometry is held
+    exactly fixed by GT, so it cannot leak into the target the way predicted-pose warps would.
+
+    Chained forward only (no ±1 branching) and anchored at frame 0 := 0; the anchor is
+    arbitrary (only relative levels are ever measured), which is exactly what
+    compute_illu_loss's shift_invariant per-sequence median subtraction already absorbs for
+    phys/invr2, so this target needs no code of its own to handle it. A frame is invalid
+    (chain_ok=False) once its predecessor is invalid or a pair's valid-pixel count is below
+    `min_valid` -- avoids silently basing a frame's absolute level on a near-empty pair.
+
+    images [B,S,3,H,W] in [0,1], depths/point_masks [B,S,H,W], extrinsics [B,S,3,4] GT
+    world-to-cam, intrinsics [B,S,3,3] GT -> (log_s [B*S,H,W], valid [B*S,H,W]), each frame's
+    value broadcast constant over H,W so it drops into compute_illu_loss's pooling unchanged --
+    same return contract as illu_shading_target / illu_msr_target.
+    """
+    B, S, _, H, W = images.shape
+    device, dtype = images.device, images.dtype
+    yy, xx = torch.meshgrid(torch.arange(H, device=device, dtype=dtype),
+                            torch.arange(W, device=device, dtype=dtype), indexing="ij")
+    Y = 0.299 * images[:, :, 0] + 0.587 * images[:, :, 1] + 0.114 * images[:, :, 2]  # (B,S,H,W)
+
+    level = torch.zeros(B, S, device=device, dtype=dtype)
+    chain_ok = torch.zeros(B, S, dtype=torch.bool, device=device)
+    chain_ok[:, 0] = True
+    for t in range(S - 1):
+        fx0, cx0 = intrinsics[:, t, 0, 0, None, None], intrinsics[:, t, 0, 2, None, None]
+        fy0, cy0 = intrinsics[:, t, 1, 1, None, None], intrinsics[:, t, 1, 2, None, None]
+        Dt = depths[:, t]
+        pts_t = torch.stack([(xx[None] - cx0) / fx0 * Dt, (yy[None] - cy0) / fy0 * Dt, Dt],
+                            dim=-1).reshape(B, H * W, 3)
+
+        Rt, Tt = extrinsics[:, t, :, :3], extrinsics[:, t, :, 3]
+        Rt1, Tt1 = extrinsics[:, t + 1, :, :3], extrinsics[:, t + 1, :, 3]
+        pts_world = torch.matmul(pts_t - Tt[:, None, :], Rt)
+        pts_t1 = (torch.matmul(pts_world, Rt1.transpose(-1, -2)) + Tt1[:, None, :]).reshape(B, H, W, 3)
+
+        fx1, cx1 = intrinsics[:, t + 1, 0, 0, None, None], intrinsics[:, t + 1, 0, 2, None, None]
+        fy1, cy1 = intrinsics[:, t + 1, 1, 1, None, None], intrinsics[:, t + 1, 1, 2, None, None]
+        Z1 = pts_t1[..., 2].clamp(min=1e-3)
+        u1, v1 = fx1 * pts_t1[..., 0] / Z1 + cx1, fy1 * pts_t1[..., 1] / Z1 + cy1
+        gx, gy = 2.0 * u1 / (W - 1) - 1.0, 2.0 * v1 / (H - 1) - 1.0
+        in_bounds = (gx.abs() <= 1) & (gy.abs() <= 1) & (pts_t1[..., 2] > 1e-3)
+        grid = torch.stack([gx, gy], dim=-1)
+
+        sampled_Y = F.grid_sample(Y[:, t + 1, None], grid, mode="bilinear",
+                                  align_corners=True, padding_mode="zeros")[:, 0]
+        valid = point_masks[:, t] & in_bounds
+        cnt = valid.float().sum(dim=(1, 2))
+        mean_s = (sampled_Y * valid).sum(dim=(1, 2)) / cnt.clamp_min(1)
+        mean_t = (Y[:, t] * valid).sum(dim=(1, 2)) / cnt.clamp_min(1)
+        r = torch.log(mean_s.clamp_min(1e-3) / mean_t.clamp_min(1e-3))
+
+        ok = chain_ok[:, t] & (cnt >= min_valid)
+        level[:, t + 1] = torch.where(ok, level[:, t] + r, level[:, t])
+        chain_ok[:, t + 1] = ok
+
+    log_s = level[:, :, None, None].expand(B, S, H, W).reshape(B * S, H, W)
+    valid_out = chain_ok[:, :, None, None].expand(B, S, H, W).reshape(B * S, H, W)
+    return log_s, valid_out
+
+
 def compute_illu_loss(predictions, batch, target="phys", smooth_sigma=1.0, min_valid_frac=0.5,
                       shift_invariant=True, **kwargs):
     """L1 between the illumination head's log map and a log-illumination target.
 
     target: "phys" / "invr2" = near-field shading from GT depth (illu_shading_target);
-            "msr" = multi-scale Retinex surround of the image itself (illu_msr_target).
+            "msr" = multi-scale Retinex surround of the image itself (illu_msr_target);
+            "xframe" = GT-geometry cross-frame brightness-ratio chain (illu_xframe_target) --
+            the one target actually grounded in real appearance change rather than a
+            per-frame decomposition; needs GT depth, extrinsics, intrinsics, point_masks.
     shift_invariant: subtract the per-frame (detached) median residual before the L1. Needed for
-    the depth targets (unknown depth scale and light intensity); for "msr" the absolute log level
+    the depth targets (unknown depth scale and light intensity) and for "xframe" (the chain's
+    anchor at frame 0 is arbitrary); for "msr" the absolute log level
     is well defined and IS the per-frame brightness, so set it False there or that part is erased.
 
     The target is pooled to the head's own grid in log space (valid pixels only), and a cell
@@ -1358,6 +1432,11 @@ def compute_illu_loss(predictions, batch, target="phys", smooth_sigma=1.0, min_v
             images = batch["images"].float()
             H, W = images.shape[-2:]
             log_s, valid = illu_msr_target(images.reshape(B * S, 3, H, W))
+        elif target == "xframe":
+            log_s, valid = illu_xframe_target(
+                batch["images"].float(), batch["depths"].float(), batch["extrinsics"].float(),
+                batch["intrinsics"].float(), batch["point_masks"].bool(),
+            )
         else:
             depths = batch["depths"].float()
             H, W = depths.shape[-2:]
