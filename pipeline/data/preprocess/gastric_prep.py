@@ -18,8 +18,8 @@ This script measures 1 and 2, writes a contact sheet so the segment choice is in
 rather than guessed, and exports the chosen segments cropped, masked and renumbered.
 
 Prepared sequences land in ``<gastric_root>/prep/`` (they are data, and follow the same
-convention as the ``po_*``/``*_dynmask`` preprocessors); the diagnostic figure and the
-segment table land in ``outputs/gastric_prep/``.
+convention as the ``po_*``/``*_dynmask`` preprocessors); the diagnostic figure lands in
+``outputs/vis/gastric_prep/private/`` and the segment table in ``outputs/metrics/gastric_prep/private/``.
 
 Usage:
   python -m pipeline.data.preprocess.gastric_prep --list              # measure + contact sheet only
@@ -41,7 +41,7 @@ import matplotlib.pyplot as plt
 
 from pipeline.data.paths import data_path
 from pipeline.eval.media_io import write_video
-from pipeline.eval.paths import output_dir_for_exp
+from pipeline.eval.paths import output_dirs
 
 TOOL = "gastric_prep"
 DARK = 25.0            # the letterbox sits at luminance 15; tissue starts well above 25
@@ -218,8 +218,7 @@ def main():
         print(f"{i:>2} {s['frame_start']:6d}-{s['frame_end']:<9d} {s['n_frames']:>4} "
               f"{s['motion_median']:>12.1f} {s['motion_total']:>10.0f}")
 
-    out_dir = args.out_dir or output_dir_for_exp("private", TOOL)
-    os.makedirs(out_dir, exist_ok=True)
+    out = output_dirs(TOOL, "private", override=args.out_dir)
 
     n_show = min(6, len(segs))
     fig = plt.figure(figsize=(15, 4 + 2.6 * ((n_show + 2) // 3)))
@@ -249,15 +248,16 @@ def main():
                     f"{s['n_frames']}f  {s['motion_median']:.0f}px/step", fontsize=9)
         a.axis("off")
     fig.tight_layout()
-    fig_path = os.path.join(out_dir, "gastric_segments.png")
+    fig_path = out.vis_file("gastric_segments.png")
     fig.savefig(fig_path, dpi=120); plt.close(fig)
 
-    with open(os.path.join(out_dir, "segments.json"), "w") as f:
+    seg_path = out.metrics_file("segments.json")
+    with open(seg_path, "w") as f:
         json.dump(dict(n_frames=len(frames), period=period, stride=stride,
                        bbox=dict(y0=y0, y1=y1, x0=x0, x1=x1),
                        mask_valid_frac=float(mask.mean()),
                        motion_median=float(np.median(mv)), segments=segs), f, indent=2)
-    print(f"\n{fig_path}\n{os.path.join(out_dir, 'segments.json')}")
+    print(f"\n{fig_path}\n{seg_path}")
 
     chosen = []
     if args.export:

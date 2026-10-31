@@ -41,7 +41,7 @@ the only record of how far it got.
 Usage (from the repo root):
     python -m pipeline.training.tools.shm_repro                          # 30 min, 8 workers, DataLoader-like
     python -m pipeline.training.tools.shm_repro --minutes 60 --workers 12 --strategy file_system
-    tail -f outputs/shm_repro/shm_repro.log            # from another shell
+    tail -f outputs/runlogs/shm_repro/shm_repro.log            # from another shell
 
 Exit codes:  0 = survived the full duration    1 = a worker died (the reproduction)
 """
@@ -100,11 +100,11 @@ def main() -> int:
                     help="bounded so a slow consumer cannot grow the footprint without limit")
     ap.add_argument("--heartbeat", type=float, default=10.0, help="seconds between log lines")
     ap.add_argument("--out_dir", default=None,
-                    help="default: outputs/shm_repro/ relative to the repo root")
+                    help="default: outputs/runlogs/shm_repro/")
     args = ap.parse_args()
 
     repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    out_dir = args.out_dir or os.path.join(repo_root, "outputs", "shm_repro")
+    out_dir = args.out_dir or os.path.join(repo_root, "outputs", "runlogs", "shm_repro")
     os.makedirs(out_dir, exist_ok=True)
     log_path = os.path.join(out_dir, "shm_repro.log")
     log_fh = open(log_path, "a", buffering=1)

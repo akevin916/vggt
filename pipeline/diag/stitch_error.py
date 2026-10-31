@@ -27,7 +27,7 @@ from scipy.spatial.transform import Rotation
 
 from pipeline.data.paths import data_path
 from pipeline.eval.metrics_pose import eval_pose_metrics, snippet_pose_metrics
-from pipeline.eval.paths import default_output_dir
+from pipeline.eval.paths import output_dirs_from_ckpt
 from pipeline.eval.vggt_infer import (infer_sequence, infer_sequence_stitched,
                                    umeyama_sim3, _extrinsic_to_c2w)
 
@@ -119,10 +119,8 @@ def main():
               f"   {m['n_seams']} seams, scales {m['stitch_scales']}")
         out[f"stitched_{c}_{o}"] = m
 
-    d = default_output_dir(args.ckpt, TOOL)
-    os.makedirs(d, exist_ok=True)
-    p = os.path.join(d, f"{os.path.basename(args.seq).replace('/', '_')}"
-                        f"_{args.start}_{len(paths)}f.json")
+    p = output_dirs_from_ckpt(args.ckpt, TOOL).metrics_file(
+        f"{os.path.basename(args.seq).replace('/', '_')}_{args.start}_{len(paths)}f.json")
     with open(p, "w") as f:
         json.dump(dict(meta=vars(args) | {"gt_extent_mm": extent, "frames": len(paths)},
                        results=out), f, indent=2, default=str)

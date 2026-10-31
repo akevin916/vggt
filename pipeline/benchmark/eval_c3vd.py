@@ -44,7 +44,7 @@ from datetime import datetime
 
 from pipeline.benchmark.eval_scared import eval_ckpt, list_sequences
 from pipeline.data.paths import data_path
-from pipeline.eval.paths import default_output_dir, output_dir_for_exp
+from pipeline.eval.paths import exp_name_from_ckpt, output_dirs
 
 TOOL = "eval_c3vd"
 
@@ -67,8 +67,8 @@ def evaluate(args, model=None):
         args.max_depth = C3VD_MAX_DEPTH_MM
 
     suffix = "" if getattr(args, "gate_mode", "predicted") == "predicted" else f"_gate{args.gate_mode}"
-    args.out_dir = getattr(args, "out_dir", None) or output_dir_for_exp(
-        f"{args.split}_{args.n_frames}f{suffix}", TOOL)
+    args.out_dir = getattr(args, "out_dir", None) or output_dirs(
+        TOOL, exp_name_from_ckpt(args.ckpt), f"{args.split}_{args.n_frames}f{suffix}").metrics
     os.makedirs(args.out_dir, exist_ok=True)
 
     results = eval_ckpt(args.ckpt, root, args.split, seqs, args, model=model)
@@ -116,7 +116,7 @@ def main():
         # Per-checkpoint directory keyed on the EXP name, not the checkpoint file name:
         # several runs all produce a best_ate.pt, and keying on the file name makes them
         # overwrite each other's results.json.
-        args.out_dir = explicit_out or default_output_dir(ckpt, TOOL)
+        args.out_dir = explicit_out
         args.ckpt = ckpt
         res = evaluate(args, model=None)
         mp = res.get("pose", {}).get("mean", {})

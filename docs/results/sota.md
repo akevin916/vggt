@@ -238,10 +238,9 @@ python pipeline/benchmark/eval_scared.py --ckpts $O $B --split test/depth --n_fr
 python pipeline/benchmark/eval_scared.py --ckpts $O $B --split test/depth --n_frames 0 \
   --chunk_size 64 --overlap 16 --depth_protocol afsfm
 
-# pose, snippet ATE, 5 幀 context（公平設定）—— 必須給 --out_dir，否則蓋掉 64 幀那份
+# pose, snippet ATE, 5 幀 context（公平設定）—— run 名是 pose，64 幀那份是 pose_c64，不會互蓋
 python pipeline/benchmark/eval_scared.py --ckpts $O $B --split test/pose --n_frames 0 \
-  --chunk_size 5 --overlap 4 --no_depth \
-  --out_dir ../outputs/eval_scared/test_pose_0f_chunk5
+  --chunk_size 5 --overlap 4 --no_depth
 
 # pose, snippet ATE, 64 幀 context
 python pipeline/benchmark/eval_scared.py --ckpts $O $B --split test/pose --n_frames 0 \
@@ -250,6 +249,7 @@ python pipeline/benchmark/eval_scared.py --ckpts $O $B --split test/pose --n_fra
 
 一次跑完全部：`bash benchmark/run_report_tables.sh [scared|pose5|lesion|all]`
 
-輸出在 `outputs/eval_scared/<split>_<n>f[_single][_afsfm]/<exp>_<stem>/results.json`。
-子目錄名走 `paths.exp_name_from_ckpt`——**不是** ckpt 檔名，否則多個 run 的 `best_ate.pt`
+輸出在 `outputs/metrics/eval_scared/<exp>__<protocol>_<role>/results.json`（`<protocol>` 見 `eval_scared.protocol_tag`，`<role>` = best/last）；
+2026-10-20 以前的結果在 `outputs/_archive/legacy_2026-10-20/eval_scared/<split>_<n>f[_single][_afsfm]/<exp>_<stem>/` 與 `.../legacy_2026-10-20/eval/<exp>/`。
+`<exp>` 走 `paths.exp_name_from_ckpt`——**不是** ckpt 檔名，否則多個 run 的 `best_ate.pt`
 會全部撞成同一個 `best_ate/` 目錄互相覆蓋（2026-08-25 發生過）。

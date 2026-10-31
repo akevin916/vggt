@@ -27,9 +27,10 @@ Two metric families, independently switchable via --metrics:
                            the model's own gate binarised to 0/1 (--hard_taus / --hard_topk),
                            i.e. an oracle-SHAPED signal driven by the prediction
 
-Outputs keep the two pre-merge layouts so older results stay comparable:
-    pose     -> outputs/gate_bias_ablation[_po]/<exp>/results.json
-    quality  -> outputs/gate_quality/<exp>/quality_f<max_frames>.json
+Outputs (``<exp>`` from the ckpt):
+    pose     -> outputs/metrics/gate_eval/<exp>__{sintel,po}_pose/results.json
+    quality  -> outputs/metrics/gate_eval/<exp>__sintel_quality_f<max_frames>/quality.json
+                outputs/vis/gate_eval/<exp>__sintel_quality_f<max_frames>/<seq>.gif   (--gif)
 
 PointOdyssey supports ``pose`` only -- the quality metrics read Sintel's flow-residual masks.
 
@@ -68,16 +69,12 @@ from pipeline.data.sintel_io import (
 from pipeline.eval.gate_common import oracle_logits_from_masks, po_common_conf, pool_to_patch
 from pipeline.eval.gate_vis import save_gate_overlay_gif
 from pipeline.eval.metrics_pose import eval_pose_metrics, extrinsics_w2c_to_tum
-from pipeline.eval.paths import (
-    GATE_BIAS_ABLATION,
-    GATE_BIAS_ABLATION_PO,
-    GATE_QUALITY,
-    default_output_dir,
-)
+from pipeline.eval.paths import output_dirs_from_ckpt
 from pipeline.eval.vggt_infer import infer_sequence_chunked, load_vggt_for_eval
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
+TOOL = "gate_eval"
 MODES = ["off", "predicted", "oracle"]
 POSE_METRICS = ("ate", "rpe_trans", "rpe_rot")
 QUALITY_MACRO_KEYS = ("auc", "f1", "gap", "p_dyn", "p_stat")
@@ -523,8 +520,8 @@ def _evaluate_sintel(args) -> Dict[str, Any]:
                 mode: float(np.mean([v[mode] for v in hard_frac_by_seq.values() if mode in v]))
                 for mode in _hard_mode_names(args)
             }
-        out_dir = args.out_dir or default_output_dir(args.ckpt, GATE_BIAS_ABLATION)
-        _save_json(out_dir, "results.json", results)
+        out = output_dirs_from_ckpt(args.ckpt, TOOL, "sintel_pose", override=args.out_dir)
+        _save_json(out.metrics, "results.json", results)
         _print_pose_summary(results, "GATE BIAS ABLATION (Sintel)", item_label="seq")
         if hard_frac_by_seq:
             print("\nfraction of patches suppressed (mean over seqs):")
@@ -551,13 +548,13 @@ def _evaluate_sintel(args) -> Dict[str, Any]:
             "calibration": _calibration(pooled_p, pooled_y, args.cal_bins) if pooled_p is not None else {},
             "errors": errors,
         }
-        out_dir = args.quality_out_dir or default_output_dir(args.ckpt, GATE_QUALITY)
-        _save_json(out_dir, f"quality_f{args.max_frames}.json", results)
+        out = output_dirs_from_ckpt(args.ckpt, TOOL, f"sintel_quality_f{args.max_frames}",
+                                    override=args.quality_out_dir)
+        _save_json(out.metrics, "quality.json", results)
         _print_quality_summary(results)
         if overlay_payload:
             ck = os.path.basename(args.ckpt)
-            vis_dir = os.path.join(out_dir, f"overlay_f{args.max_frames}")
-            print(f"\noverlay GIFs -> {vis_dir}")
+            print(f"\noverlay GIFs -> {out.vis}")
             for seq, (imgs, p_grid, y_grid) in overlay_payload.items():
                 q = quality_per_seq[seq]
                 head = (f"{seq}   AUC {q['auc']:.3f}   F1 {q['f1']:.3f}   "
@@ -565,7 +562,7 @@ def _evaluate_sintel(args) -> Dict[str, Any]:
                 sub = (f"ckpt={ck}  label_thr={args.label_thr}  motion_thr={args.motion_thr}px  "
                        f"frames={imgs.shape[0]}")
                 fp = save_gate_overlay_gif(
-                    os.path.join(vis_dir, f"{seq}.gif"), imgs, p_grid, y_grid,
+                    out.vis_file(f"{seq}.gif"), imgs, p_grid, y_grid,
                     header=head, subheader=sub,
                     alpha=args.overlay_alpha, duration_ms=args.duration_ms,
                 )
@@ -665,8 +662,8 @@ def _evaluate_po(args) -> Dict[str, Any]:
         "errors": errors,
     }
 
-    out_dir = args.out_dir or default_output_dir(args.ckpt, GATE_BIAS_ABLATION_PO)
-    _save_json(out_dir, "results.json", results)
+    out = output_dirs_from_ckpt(args.ckpt, TOOL, "po_pose", override=args.out_dir)
+    _save_json(out.metrics, "results.json", results)
     _print_pose_summary(results, "GATE BIAS ABLATION (PointOdyssey, m*_inst oracle)", item_label="clip")
     return {"pose": results}
 

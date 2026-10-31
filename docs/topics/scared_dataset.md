@@ -34,7 +34,7 @@ scared/
 └── scared.zip                           原始壓縮檔
 ```
 
-`split` 參數（`eval_scared.py --split`、`datasets/scared.py`）直接就是上面的相對路徑：`val`、`train`、`test/depth`、`test/pose`。舊名 `test`、`pose_seq` 在 2026-09-14 退役，`outputs/eval_scared/` 下的結果目錄同步改名為 `test_depth_*`、`test_pose_*`。
+`split` 參數（`eval_scared.py --split`、`datasets/scared.py`）直接就是上面的相對路徑：`val`、`train`、`test/depth`、`test/pose`。舊名 `test`、`pose_seq` 在 2026-09-14 退役，`outputs/_archive/legacy_2026-10-20/eval_scared/` 下的結果目錄同步改名為 `test_depth_*`、`test_pose_*`。
 
 ⚠️ `test/depth/dataset3/keyframe4`（79 幀）和 `test/pose/dataset3/keyframe4`（834 幀）**同名不同物**：前者是後者那段影片的稀疏子集。引用序列時一律帶完整 split。
 
@@ -236,6 +236,12 @@ b=3（只有 6% patch 越過折點）與 b=0 沒有差別（−0.1%，遠在噪�
 b=10 時 +26.9%**。也就是說：把 gate 的排序直接當遮罩用，遮得越多 pose 越差。
 
 ### 9.3 SCARED 大部分序列其實**有**器械 —— 與原本的假設相反
+
+> ⚠️ **2026-10-19 人工檢查推翻本節數字。** 重寫同參數的啟發式（`sat_thr=60`、`val_thr=40`、blob ≥ 2%，開運算 15×15 橢圓）
+> 在 train 22 條中命中 16 條，但人工看 GIF 後只有 `dataset5/keyframe1`、`dataset5/keyframe2`、`dataset7/keyframe1`
+> 有器械（例如 `dataset6/*` 平均 mask 面積 0.32–0.34 卻無器械）。誤報來源（反光或偏白組織）未查。
+> 下方「23/35」與「推翻原假設」**不可引用**；val 內哪些有器械尚未人工確認。
+> 輸出：`outputs/_archive/legacy_2026-10-20/scared_instrument_heuristic/`（GIF 與 `hit_rates.json`）。
 
 `scan_foreground.py` 用「低飽和、非暗」偵測金屬器械，掃過 train/val 全部 35 條序列
 （`sat_thr=60`、`val_thr=40`、blob ≥ 2% 畫面算命中）：

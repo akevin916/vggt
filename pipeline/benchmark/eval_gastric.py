@@ -42,7 +42,7 @@ import torch
 
 from pipeline.data.paths import data_path
 from pipeline.eval.media_io import write_video
-from pipeline.eval.paths import default_output_dir
+from pipeline.eval.paths import output_dirs_from_ckpt
 from pipeline.eval.ply_io import write_ply
 from pipeline.eval.vggt_infer import infer_sequence, load_vggt_for_eval
 from pipeline.eval.warp_psnr import unproject_to_world
@@ -77,8 +77,8 @@ def preprocessed(paths):
     return t.permute(0, 2, 3, 1).numpy().astype(np.float32)
 
 
-def save_cloud(out_stem, depth, intrinsic, extrinsic, images, max_points, depth_pct):
-    """Point cloud from depth unproject. Writes .ply + .npz with frame_id."""
+def save_cloud(out, stem, depth, intrinsic, extrinsic, images, max_points, depth_pct):
+    """Point cloud from depth unproject. Writes vis/<stem>.ply + cache/<stem>.npz with frame_id."""
     per_frame = max(1, max_points // max(1, len(depth)))
     rng = np.random.default_rng(0)
     pts, cols, fids = [], [], []
@@ -102,13 +102,13 @@ def save_cloud(out_stem, depth, intrinsic, extrinsic, images, max_points, depth_
     fids = np.concatenate(fids) if fids else np.zeros((0,), np.int16)
 
     np.savez_compressed(
-        out_stem + ".npz",
+        out.cache_file(stem + ".npz"),
         points=pts.astype(np.float32),
         colors=(np.clip(cols, 0, 1) * 255).astype(np.uint8),
         frame_id=fids,
         n_frames=np.int32(len(depth)),
     )
-    return write_ply(out_stem + ".ply", pts, cols)
+    return write_ply(out.vis_file(stem + ".ply"), pts, cols)
 
 
 def dump_arrays(path, pred, images=None):
@@ -130,7 +130,7 @@ def dump_arrays(path, pred, images=None):
 # per-segment
 # ---------------------------------------------------------------------------
 
-def run_segment(model, seg_dir, out_dir, args):
+def run_segment(model, seg_dir, out, args):
     paths = list_images(seg_dir)
     if not paths:
         return dict(error="no images found")
@@ -148,9 +148,8 @@ def run_segment(model, seg_dir, out_dir, args):
     pred = infer_sequence(model, paths, device=args.device)
     imgs = preprocessed(paths)
 
-    os.makedirs(out_dir, exist_ok=True)
-    dump_arrays(os.path.join(out_dir, "seq.npz"), pred, images=imgs)
-    write_video(os.path.join(out_dir, "input.mp4"), imgs, fps=args.fps)
+    dump_arrays(out.cache_file("seq.npz"), pred, images=imgs)
+    write_video(out.vis_file("input.mp4"), imgs, fps=args.fps)
 
     info = dict(
         seg=seg_name,
@@ -159,14 +158,13 @@ def run_segment(model, seg_dir, out_dir, args):
     )
 
     if args.ply and "depth" in pred:
-        stem = os.path.join(out_dir, "cloud")
         n_pts = save_cloud(
-            stem, pred["depth"], pred["intrinsic"],
+            out, "cloud", pred["depth"], pred["intrinsic"],
             pred["extrinsic"], imgs, args.max_points, args.depth_pct,
         )
         info["ply_points"] = n_pts
-        info["ply"] = stem + ".ply"
-        print(f"    -> {n_pts:,} points  {stem}.ply")
+        info["ply"] = os.path.join(out.vis, "cloud.ply")
+        print(f"    -> {n_pts:,} points  {info['ply']}")
 
     return info
 
@@ -177,7 +175,7 @@ def run_segment(model, seg_dir, out_dir, args):
 
 def eval_ckpt(ckpt, args):
     model = load_vggt_for_eval(ckpt, device=args.device)
-    base = args.out_dir or default_output_dir(ckpt, TOOL)
+    base = output_dirs_from_ckpt(ckpt, TOOL, override=args.out_dir)
     results = {}
 
     gastric_root = args.gastric_root
@@ -187,9 +185,8 @@ def eval_ckpt(ckpt, args):
             print(f"  [skip] {seg_dir} not found")
             results[seg] = dict(error="not found")
             continue
-        out_dir = os.path.join(base, seg)
         try:
-            results[seg] = run_segment(model, seg_dir, out_dir, args)
+            results[seg] = run_segment(model, seg_dir, base.sub(seg), args)
         except Exception:
             traceback.print_exc()
             results[seg] = dict(error=True)
@@ -206,8 +203,7 @@ def eval_ckpt(ckpt, args):
         ),
         results=results,
     )
-    os.makedirs(base, exist_ok=True)
-    summary_path = os.path.join(base, "summary.json")
+    summary_path = base.metrics_file("summary.json")
     with open(summary_path, "w") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
     print(f"-> {summary_path}")

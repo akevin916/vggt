@@ -58,8 +58,10 @@ from pipeline.data.sintel_io import (
 )
 from pipeline.eval.metrics_depth import average_depth_results, eval_sequence_depth
 from pipeline.eval.metrics_pose import eval_pose_metrics
-from pipeline.eval.paths import PNP_POSE, default_output_dir
+from pipeline.eval.paths import output_dirs_from_ckpt
 from pipeline.eval.vggt_infer import graft_point_head, infer_sequence, load_vggt_for_eval
+
+TOOL = "pnp_pose"
 
 POSE_MODES = ["camera_head", "pnp_all", "pnp_static"]
 DEPTH_MODES = ["depth_head", "point_map_z"]
@@ -81,7 +83,7 @@ def parse_args():
         "--out_dir",
         type=str,
         default=None,
-        help=f"Default: outputs/{PNP_POSE}/<exp>/f<max_frames>",
+        help=f"Default: outputs/<kind>/{TOOL}/<exp>__f<max_frames>/",
     )
     ap.add_argument("--seq_list", type=str, nargs="*", default=None)
     ap.add_argument("--device", type=str, default="cuda")
@@ -287,14 +289,11 @@ def print_summary(results: Dict[str, Any]):
 
 def main():
     args = parse_args()
-    # The f<max_frames> level matches the gate_sweep layout: sequence length is part of a
-    # run's identity here (the whole point is that gate headroom varies with it), so two
-    # lengths must not land on the same results.json.
-    args.out_dir = args.out_dir or os.path.join(
-        default_output_dir(args.ckpt, PNP_POSE), f"f{args.max_frames}"
-    )
+    # Sequence length is part of a run's identity here (the whole point is that gate
+    # headroom varies with it), so two lengths must not land on the same results.json.
+    out = output_dirs_from_ckpt(args.ckpt, TOOL, f"f{args.max_frames}", override=args.out_dir)
     args.sintel_root = resolve_sintel_root(args.sintel_root)
-    print(f"Output dir: {args.out_dir}")
+    print(f"Output dir: {out.metrics}")
     print(f"Sintel root: {args.sintel_root}")
 
     model = load_vggt_for_eval(args.ckpt, device=args.device, force_point=bool(args.point_head_from))
@@ -312,8 +311,6 @@ def main():
         )
 
     sequences = list_sintel_sequences(args.seq_list)
-    os.makedirs(args.out_dir, exist_ok=True)
-    error_log = os.path.join(args.out_dir, "_error_log.txt")
 
     per_seq: Dict[str, Dict[str, Any]] = {}
     errors: List[str] = []
@@ -323,7 +320,7 @@ def main():
         except Exception as e:
             msg = f"{seq}: {e}\n{traceback.format_exc()}"
             errors.append(msg)
-            with open(error_log, "a", encoding="utf-8") as f:
+            with open(out.runlog_file("_error_log.txt"), "a", encoding="utf-8") as f:
                 f.write(msg + "\n")
 
     results = {
@@ -349,7 +346,7 @@ def main():
         "errors": errors,
     }
 
-    json_path = os.path.join(args.out_dir, "results.json")
+    json_path = out.metrics_file("results.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
     print(f"\nSaved {json_path}")

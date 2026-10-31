@@ -34,7 +34,7 @@
 
 ### 1.1 Depth（test/depth split，afsfm 協定）
 
-來源 `outputs/eval_scared/test_depth_0f{,_single}_afsfm/`｜08-25 重跑；Colon版 09-14（同批重跑 `VGGT-1B` / `vanilla` 與 08-25 值一致到小數第四位）
+來源 `outputs/_archive/legacy_2026-10-20/eval_scared/test_depth_0f{,_single}_afsfm/`｜08-25 重跑；Colon版 09-14（同批重跑 `VGGT-1B` / `vanilla` 與 08-25 值一致到小數第四位）
 
 | ckpt | 單張輸入 | 多張輸入 |
 |---|---|---|

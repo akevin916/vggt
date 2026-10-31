@@ -62,7 +62,20 @@ python 端走 `pipeline/data/paths.py` 的 `data_path("train", "point_odyssey")`
 
 搬家規則：diag → benchmark 的時機是**你決定那個數字要進論文的那一刻**，不是等它「看起來穩了」。
 
-**輸出路徑**：`logs/<exp>/` 只放訓練產物（`ckpts/`、`tensorboard/`、`log.txt`、trainer 的 `pose_eval/`）；訓練之後產生的一切（benchmark json、ablation、診斷、圖）一律 `outputs/<tool>/<exp>/`，由 `pipeline/eval/paths.py` 的 `default_output_dir(ckpt, TOOL)` 解析，別自己拼路徑。
+**輸出路徑**：`logs/<exp>/` 只放訓練產物（`ckpts/`、`tensorboard/`、`log.txt`、trainer 的 `pose_eval/`）。訓練之後產生的一切寫進 `outputs/`，**先按檔案性質分、再按工具分**：
+
+```
+outputs/metrics/<tool>/<key>/   json / csv / txt 數字（小、要留）
+outputs/vis/<tool>/<key>/       png / gif / mp4 / ply（給人看的）
+outputs/cache/<tool>/<key>/     npz / npy 與它們的 meta.json（大、可重算、隨時可刪）
+outputs/runlogs/<tool>/<key>/   stdout、batch log、_error_log.txt
+outputs/_archive/               退役結果；2026-10-20 以前的舊結構整包在 legacy_2026-10-20/
+```
+
+- `<tool>` = 產生它的 script 檔名，一支 script 一個 tool（一次性 probe 也一樣），每支 script 在檔頭宣告 `TOOL = "<檔名>"`。不要再用研究分支（`A_attn_bias`）、主題（`gate`）或用途（`paper_vis`）當頂層。
+- `<key>` = `<exp>` 或 `<exp>__<run>`。`<exp>` 由 ckpt 推（比較多支用 `A_vs_B`）；`<run>` 是這次的設定，`<split>_<protocol>[_<variant>]`，如 `test_pose_c64_best`、`sintel_quality_f16`。同一個 key 在每個 kind 下都一樣，所以圖和它背後的數字永遠在對稱的路徑上。
+- 檔名寫內容不寫編號：`camera_attn_mean.png`，不要 `fig1.png` / `figG.png`。`.bak_*` 不留在 `metrics/`。
+- 一律用 `pipeline/eval/paths.py` 的 `output_dirs(tool, exp, run)` / `output_dirs_from_ckpt(ckpt, tool, run)`，再用 `out.metrics_file(name)` / `out.vis_file(name)` / `out.cache_file(name)` 取路徑（會自動建目錄），別自己拼路徑。CLI 的 `--out_dir` 透過 `override=` 傳入，四種 kind 會合併到同一個目錄（舊用法相容）。
 
 Sintel/flow 的共用 IO 與 mask 推導在 `pipeline/data/`（`sintel_io.py`、`motion_mask.py`）——它們被 `data/preprocess/`、`data/datasets/`、benchmark、diag 共用，屬 data layer 而非 eval layer。
 
