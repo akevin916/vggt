@@ -117,6 +117,8 @@ def protocol_tag(args) -> str:
             tag += f"_{args.depth_protocol}"
     if args.n_frames > 0:
         tag += f"_{args.n_frames}f"
+    if getattr(args, "frame_pos", False):
+        tag += "_fpos"
     for _f, _t in (("colmask", "cm"), ("relmask", "rm")):
         if getattr(args, _f, None):
             tag += f"_{_t}-" + os.path.splitext(os.path.basename(getattr(args, _f)))[0]
@@ -236,6 +238,9 @@ def eval_ckpt(ckpt, root, split, seqs, args, model=None):
             # meaningless number instead of failing. Gate it on the frames actually selected.
             sel_fids = np.array([int(os.path.basename(p)[:-4]) for p in paths])
             contiguous = bool(len(sel_fids) > 1 and np.all(np.diff(sel_fids) == 1))
+            # --frame_pos: give the temporal blocks the real frame numbers (offsets from the
+            # first frame of each pass) instead of 0..S-1; differs only on non-contiguous frames.
+            fpos = sel_fids if getattr(args, "frame_pos", False) else None
 
             chunk = int(getattr(args, "chunk_size", 0) or 0)
             if getattr(args, "single_view", False):
@@ -272,7 +277,8 @@ def eval_ckpt(ckpt, root, split, seqs, args, model=None):
                 pred = {}
                 for st in starts:
                     sub = slice(st, min(st + chunk, len(paths)))
-                    pr = infer_sequence(model, paths[sub], device=args.device)
+                    pr = infer_sequence(model, paths[sub], device=args.device,
+                                        frame_pos=None if fpos is None else fpos[sub])
                     parts.append((st, pr["extrinsic"]))
                     if "depth" in pr:
                         # Depth is per-frame, so chunking is harmless -- but take each frame
@@ -290,7 +296,7 @@ def eval_ckpt(ckpt, root, split, seqs, args, model=None):
                 per_seq_pose[seq]["n_chunks"] = len(starts)
                 per_seq_pose[seq]["full_seq_ate_reported"] = False
             else:
-                pred = infer_sequence(model, paths, device=args.device)
+                pred = infer_sequence(model, paths, device=args.device, frame_pos=fpos)
                 per_seq_pose[seq] = eval_pose_metrics(pred["extrinsic"], gt_tum, gt_ts)
                 if contiguous:
                     per_seq_pose[seq].update(snippet_pose_metrics(pred["extrinsic"], gt_E))
@@ -408,6 +414,8 @@ def main():
                     help="mm (SCARED p99.9 <= 165). Default: 200 for monst3r, 150 for afsfm")
     ap.add_argument("--depth_protocol", default="monst3r", choices=["monst3r", "afsfm"],
                     help="afsfm = AF-SfMLearner SCARED protocol (per-frame median, <=150mm)")
+    ap.add_argument("--frame_pos", action="store_true",
+                    help="pass real frame numbers to the temporal blocks (default: treat frames as contiguous)")
     ap.add_argument("--single_view", action="store_true",
                     help="predict each frame from ONE image (S=1), the monocular setting the "
                          "published SCARED depth tables use. Depth only; pose is skipped.")

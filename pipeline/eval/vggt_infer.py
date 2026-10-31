@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Sequence, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -128,8 +128,12 @@ def infer_sequence(
     dtype: Optional[torch.dtype] = None,
     want_point: bool = False,
     images: Optional[torch.Tensor] = None,
+    frame_pos: Optional[Sequence[int]] = None,
 ) -> Dict[str, np.ndarray]:
     """Run VGGT on one sequence.
+
+    ``frame_pos`` (length S) is each frame's index in its source sequence; only the temporal
+    blocks read it (offset from the first frame). None = treat the frames as contiguous.
 
     ``want_point`` opts in to returning the point head's ``world_points`` /
     ``world_points_conf``. It is off by default because those are [S,H,W,3] fp32
@@ -151,7 +155,9 @@ def infer_sequence(
         images = images.unsqueeze(0)
 
     with torch.cuda.amp.autocast(dtype=dtype, enabled=(device == "cuda")):
-        pred = model(images=images)
+        fp = None if frame_pos is None else torch.as_tensor(np.asarray(frame_pos), dtype=torch.long,
+                                                            device=images.device).view(1, -1)
+        pred = model(images=images, frame_pos=fp)
 
     h, w = images.shape[-2], images.shape[-1]
     extrinsic, intrinsic = pose_encoding_to_extri_intri(pred["pose_enc"], image_size_hw=(h, w))

@@ -188,7 +188,7 @@ class RotaryPositionEmbedding2D(nn.Module):
         return torch.cat((vertical_features, horizontal_features), dim=-1)
 
 
-class RotaryPositionEmbedding1D(RotaryPositionEmbedding2D):
+class RotaryTimeEmbedding1D(RotaryPositionEmbedding2D):
     # NEW: Dyn-VGGT 時間軸 RoPE。與 2D 版同構但只編「時間」一個軸（整個 head_dim 都用幀索引旋轉），
     #      只在 temporal attention 內作用，空間 RoPE 一個字不動，保留預訓練 warm-start（見 docs §3.1）。
     """1D Rotary Position Embedding for the temporal axis.
