@@ -29,7 +29,6 @@ model:
   head_grad_checkpoint: true   # gradients cross the frozen depth head; its activations scale with S
   gaussmask:
     enable: true
-    cone: false
     rho: 0.25
     S_max: 64
     start: 8
@@ -38,7 +37,7 @@ model:
     T_end: 0.1
     T_steps: [0, 367]
     hard_from: 367
-    init: {sigma_s: 8.0, sigma_y: 6.0, sigma_x: 6.0, v: 0.0}
+    init: {sigma_s: 8.0, sigma_y: 6.0, sigma_x: 6.0}
 
 # Sampling: contiguous stride-1 clips of S frames at the test crop (518x420 -> 30x37 patches);
 # the aspect augmentation is pinned to 0.82 (518*0.82 -> 420), the other train augs are tfs's.

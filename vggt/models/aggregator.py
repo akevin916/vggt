@@ -13,7 +13,7 @@ from typing import Optional, Tuple, Union, List, Dict, Any
 
 from vggt.layers import PatchEmbed
 from vggt.layers.block import Block
-from vggt.layers.rope import RotaryPositionEmbedding2D, RotaryTimeEmbedding1D, PositionGetter  # MODIFIED: 1D temporal RoPE
+from vggt.layers.rope import RotaryPositionEmbedding2D, RotaryTimeEmbedding1D, PositionGetter
 from vggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
 
 logger = logging.getLogger(__name__)
@@ -72,10 +72,8 @@ class Aggregator(nn.Module):
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
-        temporal_every=3,   # insert one temporal block every `temporal_every` aa-blocks
-        # Gaussian spatio-temporal key mask (3-10; vggt/models/gaussmask.py). dict of GaussMask
-        # kwargs (enable, cone, rho, T_*, hard_from, init, fixed_path, start, grid, S_max) or None.
-        gaussmask: Optional[dict] = None,
+        temporal_every=1,   # one temporal block every `temporal_every` aa-blocks
+        gaussmask: Optional[dict] = None,   # Gaussian key mask settings (see gaussmask.py); None = off
     ):
         super().__init__()
 
@@ -85,7 +83,7 @@ class Aggregator(nn.Module):
         self.rope = RotaryPositionEmbedding2D(frequency=rope_freq) if rope_freq > 0 else None
         self.position_getter = PositionGetter() if self.rope is not None else None
 
-        # temporal RoPE — independent 1D rotary embedding related to frame positions
+        # 1D rotary embedding over frame positions, used only inside the temporal blocks
         self.temporal_rope = RotaryTimeEmbedding1D(frequency=rope_freq) if rope_freq > 0 else None
 
         self.frame_blocks = nn.ModuleList(
@@ -126,7 +124,7 @@ class Aggregator(nn.Module):
         self.aa_order = aa_order
         self.patch_size = patch_size
         self.aa_block_size = aa_block_size
-        self.temporal_every = temporal_every  # NEW
+        self.temporal_every = temporal_every
 
         # Validate that depth is divisible by aa_block_size
         if self.depth % self.aa_block_size != 0:
@@ -134,7 +132,8 @@ class Aggregator(nn.Module):
 
         self.aa_block_num = self.depth // self.aa_block_size
 
-        # temporal attention blocks. Each block warm-starts as identity via LayerScale gamma=0
+        # Temporal attention blocks (only when "temporal" is in aa_order). Each starts as an
+        # identity map: both LayerScale gammas are zeroed below.
         if "temporal" in self.aa_order:
             self.n_temporal = self.aa_block_num // self.temporal_every
             self.temporal_blocks = nn.ModuleList(
@@ -283,10 +282,9 @@ class Aggregator(nn.Module):
         # update P because we added special tokens
         _, P, C = tokens.shape
 
-        # NEW: temporal positions for the 1D time RoPE, shape (B*P, S) integer frame indices (decision B4).
-        #      camera token (idx 0) and patch tokens (idx >= patch_start_idx) get the frame's offset from
-        #      the clip's first frame (frame_pos - frame_pos[:, 0], or 0..S-1 when frame_pos is None);
-        #      register tokens (idx 1..patch_start_idx-1) get 0 → identity rotation (no temporal RoPE).
+        # Positions for the temporal RoPE, shape (B*P, S). Camera and patch tokens get the frame's
+        # offset from the clip's first frame (0..S-1 when frame_pos is None); register tokens get 0,
+        # i.e. no rotation.
         temporal_pos = None
         if self.n_temporal and self.temporal_rope is not None:
             if frame_pos is None:
@@ -321,9 +319,8 @@ class Aggregator(nn.Module):
                         tokens, B, S, P, C, global_idx, pos=pos, gm_tab=gm_tab,
                     )
                 elif attn_type == "temporal":
-                    # NEW: run a temporal block once every `temporal_every` aa-blocks.
-                    #      It only updates the streaming `tokens`; it does NOT emit an intermediate
-                    #      into output_list, so the head input stays [B,S,P,2C] (decision A2).
+                    # Runs once every `temporal_every` aa-blocks. It only updates `tokens` and adds
+                    # nothing to output_list, so the heads still receive [B, S, P, 2C].
                     if self.n_temporal and (block_iter % self.temporal_every == self.temporal_every - 1):
                         tokens, temporal_idx = self._process_temporal_attention(
                             tokens, B, S, P, C, temporal_idx, pos=temporal_pos,
@@ -411,12 +408,9 @@ class Aggregator(nn.Module):
         global _FLEX_FN
         if _FLEX_FN is None:
             from torch.nn.attention.flex_attention import flex_attention as _fa
-            # Frames per batch vary (img_nums [4, 12]), so each distinct shape compiles its own
-            # kernel. Dynamo's default cache_size_limit of 8 is hit around step 9, after which it
-            # falls back to EAGER flex -- which raises immediately ("get value out of a tracing
-            # tensor"). Measured 2026-09-27: 8 good steps then a crash; with the limit raised, 12
-            # varied (B, S) combinations all pass. automatic_dynamic_shapes off keeps every shape
-            # specialised instead of switching to dynamic (which trips the same error).
+            # Every distinct (B, S) compiles its own kernel. Past dynamo's default cache limit it
+            # falls back to eager flex, which fails ("get value out of a tracing tensor"), so the
+            # limit is raised; automatic_dynamic_shapes is off for the same reason.
             torch._dynamo.config.cache_size_limit = max(64, torch._dynamo.config.cache_size_limit)
             torch._dynamo.config.automatic_dynamic_shapes = False
             _FLEX_FN = torch.compile(_fa, dynamic=False)
@@ -424,14 +418,16 @@ class Aggregator(nn.Module):
             return _FLEX_FN(q, k, v, score_mod=score_mod, kernel_options=kernel_options)
         return _FLEX_FN(q, k, v, score_mod=score_mod)
 
-    # ---- Gaussian spatio-temporal mask (3-10) ---------------------------------------------------
+    # ---- Gaussian spatio-temporal key mask -----------------------------------------------------
     def _build_gaussmask(self, cfg, depth):
         from vggt.models.gaussmask import GaussMask
         cfg = dict(cfg)
+        if cfg.get("cone"):
+            raise ValueError("gaussmask.cone is not supported: only the ball form is implemented")
         start = int(cfg.get("start", 8))
         return GaussMask(
             n_layers=int(depth) - start, start=start, grid=tuple(cfg.get("grid", (30, 37))),
-            S_max=int(cfg.get("S_max", 64)), cone=bool(cfg.get("cone", False)),
+            S_max=int(cfg.get("S_max", 64)),
             rho=float(cfg.get("rho", 0.25)), T_start=float(cfg.get("T_start", 2.0)),
             T_end=float(cfg.get("T_end", 0.1)), T_steps=tuple(cfg.get("T_steps", (0, 1100))),
             hard_from=int(cfg.get("hard_from", 1100)),
@@ -444,9 +440,8 @@ class Aggregator(nn.Module):
             .to(self.camera_token.device)
 
     # flex tile sizes for the Gaussian-mask blocks, e.g. {"BLOCK_M": 64, "BLOCK_N": 64,
-    # "num_stages": 1}. None = flex defaults, which need 208 KB shared memory (an RTX 5090 has
-    # 99 KB). A block-sparse BlockMask was tried and dropped (2026-10-29: 0.66x / 0.85x the plain
-    # model's 64-frame forward, see docs/topics/slim_vs_slim_tfs.md).
+    # "num_stages": 1}. None = flex defaults, which need more shared memory than some GPUs have
+    # (RTX 5090).
     gm_kernel_options = None
 
     def _gaussmask_score_mod(self, tab, P):
@@ -482,12 +477,9 @@ class Aggregator(nn.Module):
         return tokens + block.ls2(block.mlp(block.norm2(tokens)))
 
     def _process_temporal_attention(self, tokens, B, S, P, C, temporal_idx, pos=None):
-        # NEW: temporal attention (Dyn-VGGT contribution ①). Reshape so the *time* axis S is the
-        #      sequence dim — each spatial position attends across its own S frames (motion/trajectory).
-        #      Updates the streaming tokens only; emits NO intermediate (head input stays 2C, decision A2).
         """
-        Process temporal attention block. Tokens are reshaped to (B*P, S, C) so attention runs
-        purely along the time axis, then reshaped back to (B*S, P, C) for the next attention type.
+        Process temporal attention block. Tokens are reshaped to (B*P, S, C) so each token position
+        attends only across its own S frames, then reshaped back to (B*S, P, C).
         """
         # (B*S, P, C) or (B, S*P, C) -> (B, S, P, C) -> (B*P, S, C)
         tokens = tokens.view(B, S, P, C).permute(0, 2, 1, 3).reshape(B * P, S, C)

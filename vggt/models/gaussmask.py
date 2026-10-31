@@ -1,10 +1,9 @@
-"""Gaussian spatio-temporal key mask on global attention (contribution 3-10, ball / cone).
+"""Gaussian spatio-temporal key mask on global attention.
 
 Query (s, p) and key (s', p') with displacement (ds, dy, dx) = key - query (frames, patch rows,
 patch cols). Per global layer l >= start:
 
-    sigma_y(ds) = max(sigma_y0 + v |ds|, 0.5)   (x alike; ball: v = 0)
-    Q = ds^2 / sigma_s^2 + dy^2 / sigma_y(ds)^2 + dx^2 / sigma_x(ds)^2
+    Q = ds^2 / sigma_s^2 + dy^2 / sigma_y^2 + dx^2 / sigma_x^2     (sigma_y, sigma_x >= 0.5)
 
 Kept keys (Q <= c^2) get bias -Q/2, the rest are dropped. Always kept with bias 0: same frame,
 key frame 0, special tokens (key or query). No mean token.
@@ -18,7 +17,7 @@ Q depends on the displacement alone, so each layer's bias is one table [2*S_max-
 2*GW-1] (~0.55 M entries) built here in plain PyTorch and looked up in flex's score_mod. That is
 also what makes training affordable: gradients reach the table spread over 0.55 M addresses and
 autograd takes them back to sigma. Computing Q inside the score_mod from captured scalars works
-but every score's gradient then lands on the same scalar (82 s per layer at S=48 vs 4.3 s).
+but is much slower to train: every score's gradient then lands on the same few scalars.
 """
 import json
 import math
@@ -33,7 +32,7 @@ DROP = -1.0e4   # finite stand-in for log 0 (kept keys get the Gaussian bias, dr
 
 class GaussMask(nn.Module):
     def __init__(self, n_layers: int = 16, start: int = 8, grid=(30, 37), S_max: int = 64,
-                 cone: bool = False, rho: float = 0.25, T_start: float = 2.0, T_end: float = 0.1,
+                 rho: float = 0.25, T_start: float = 2.0, T_end: float = 0.1,
                  T_steps=(0, 1100), hard_from: int = 1100, init: Optional[dict] = None,
                  fixed_path: Optional[str] = None):
         super().__init__()
@@ -66,25 +65,23 @@ class GaussMask(nn.Module):
             assert len(layers) == self.L, (len(layers), self.L)
             assert spec.get("S_max", self.S_max) == self.S_max and tuple(spec.get("grid", grid)) == tuple(grid)
             self.rho = float(spec.get("rho", self.rho))
-            cone = bool(spec.get("cone", cone))
-            get = lambda k: torch.tensor([float(l[k]) for l in layers])   # noqa: E731
+            if spec.get("cone") or any(float(l.get("v", 0.0)) != 0.0 for l in layers):
+                raise ValueError(f"{fixed_path} is a cone mask (sigma varies with |ds|); only the "
+                                 "ball form is supported here")
+            get = lambda *ks: torch.tensor([float(next(l[k] for k in ks if k in l)) for l in layers])  # noqa: E731
             self.register_buffer("log_s", get("sigma_s").log(), persistent=False)
-            self.register_buffer("log_y", get("sigma_y0").log(), persistent=False)
-            self.register_buffer("log_x", get("sigma_x0").log(), persistent=False)
-            self.register_buffer("v", get("v"), persistent=False)
+            self.register_buffer("log_y", get("sigma_y", "sigma_y0").log(), persistent=False)
+            self.register_buffer("log_x", get("sigma_x", "sigma_x0").log(), persistent=False)
             self.register_buffer("c2_fixed", get("c2"), persistent=False)
         else:
             init = dict(init or {})
+            if float(init.get("v", 0.0)) != 0.0:
+                raise ValueError("init.v != 0 describes a cone mask; only the ball form is supported")
             full = lambda x: torch.full((self.L,), float(x))              # noqa: E731
             self.log_s = nn.Parameter(full(math.log(init.get("sigma_s", 8.0))))
             self.log_y = nn.Parameter(full(math.log(init.get("sigma_y", 6.0))))
             self.log_x = nn.Parameter(full(math.log(init.get("sigma_x", 6.0))))
-            if cone:
-                self.v = nn.Parameter(full(init.get("v", 0.0)))
-            else:
-                self.register_buffer("v", full(0.0), persistent=True)
             self.register_buffer("steps", torch.zeros((), dtype=torch.long), persistent=True)
-        self.cone = bool(cone)
         self._last_keep = None             # hard keep set at the previous stats() call
 
     # ---- schedule -----------------------------------------------------------------------------
@@ -107,13 +104,12 @@ class GaussMask(nn.Module):
     # ---- the table ----------------------------------------------------------------------------
     def Q(self) -> torch.Tensor:
         """[L, NS, NY, NX] float32."""
-        ad = self.ds.abs()[None, :]                                           # [1, NS]
-        sy = (self.log_y.float().exp()[:, None] + self.v.float()[:, None] * ad).clamp(min=0.5)
-        sx = (self.log_x.float().exp()[:, None] + self.v.float()[:, None] * ad).clamp(min=0.5)
+        sy = self.log_y.float().exp().clamp(min=0.5)[:, None, None, None]
+        sx = self.log_x.float().exp().clamp(min=0.5)[:, None, None, None]
         inv_s2 = torch.exp(-2.0 * self.log_s.float())[:, None, None, None]
         return (self.ds[None, :, None, None] ** 2 * inv_s2
-                + self.dy[None, None, :, None] ** 2 / sy[:, :, None, None] ** 2
-                + self.dx[None, None, None, :] ** 2 / sx[:, :, None, None] ** 2)
+                + self.dy[None, None, :, None] ** 2 / sy ** 2
+                + self.dx[None, None, None, :] ** 2 / sx ** 2)
 
     @torch.no_grad()
     def solve_c2_hard(self, Q: torch.Tensor) -> torch.Tensor:
@@ -185,8 +181,8 @@ class GaussMask(nn.Module):
             rms = lambda g: (((g ** 2) * k).sum() / tot).sqrt().item()     # noqa: E731
             out.append(dict(
                 layer=self.start + l,
-                sigma_s=self.log_s[l].exp().item(), sigma_y0=self.log_y[l].exp().item(),
-                sigma_x0=self.log_x[l].exp().item(), v=self.v[l].item(), c2=c2[l].item(),
+                sigma_s=self.log_s[l].exp().item(), sigma_y=self.log_y[l].exp().item(),
+                sigma_x=self.log_x[l].exp().item(), c2=c2[l].item(),
                 hard_keep=round(frac, 5),
                 rms_ds=rms(self.ds[:, None, None]), rms_dy=rms(self.dy[None, :, None]),
                 rms_dx=rms(self.dx[None, None, :])))
@@ -203,9 +199,8 @@ class GaussMask(nn.Module):
              "hard": self.hard_on(),
              "hard_keep": [round(x, 4) for x in (kept / w.sum()).tolist()],
              "sigma_s": [round(x, 3) for x in self.log_s.exp().tolist()],
-             "sigma_y0": [round(x, 3) for x in self.log_y.exp().tolist()],
-             "sigma_x0": [round(x, 3) for x in self.log_x.exp().tolist()],
-             "v": [round(x, 4) for x in self.v.tolist()],
+             "sigma_y": [round(x, 3) for x in self.log_y.exp().tolist()],
+             "sigma_x": [round(x, 3) for x in self.log_x.exp().tolist()],
              "c2": [round(x, 3) for x in c2.tolist()]}
         if not self.fixed:
             T = self.T()
@@ -221,7 +216,7 @@ class GaussMask(nn.Module):
 
     @torch.no_grad()
     def export(self, path: str, note: str = ""):
-        spec = dict(cone=self.cone, rho=self.rho, S_max=self.S_max, grid=[self.GH, self.GW],
+        spec = dict(rho=self.rho, S_max=self.S_max, grid=[self.GH, self.GW],
                     start=self.start, note=note, layers=self.layer_summary())
         with open(path, "w") as f:
             json.dump(spec, f, indent=2)

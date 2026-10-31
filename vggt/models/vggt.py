@@ -19,7 +19,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                  enable_camera=True, enable_point=True, enable_depth=True, enable_track=True,
                  enable_temporal=False,
                  head_grad_checkpoint=False,   # checkpoint the DPT heads per frame chunk (memory only)
-                 # Gaussian spatio-temporal key mask (3-10): dict, see vggt/models/gaussmask.py
+                 # Gaussian key mask on global attention: dict of settings (vggt/models/gaussmask.py)
                  gaussmask=None):
         super().__init__()
 

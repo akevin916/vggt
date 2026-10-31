@@ -147,8 +147,8 @@ class DPTHead(nn.Module):
         all_preds = []
         all_conf = []
         # grad_checkpoint (off by default): recompute each chunk in backward instead of storing
-        # its full-resolution activations. Same numbers; needed when gradients must pass THROUGH
-        # a frozen head for long clips (mask-only runs at S >= 32).
+        # its full-resolution activations. Same numbers, less memory; useful when gradients must
+        # pass through a frozen head on long clips.
         use_ckpt = bool(getattr(self, "grad_checkpoint", False)) and torch.is_grad_enabled()
 
         def _impl(s0, s1):

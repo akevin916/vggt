@@ -189,8 +189,6 @@ class RotaryPositionEmbedding2D(nn.Module):
 
 
 class RotaryTimeEmbedding1D(RotaryPositionEmbedding2D):
-    # NEW: Dyn-VGGT 時間軸 RoPE。與 2D 版同構但只編「時間」一個軸（整個 head_dim 都用幀索引旋轉），
-    #      只在 temporal attention 內作用，空間 RoPE 一個字不動，保留預訓練 warm-start（見 docs §3.1）。
     """1D Rotary Position Embedding for the temporal axis.
 
     Reuses the frequency / rotate-half machinery of the 2D version, but rotates the
@@ -201,7 +199,7 @@ class RotaryTimeEmbedding1D(RotaryPositionEmbedding2D):
         tokens: Input tensor of shape (batch, n_heads, n_tokens, head_dim).
         positions: Integer position tensor of shape (batch, n_tokens) — frame indices.
                    Tokens given position 0 receive an identity rotation (no temporal RoPE),
-                   which is how register tokens are excluded (decision B4).
+                   which is how register tokens are excluded.
     """
 
     def forward(self, tokens: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:

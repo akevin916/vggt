@@ -14,13 +14,12 @@
 
 **做什麼**：query 看別幀的 patch key 時，用位移 (Δs 幀, Δy 格, Δx 格) 算一個橢球距離 Q；Q 太大的 key 丟掉，其餘依 Q 打折。同幀、第 0 幀（參考相機）、camera / register token 一律保留。
 
-- Q = Δs²/σs² + Δy²/σy(Δs)² + Δx²/σx(Δs)²
-  - 球版：σy、σx 固定（v = 0）。
-  - 錐版：σy(Δs) = max(σy0 + v·|Δs|, 0.5)，x 同理；v 是學的，讓越遠的幀空間範圍變寬或變窄。
+- Q = Δs²/σs² + Δy²/σy² + Δx²/σx²
+  - σy、σx 不隨幀距變（下限 0.5）。錐版（σ 隨 |Δs| 變寬或變窄）2026-10-31 已從 slim 移除，只在 `illu-vggt` 有。
 - Q ≤ c² 的 key 保留，bias = −Q/2；其他加 −1e4（等於丟掉）。
 - **例子**：σs = 8、σy = σx = 6。query 在第 10 幀 (5, 5)，key 在第 14 幀 (7, 9) → 位移 (4, 2, 4) → Q = 16/64 + 4/36 + 16/36 ≈ 0.81 → 若 c² ≥ 0.81 就保留，bias ≈ −0.40。
 - **c² 不學**：每步依預算 ρ（預設 0.25）用二分法解出來，權重是各位移在 64 幀 chunk 裡出現的次數。所以 σ 只決定形狀（時間 vs 空間的比例），保留多少由 ρ 決定。
-- **作用範圍**：global 第 8–23 層，每層一組參數（球版 3 個、錐版 4 個）。
+- **作用範圍**：global 第 8–23 層，每層一組參數（σs、σy、σx 共 3 個）。
 - 訓練：soft 邊界 σ((c² − Q)/T)，溫度 T 從 2 退火到 0.1，之後改 straight-through 硬邊界。eval：硬邊界。
 
 ---
@@ -64,7 +63,7 @@
 
 | 函式 | 做什麼 |
 |---|---|
-| `__init__` | 建參數 `log_s`、`log_y`、`log_x`（錐版加 `v`），和各位移的出現次數 `n` |
+| `__init__` | 建參數 `log_s`、`log_y`、`log_x`，和各位移的出現次數 `n` |
 | `Q` | 每層的 Q 表 `[16, 127, 59, 73]` |
 | `solve_c2_hard` / `solve_c2_soft` | 依預算解 c²（硬邊界 / soft 邊界），不傳梯度 |
 | `tables` | 依 train / eval 與退火進度回傳 bias 表 |
@@ -81,12 +80,11 @@
 | key | 例子 | 意思 |
 |---|---|---|
 | `enable` | true | 開啟學習版 |
-| `cone` | false | false = 球版，true = 錐版（`c3_gcone_A` 只改這個） |
 | `rho` | 0.25 | 每層保留 25% |
 | `S_max` | 64 | 位移表涵蓋最多 64 幀 |
 | `start` | 8 | 從 global 第 8 層起作用 |
 | `grid` | [30, 37] | patch 格數 |
-| `init` | σs 8、σy 6、σx 6、v 0 | 初始寬度 |
+| `init` | σs 8、σy 6、σx 6 | 初始寬度 |
 | `T_start` / `T_end` / `T_steps` | 2.0 → 0.1，第 0–367 步 | soft 邊界溫度的退火 |
 | `hard_from` | 367 | 之後改硬邊界 |
 | `fixed_path` | （eval 用） | 從 json 讀固定遮罩 |
@@ -106,7 +104,7 @@
 - 預設 `VGGT()` 的 state_dict：1797 個 key，與 `main` 相同。
 - 遮罩關：`tfs_abs/epoch_10.pt` 12 幀 dump，對 `archive-pre-slim` 的 `pose_enc` / `depth` 逐位元相同。
 - gaussmask 球 / 錐：eval 的 `pose_enc` / `depth` 與移除 colmask / relmask 之前的 slim 逐位元相同；那份 slim 又與 `illu-vggt` 逐位元相同（2026-10-28）。
-- `c3_gball_A` / `c3_gcone_A`：Hydra 展開後，與攤平前相比只少了 26 個 colmask / relmask 的 model key，其他設定完全相同；兩者都能 instantiate 出模型。
+- `c3_gball_A`（當時還有 `c3_gcone_A`）：Hydra 展開後，與攤平前相比只少了 26 個 colmask / relmask 的 model key，其他設定完全相同；兩者都能 instantiate 出模型。
 - 帶 `aggregator.relmask_*` 或 `aggregator.colmask_*` key 的 ckpt，`load_vggt_for_eval` 會直接拒絕並指向完整版。
 
 依據：scratchpad 的 `verify_slim.py`、`gm/probe.py`、`slim/compose.py`。
@@ -141,3 +139,10 @@
 - 訓練沒量：硬邊界段（`hard_from` 之後）跳過在數值上等價；soft 段沒有真正為 −1e4 的格子，只能以門檻近似。
 
 依據：scratchpad 的 `gm/blockspeed.py`、`gm/blocksparsity.py`，結果 `gm/blockspeed.json`。
+
+---
+
+## 10. 移除錐版（2026-10-31）
+
+- 刪掉 `GaussMask` 的 `cone` 參數與學習參數 `v`、`c3_gcone_A.yaml`；config 寫 `cone: true` 或 `init.v ≠ 0`、或載入錐版 json，一律直接報錯。json 匯出的鍵改為 `sigma_y` / `sigma_x`，讀取仍接受舊的 `sigma_y0` / `sigma_x0`。
+- 驗證：球版 bias 表在 train / eval、soft / hard 下與移除前逐位元相同；`temporal_every=3` 時整個模型的 eval 輸出逐位元相同；對 σ 的梯度只差浮點捨入（相對 1e-7）；`c3_gball_A` 展開後只少 `cone` 與 `init.v`。
