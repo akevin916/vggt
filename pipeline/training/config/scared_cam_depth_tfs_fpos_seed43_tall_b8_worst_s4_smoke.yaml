@@ -1,0 +1,17 @@
+# Worst-case memory probe for _tall: clip length fixed at 4 (batch = floor(12/4) clips),
+# aspect fixed at 1.0 (largest images), 5 steps, no pose_eval. One-off; delete after the probe.
+defaults:
+  - scared_cam_depth_tfs_fpos_seed43_tall_b8
+  - _self_
+
+exp_name: scared_cam_depth_tfs_fpos_seed43_tall_b8_worst_s4_smoke
+max_epochs: 1
+limit_train_batches: 5
+pose_eval:
+  enabled: false
+data:
+  train:
+    common_config:
+      img_nums: [4, 4]
+      augs:
+        aspects: [1.0, 1.0]

@@ -1,0 +1,9 @@
+# scared_cam_depth_tfs_fpos_seed43_tall with max_img_per_gpu 12 -> 8. _tall at 12 OOMs in the DPT
+# head whenever floor(12/S) short clips share a step (4x3, 6x2; probe 2026-10-29). Batch per step:
+# S=4 -> 2 clips, S=5..12 -> 1 clip. NOT directly comparable to tfs_fpos_seed43 (12 imgs/step).
+# Written 2026-10-29.
+defaults:
+- scared_cam_depth_tfs_fpos_seed43_tall
+- _self_
+exp_name: scared_cam_depth_tfs_fpos_seed43_tall_b8
+max_img_per_gpu: 8

@@ -704,11 +704,23 @@ class Trainer:
 
         was_training = model.training
         model.eval()
-        # Epoch boundary: the last optimizer step is done and the next train step zeroes grads
-        # anyway, so dropping them here only frees ~3 GB for the c64 eval (方向 3 masked eval
-        # did not fit beside them).
+        # Free the last step's .grad before the long-sequence forward: the next train step calls
+        # zero_grad(set_to_none=True) anyway, so this changes no number -- it only stops ~1 GB per
+        # 250M trainable params from sitting idle through eval (24 temporal blocks OOMed here).
         for optim in self.optims:
             optim.zero_grad(set_to_none=True)
+        # Park the optimizer state (Adam moments, ~8 bytes per trainable param) on the CPU for the
+        # eval and put every tensor back on its own device afterwards. Values are copied, never
+        # changed, so training resumes bit-identically; 24 temporal blocks (753M trainable) OOM
+        # in the c64 forward without this.
+        parked = []
+        for optim in self.optims:
+            opt = getattr(optim, "optimizer", optim)
+            for state in opt.state.values():
+                for k, v in state.items():
+                    if torch.is_tensor(v) and v.is_cuda:
+                        parked.append((state, k, v.device))
+                        state[k] = v.to("cpu")
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -832,6 +844,9 @@ class Trainer:
                 model.train()
             gc.collect()
             torch.cuda.empty_cache()
+            for state, k, dev in parked:
+                state[k] = state[k].to(dev)
+            del parked
             torch.cuda.reset_peak_memory_stats()
 
         # Share rank-0's ATE with every rank so best.pt selection is identical everywhere.

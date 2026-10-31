@@ -137,8 +137,13 @@ class DPTHead(nn.Module):
         B, S, _, H, W = images.shape
 
         # If frames_chunk_size is not specified or greater than S, process all frames at once
+        # With grad_checkpoint on, short clips still go through the (single-chunk) checkpointed loop
+        # below: B>1 batches of <= 8 frames otherwise keep the full-resolution activations.
+        use_ckpt_short = bool(getattr(self, "grad_checkpoint", False)) and torch.is_grad_enabled()
         if frames_chunk_size is None or frames_chunk_size >= S:
-            return self._forward_impl(aggregated_tokens_list, images, patch_start_idx)
+            if not use_ckpt_short:
+                return self._forward_impl(aggregated_tokens_list, images, patch_start_idx)
+            frames_chunk_size = S
 
         # Otherwise, process frames in chunks to manage memory usage
         assert frames_chunk_size > 0
